@@ -1,0 +1,18 @@
+{
+  "name": "Simplified Chinese to Traditional Chinese (MCnotepad, text dictionaries)",
+  "segmentation": {
+    "type": "mmseg",
+    "dict": { "type": "text", "file": "STPhrases.txt" }
+  },
+  "conversion_chain": [
+    {
+      "dict": {
+        "type": "group",
+        "dicts": [
+          { "type": "text", "file": "STPhrases.txt" },
+          { "type": "text", "file": "STCharacters.txt" }
+        ]
+      }
+    }
+  ]
+}

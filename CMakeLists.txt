@@ -11,13 +11,31 @@ set(CPP_PINYIN_INSTALL OFF CACHE BOOL "" FORCE)
 set(CPP_PINYIN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/cpp-pinyin EXCLUDE_FROM_ALL)
 
+# Simplified <-> Traditional Chinese (Apache-2.0). Library only: MCnotepad
+# ships plain-text dictionaries in resources/opencc, so the dictionary build
+# pipeline and command-line tools are not needed.
+set(OPENCC_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(OPENCC_BUILD_DATA OFF CACHE BOOL "" FORCE)
+set(OPENCC_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(ENABLE_GTEST OFF CACHE BOOL "" FORCE)
+set(ENABLE_BENCHMARK OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/opencc EXCLUDE_FROM_ALL)
+if(MSVC)
+    # Vendored sources are UTF-8; don't let MSVC read them as the ANSI code page.
+    foreach(_vendored libopencc marisa cpp-pinyin)
+        if(TARGET ${_vendored})
+            target_compile_options(${_vendored} PRIVATE /utf-8 /W0)
+        endif()
+    endforeach()
+endif()
+
 add_executable(MCnotepad WIN32
     src/main.cpp
     resources/app.rc
 )
 
 target_compile_definitions(MCnotepad PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(MCnotepad PRIVATE comctl32 comdlg32 shlwapi advapi32 dwmapi uxtheme crypt32 cpp-pinyin::cpp-pinyin)
+target_link_libraries(MCnotepad PRIVATE comctl32 comdlg32 shlwapi advapi32 dwmapi uxtheme crypt32 cpp-pinyin::cpp-pinyin OpenCC::OpenCC)
 
 target_include_directories(MCnotepad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 

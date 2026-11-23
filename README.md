@@ -34,7 +34,7 @@ MCnotepad 是一个原生 Win32 C++ 文本编辑器，目标是比传统编辑�
 **文本处理**（“编辑”菜单或编辑区右键菜单；有选中时处理选中内容，否则处理全文）
 - 行处理：合并为一行（直接 / 空格 / 自定义连接符）、每 N 行合并、按分隔符拆分为多行、在指定字符（如 。！？）后换行、按长度换行、删除空行、合并连续空行、删除重复行、排序、反转、每行添加前缀或后缀、添加行号
 - 空格、符号与大小写：去除行首 / 行尾空白、合并连续空格、删除所有空格、制表符转空格、清除不可见字符（零宽字符等）、大小写转换
-- 中文处理：汉字转拼音（带声调 / 不带声调 / 首字母，多音字按词语判断）、简繁转换、全角 / 半角互转、中英文标点互转
+- 中文处理：汉字转拼音（带声调 / 不带声调 / 首字母，多音字按词语判断）、简繁转换（按词语判断，如“头发”→“頭髮”、“干燥”→“乾燥”）、全角 / 半角互转、中英文标点互转
 - 开发者工具：格式化 JSON、Base64 编码 / 解码（UTF-8）、URL 编码 / 解码、正则表达式替换（支持 `$1` 分组引用、区分大小写选项）
 - 提取到新标签：邮箱、链接、IP 地址、数字、包含关键词的行、指定列（按分隔符），原文不变
 - 处理前预览：执行前显示修改前后的差异（删除的行标红、新增的行标绿），确认后才应用；可在菜单中关闭预览。每次处理都可以用一次 `Ctrl+Z` 撤销
@@ -67,7 +67,7 @@ cmake --preset windows-x64
 cmake --build --preset windows-x64-release --parallel 4
 ```
 
-可执行文件位于 `build/windows-x64/Release/MCnotepad.exe`，运行时需要同目录下的 `resources/`（工具栏图标）和 `dict/`（拼音词典）文件夹。
+可执行文件位于 `build/windows-x64/Release/MCnotepad.exe`，运行时需要同目录下的 `resources/`（工具栏图标和简繁词典）和 `dict/`（拼音词典）文件夹。
 
 ## 数据位置
 
@@ -82,3 +82,4 @@ cmake --build --preset windows-x64-release --parallel 4
 ## 第三方库
 
 - [cpp-pinyin](https://github.com/wolfgitpr/cpp-pinyin)（Apache-2.0）：汉字转拼音，源码和普通话词典位于 `third_party/cpp-pinyin`，构建时词典会复制到程序目录的 `dict/`
+- [OpenCC](https://github.com/BYVoid/OpenCC)（Apache-2.0）：简繁转换，库源码位于 `third_party/opencc`，简繁词典（文本格式）位于 `resources/opencc`，转换结果为 OpenCC 标准繁体

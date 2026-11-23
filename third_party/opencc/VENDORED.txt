@@ -1,0 +1,4 @@
+Vendored from https://github.com/BYVoid/OpenCC (Apache-2.0) at commit fae2a0a.
+Kept: library sources (src/), cmake/, and the bundled marisa, rapidjson, darts-clone and tclap dependencies.
+Left out: tests, docs, data build pipeline, Python/Node bindings, plugins.
+MCnotepad ships plain-text dictionaries in resources/opencc/ and loads them with its own s2t.json / t2s.json.

@@ -36,6 +36,7 @@
 
 #include <cpp-pinyin/Pinyin.h>
 #include <cpp-pinyin/G2pglobal.h>
+#include <SimpleConverter.hpp>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -4755,6 +4756,35 @@ Pinyin::Pinyin* PinyinConverter(std::wstring& error) {
     return converter.get();
 }
 
+// Simplified <-> Traditional with OpenCC (phrase-aware: 头发 -> 頭髮, 干燥 ->
+// 乾燥). Dictionaries are loaded on first use from <exe dir>/resources/opencc.
+bool ConvertChineseScript(std::wstring_view text, bool toTraditional, std::wstring& output) {
+    static std::unique_ptr<opencc::SimpleConverter> converters[2];
+    static bool failed[2]{};
+    const int which = toTraditional ? 0 : 1;
+    if (!converters[which] && !failed[which]) {
+        const fs::path config = fs::path(CurrentExecutablePath()).parent_path() / L"resources" / L"opencc" /
+            (toTraditional ? L"s2t.json" : L"t2s.json");
+        std::error_code error;
+        if (fs::exists(config, error)) {
+            try {
+                converters[which] = std::make_unique<opencc::SimpleConverter>(WideToUtf8(config.wstring()));
+            } catch (...) {
+                failed[which] = true;
+            }
+        } else {
+            failed[which] = true;
+        }
+    }
+    if (!converters[which]) return false;
+    try {
+        output = Utf8ToWide(converters[which]->Convert(WideToUtf8(text)));
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
 enum class PinyinMode { Tone, Plain, Initials };
 
 // Converts Chinese characters (polyphones resolved by phrase) and keeps all
@@ -5745,14 +5775,26 @@ void RunTextTool(int command) {
         break;
     case kIdToTraditional:
     case kIdToSimplified: {
-        const DWORD flags = command == kIdToTraditional ? LCMAP_TRADITIONAL_CHINESE : LCMAP_SIMPLIFIED_CHINESE;
-        if (!text.empty()) {
-            const int size = LCMapStringEx(L"zh-CN", flags, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr, 0);
-            result.assign(static_cast<size_t>(std::max(size, 0)), L'\0');
-            if (size > 0) LCMapStringEx(L"zh-CN", flags, text.c_str(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr, 0);
+        const bool toTraditional = command == kIdToTraditional;
+        SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        bool phraseAware = true;
+        if (!ConvertChineseScript(text, toTraditional, result)) {
+            // Dictionaries missing: fall back to Windows' character-level mapping.
+            phraseAware = false;
+            const DWORD flags = toTraditional ? LCMAP_TRADITIONAL_CHINESE : LCMAP_SIMPLIFIED_CHINESE;
+            if (!text.empty()) {
+                const int size = LCMapStringEx(L"zh-CN", flags, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr, 0);
+                result.assign(static_cast<size_t>(std::max(size, 0)), L'\0');
+                if (size > 0) LCMapStringEx(L"zh-CN", flags, text.c_str(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr, 0);
+            }
         }
-        for (size_t i = 0; i < std::min(text.size(), result.size()); ++i) count += text[i] != result[i] ? 1 : 0;
-        notice = L"已转换 " + std::to_wstring(count) + L" 个字";
+        if (result.size() == text.size()) {
+            for (size_t i = 0; i < text.size(); ++i) count += text[i] != result[i] ? 1 : 0;
+            notice = L"已转换 " + std::to_wstring(count) + L" 个字";
+        } else {
+            notice = L"已转换";
+        }
+        if (!phraseAware) notice += L"（未找到 OpenCC 词典，已按单字转换）";
         break;
     }
     case kIdBase64Encode:
