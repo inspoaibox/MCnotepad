@@ -37,6 +37,7 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "../resources/resource.h"
@@ -161,10 +162,22 @@ constexpr int kIdSettingsApply = 1708;
 constexpr int kIdSettingsCancel = 1709;
 constexpr int kIdEncodingFirst = 1601;    // 1601..1605
 constexpr int kIdLineEndingFirst = 1611;  // 1611..1613
-constexpr int kIdLanguageFirst = 1621;    // 1621..1630
+constexpr int kIdLanguageFirst = 1621;    // 1621..1645
 
 enum class ThemeKind { Dark = 0, Light = 1, Green = 2, Blue = 3 };
 enum class CloseBehavior { Prompt = 0, Direct = 1, Save = 2 };
+
+enum class Tok : uint8_t {
+    Plain, Keyword, Type, String, Number, Comment, Function, Tag, Attribute, Property, Constant, Meta,
+    Variable, Heading, Emphasis, Link, Error, Warning, Info, Added, Removed,
+    Column0, Column1, Column2, Column3, Column4, Column5,
+};
+
+struct SyntaxToken {
+    uint32_t start;
+    uint32_t length;
+    Tok kind;
+};
 
 struct TabDocument {
     HWND editor = nullptr;
@@ -182,21 +195,50 @@ struct TabDocument {
     int lineEnding = 0;      // index into kLineEndingNames
     int language = 0;        // index into kLanguageNames, 0 = detect from extension
     uint64_t fileTimestamp = 0;  // last write time we know about, 0 = unknown
+    int sniffedLanguage = -1;    // guessed from content when the name says nothing
+    std::vector<SyntaxToken> syntaxTokens;
+    std::vector<std::pair<LONG, LONG>> syntaxColored;  // character ranges already painted
+    bool syntaxStale = true;     // tokens no longer match the text
+    bool syntaxHadColors = false;
+    uint64_t textHash = 0;       // to tell real edits from formatting-only EN_CHANGE
 };
 
 constexpr const wchar_t* kEncodingNames[] = {L"UTF-8", L"UTF-8 BOM", L"UTF-16 LE", L"UTF-16 BE", L"ANSI"};
 constexpr const wchar_t* kLineEndingNames[] = {L"CRLF", L"LF", L"CR"};
 constexpr const wchar_t* kLineEndingMenuNames[] = {L"Windows (CRLF)", L"Unix (LF)", L"旧式 Mac (CR)"};
 constexpr const wchar_t* kLanguageNames[] = {L"自动检测", L"HTML", L"CSS", L"JavaScript", L"C/C++",
-    L"Python", L"JSON", L"Markdown", L"SQL", L"PowerShell"};
+    L"Python", L"JSON", L"Markdown", L"SQL", L"PowerShell", L"TypeScript", L"XML", L"YAML",
+    L"配置文件（INI / TOML / ENV）", L"Shell", L"批处理（BAT / CMD）", L"Java / Kotlin", L"C#", L"Go", L"Rust", L"PHP",
+    L"Dockerfile", L"CSV / TSV", L"日志（LOG）", L"Diff / Patch"};
 constexpr int kEncodingCount = 5;
 constexpr int kLineEndingCount = 3;
-constexpr int kLanguageCount = 10;
+constexpr int kLanguageCount = 25;
 constexpr int kEncodingAnsi = 4;
 constexpr int kLanguageAuto = 0;
 constexpr int kLanguageHtml = 1;
+constexpr int kLanguageCss = 2;
+constexpr int kLanguageJavaScript = 3;
+constexpr int kLanguageCpp = 4;
+constexpr int kLanguagePython = 5;
 constexpr int kLanguageJson = 6;
 constexpr int kLanguageMarkdown = 7;
+constexpr int kLanguageSql = 8;
+constexpr int kLanguagePowerShell = 9;
+constexpr int kLanguageTypeScript = 10;
+constexpr int kLanguageXml = 11;
+constexpr int kLanguageYaml = 12;
+constexpr int kLanguageConfig = 13;
+constexpr int kLanguageShell = 14;
+constexpr int kLanguageBatch = 15;
+constexpr int kLanguageJava = 16;
+constexpr int kLanguageCSharp = 17;
+constexpr int kLanguageGo = 18;
+constexpr int kLanguageRust = 19;
+constexpr int kLanguagePhp = 20;
+constexpr int kLanguageDockerfile = 21;
+constexpr int kLanguageCsv = 22;
+constexpr int kLanguageLog = 23;
+constexpr int kLanguageDiff = 24;
 constexpr int kLanguagePlain = -1;
 
 struct AppState {
@@ -300,6 +342,12 @@ std::unordered_map<HWND, WNDPROC> g_editorProcs;
 std::wstring GetWindowTextValue(HWND window);
 void ApplyEditorTheme(HWND editor);
 void HighlightDocument(const TabDocument& document);
+void HighlightDocument(TabDocument& document);
+void SyntaxColorVisible(TabDocument& document);
+void SyntaxOnViewChanged(HWND editor);
+int LanguageFromName(const std::wstring& name);
+int LanguageFromPath(const std::wstring& path);
+int SniffLanguage(const std::wstring& text);
 int EffectiveLanguage(const TabDocument& document);
 void RefreshGutter();
 void AppendEncodingItems(HMENU menu);
@@ -648,6 +696,8 @@ void ApplyEditorTheme(HWND editor) {
     format.dwMask = CFM_COLOR | CFM_BACKCOLOR;
     format.crTextColor = foreground;
     format.crBackColor = background;
+    format.dwMask |= CFM_BOLD;  // headings may have left bold text behind
+    format.dwEffects = 0;
     // SCF_DEFAULT too, so text inserted later (SetWindowText, typing) starts
     // in the theme colour without a separate colouring pass.
     SendMessageW(editor, EM_SETCHARFORMAT, SCF_DEFAULT, reinterpret_cast<LPARAM>(&format));
@@ -698,6 +748,35 @@ public:
         return static_cast<LONG>(start);
     }
 
+    // A font object carrying only colour and weight (everything else
+    // undefined), so applying it is one call and touches nothing else.
+    ITextFont* MakeStyleFont(COLORREF color, bool bold) {
+        ITextFont* base = nullptr;
+        ITextFont* duplicate = nullptr;
+        if (!range_ || FAILED(range_->SetRange(0, 0)) || FAILED(range_->GetFont(&base)) || !base) return nullptr;
+        if (SUCCEEDED(base->GetDuplicate(&duplicate)) && duplicate) {
+            duplicate->Reset(tomUndefined);
+            duplicate->SetForeColor(static_cast<long>(color));
+            duplicate->SetBold(bold ? tomTrue : tomFalse);
+        }
+        base->Release();
+        return duplicate;
+    }
+
+    void ApplyFont(LONG start, LONG end, ITextFont* font) {
+        if (range_ && font && SUCCEEDED(range_->SetRange(start, end))) range_->SetFont(font);
+    }
+
+    void SetStyle(LONG start, LONG end, COLORREF color, bool bold) {
+        if (!range_ || FAILED(range_->SetRange(start, end))) return;
+        ITextFont* font = nullptr;
+        if (SUCCEEDED(range_->GetFont(&font)) && font) {
+            font->SetForeColor(static_cast<long>(color));
+            font->SetBold(bold ? tomTrue : tomFalse);
+            font->Release();
+        }
+    }
+
     void SetColor(LONG start, LONG end, COLORREF color) {
         if (!range_ || FAILED(range_->SetRange(start, end))) return;
         ITextFont* font = nullptr;
@@ -722,6 +801,17 @@ void SetSelectionColor(HWND editor, LONG start, LONG end, COLORREF color) {
     SendMessageW(editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
 }
 
+uint64_t HashText(std::wstring_view text) {
+    uint64_t hash = 1469598103934665603ull;  // FNV-1a
+    for (const wchar_t c : text) {
+        hash ^= static_cast<uint64_t>(c);
+        hash *= 1099511628211ull;
+    }
+    return hash ^ text.size();
+}
+
+std::wstring GetEditorRawText(HWND editor);
+
 // Text exactly as RichEdit stores it (one character per line break), so string
 // offsets match RichEdit character positions.
 std::wstring GetEditorRawText(HWND editor) {
@@ -740,99 +830,1180 @@ std::wstring GetEditorRawText(HWND editor) {
     return text;
 }
 
-// Lightweight colouring: HTML gets tags, comments and attribute strings; code
-// languages get quoted strings (a string never runs past its line); plain text
-// and Markdown are left alone so apostrophes don't colour whole paragraphs.
-void ApplySimpleSyntaxHighlight(HWND editor, int language) {
-    if (!editor) return;
-    const std::wstring text = GetEditorRawText(editor);
-    if (text.empty()) return;
-    EditorEventMute mute(editor);
-    TextDocumentRef tom(editor);
-    long freezeCount = 0;
-    if (tom) {
-        // Colour changes are not edits: keep them off the undo stack, and
-        // repaint once at the end instead of per token.
-        tom.document()->Undo(tomSuspend, nullptr);
-        tom.document()->Freeze(&freezeCount);
-    } else {
-        SendMessageW(editor, WM_SETREDRAW, FALSE, 0);
+std::wstring LowerInvariantSyntax(std::wstring_view text) {
+    std::wstring result(text);
+    if (!result.empty()) {
+        LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, text.data(), static_cast<int>(text.size()),
+            result.data(), static_cast<int>(result.size()), nullptr, nullptr, 0);
     }
-    CHARRANGE saved{};
-    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&saved));
-    POINT scroll{};
-    SendMessageW(editor, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
-    const ThemePalette& palette = CurrentPalette();
-    const auto color = [&](size_t start, size_t end, COLORREF value) {
-        if (tom) tom.SetColor(static_cast<LONG>(start), static_cast<LONG>(end), value);
-        else SetSelectionColor(editor, static_cast<LONG>(start), static_cast<LONG>(end), value);
-    };
-    color(0, text.size() + 1, EditorForeground());
-    const auto lineEnd = [&](size_t from) {
-        const size_t end = text.find_first_of(L"\r\n", from);
-        return end == std::wstring::npos ? text.size() : end;
-    };
+    return result;
+}
 
-    if (language == kLanguageHtml) {
-        for (size_t i = 0; i < text.size();) {
-            if (text.compare(i, 4, L"<!--") == 0) {
-                const size_t end = text.find(L"-->", i + 4);
-                const size_t finish = end == std::wstring::npos ? text.size() : end + 3;
-                color(i, finish, palette.syntaxComment);
-                i = finish;
-            } else if (text[i] == L'<') {
-                const size_t end = text.find(L'>', i + 1);
-                const size_t finish = end == std::wstring::npos ? text.size() : end + 1;
-                color(i, finish, palette.syntaxTag);
-                // Attribute values inside the tag.
-                for (size_t j = i + 1; j < finish; ++j) {
-                    if (text[j] != L'"' && text[j] != L'\'') continue;
-                    const size_t close = text.find(text[j], j + 1);
-                    if (close == std::wstring::npos || close >= finish) break;
-                    color(j, close + 1, palette.syntaxString);
-                    j = close;
+// ===========================================================================
+// Syntax highlighting
+// Each language has a small tokenizer that runs over the whole text (fast,
+// pure string scanning). Colours are applied lazily: only the visible part of
+// the editor plus a margin, and more as the user scrolls. That keeps large
+// files instant to open and typing responsive.
+// ===========================================================================
+
+constexpr size_t kSyntaxSizeLimit = 2u << 20;  // characters; bigger files stay plain
+
+struct SyntaxStyle { COLORREF color; bool bold; };
+
+SyntaxStyle StyleFor(Tok kind) {
+    const bool dark = g_app.darkTheme;
+    const ThemePalette& palette = CurrentPalette();
+    const auto pick = [dark](COLORREF d, COLORREF l) { return dark ? d : l; };
+    switch (kind) {
+    case Tok::Keyword:   return {pick(RGB(197, 134, 192), RGB(175, 0, 219)), false};
+    case Tok::Type:      return {pick(RGB(78, 201, 176), RGB(38, 127, 153)), false};
+    case Tok::String:    return {pick(RGB(206, 145, 120), RGB(163, 21, 21)), false};
+    case Tok::Number:    return {pick(RGB(181, 206, 168), RGB(9, 134, 88)), false};
+    case Tok::Comment:   return {pick(RGB(106, 153, 85), RGB(0, 128, 0)), false};
+    case Tok::Function:  return {pick(RGB(220, 220, 170), RGB(121, 94, 38)), false};
+    case Tok::Tag:       return {pick(RGB(86, 156, 214), RGB(128, 0, 0)), false};
+    case Tok::Attribute: return {pick(RGB(156, 220, 254), RGB(229, 0, 0)), false};
+    case Tok::Property:  return {pick(RGB(156, 220, 254), RGB(4, 81, 165)), false};
+    case Tok::Constant:  return {pick(RGB(86, 156, 214), RGB(0, 0, 255)), false};
+    case Tok::Meta:      return {pick(RGB(197, 134, 192), RGB(175, 0, 219)), false};
+    case Tok::Variable:  return {pick(RGB(156, 220, 254), RGB(0, 16, 128)), false};
+    case Tok::Heading:   return {pick(RGB(86, 156, 214), RGB(128, 0, 0)), true};
+    case Tok::Emphasis:  return {palette.editorText, true};
+    case Tok::Link:      return {pick(RGB(78, 201, 176), RGB(0, 112, 193)), false};
+    case Tok::Error:     return {pick(RGB(244, 135, 113), RGB(205, 49, 49)), true};
+    case Tok::Warning:   return {pick(RGB(229, 192, 123), RGB(191, 136, 3)), true};
+    case Tok::Info:      return {pick(RGB(117, 190, 255), RGB(0, 112, 193)), false};
+    case Tok::Added:     return {pick(RGB(129, 199, 132), RGB(22, 130, 52)), false};
+    case Tok::Removed:   return {pick(RGB(244, 135, 113), RGB(205, 49, 49)), false};
+    case Tok::Column0:   return {pick(RGB(156, 220, 254), RGB(4, 81, 165)), false};
+    case Tok::Column1:   return {pick(RGB(206, 145, 120), RGB(163, 21, 21)), false};
+    case Tok::Column2:   return {pick(RGB(181, 206, 168), RGB(9, 134, 88)), false};
+    case Tok::Column3:   return {pick(RGB(197, 134, 192), RGB(175, 0, 219)), false};
+    case Tok::Column4:   return {pick(RGB(220, 220, 170), RGB(121, 94, 38)), false};
+    case Tok::Column5:   return {pick(RGB(78, 201, 176), RGB(38, 127, 153)), false};
+    default:             return {palette.editorText, false};
+    }
+}
+
+// ---- Language specs --------------------------------------------------------------
+
+struct CodeSpec {
+    std::vector<std::wstring> lineComments;
+    std::wstring blockOpen, blockClose;
+    std::wstring blockOpen2, blockClose2;
+    std::wstring quotes = L"\"'";
+    bool multilineQuotes = false;   // every quote may span lines (shell, PowerShell)
+    bool backtickMultiline = true;  // `template` strings
+    bool tripleQuotes = false;      // Python """ """
+    bool backslashEscapes = true;
+    bool hashMeta = false;          // #include / #region at line start
+    bool decorators = false;        // @Decorator
+    bool dollarVariables = false;   // $name, ${name}
+    bool percentVariables = false;  // %name%, %~dp0, !name!
+    bool dashIdentifiers = false;   // Get-ChildItem, -Parameter
+    bool caseInsensitive = false;
+    bool shellComments = false;     // '#' starts a comment only after whitespace
+    bool macroBang = false;         // name!(...) is a macro call (Rust)
+    std::unordered_set<std::wstring> keywords, types, constants, builtins;
+};
+
+std::unordered_set<std::wstring> WordSet(const wchar_t* words, bool lower = false) {
+    std::unordered_set<std::wstring> set;
+    std::wistringstream stream(words);
+    for (std::wstring word; stream >> word;) set.insert(lower ? LowerInvariantSyntax(word) : word);
+    return set;
+}
+
+const CodeSpec* SpecFor(int language) {
+    static std::unordered_map<int, CodeSpec> specs = [] {
+        std::unordered_map<int, CodeSpec> m;
+        const wchar_t* jsKeywords = L"break case catch class const continue debugger default delete do else export extends finally for "
+            L"function if import in instanceof let new return super switch this throw try typeof var void while with yield async await "
+            L"of static get set from as";
+        CodeSpec js;
+        js.lineComments = {L"//"};
+        js.blockOpen = L"/*"; js.blockClose = L"*/";
+        js.quotes = L"\"'`";
+        js.decorators = true;
+        js.keywords = WordSet(jsKeywords);
+        js.constants = WordSet(L"true false null undefined NaN Infinity");
+        m[kLanguageJavaScript] = js;
+        CodeSpec ts = js;
+        for (const auto& w : WordSet(L"interface type enum implements namespace module declare abstract private protected public readonly keyof infer is satisfies override")) ts.keywords.insert(w);
+        ts.types = WordSet(L"string number boolean any unknown never object symbol bigint");
+        m[kLanguageTypeScript] = ts;
+
+        CodeSpec c;
+        c.lineComments = {L"//"};
+        c.blockOpen = L"/*"; c.blockClose = L"*/";
+        c.hashMeta = true;
+        c.keywords = WordSet(L"alignas alignof auto break case catch class const constexpr consteval constinit const_cast continue "
+            L"co_await co_return co_yield decltype default delete do dynamic_cast else enum explicit export extern for friend goto if "
+            L"inline mutable namespace new noexcept operator private protected public register reinterpret_cast return sizeof static "
+            L"static_assert static_cast struct switch template this thread_local throw try typedef typeid typename union using virtual "
+            L"volatile while override final");
+        c.types = WordSet(L"void bool char wchar_t char8_t char16_t char32_t short int long float double signed unsigned size_t "
+            L"ptrdiff_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t intptr_t uintptr_t std string wstring "
+            L"BOOL DWORD WORD BYTE UINT LONG HWND HANDLE LPARAM WPARAM LRESULT");
+        c.constants = WordSet(L"true false nullptr NULL TRUE FALSE");
+        m[kLanguageCpp] = c;
+
+        CodeSpec cs = c;
+        cs.keywords = WordSet(L"abstract as base break case catch checked class const continue default delegate do else enum event "
+            L"explicit extern finally fixed for foreach goto if implicit in interface internal is lock namespace new operator out "
+            L"override params private protected public readonly ref return sealed sizeof stackalloc static struct switch this throw "
+            L"try typeof unchecked unsafe using virtual volatile while async await var get set init record yield where when nameof partial");
+        cs.types = WordSet(L"bool byte sbyte char decimal double float int uint long ulong short ushort object string void dynamic nint nuint");
+        cs.constants = WordSet(L"true false null");
+        cs.decorators = false;
+        m[kLanguageCSharp] = cs;
+
+        CodeSpec java = c;
+        java.hashMeta = false;
+        java.decorators = true;
+        java.keywords = WordSet(L"abstract assert break case catch class continue default do else enum extends final finally for if "
+            L"implements import instanceof interface native new package private protected public return static strictfp super switch "
+            L"synchronized this throw throws transient try volatile while var record yield sealed permits fun val when object "
+            L"companion data suspend override open internal lateinit");
+        java.types = WordSet(L"boolean byte char short int long float double void String Object Integer Long Double Boolean Unit Any");
+        java.constants = WordSet(L"true false null");
+        m[kLanguageJava] = java;
+
+        CodeSpec go = c;
+        go.hashMeta = false;
+        go.quotes = L"\"'`";
+        go.keywords = WordSet(L"break case chan const continue default defer else fallthrough for func go goto if import interface "
+            L"map package range return select struct switch type var");
+        go.types = WordSet(L"bool byte complex64 complex128 error float32 float64 int int8 int16 int32 int64 rune string uint uint8 "
+            L"uint16 uint32 uint64 uintptr any");
+        go.constants = WordSet(L"true false nil iota");
+        m[kLanguageGo] = go;
+
+        CodeSpec rust = c;
+        rust.hashMeta = false;
+        rust.macroBang = true;
+        rust.keywords = WordSet(L"as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod "
+            L"move mut pub ref return self Self static struct super trait type unsafe use where while");
+        rust.types = WordSet(L"i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64 bool char str String Vec Option Result Box");
+        rust.constants = WordSet(L"true false None Some Ok Err");
+        m[kLanguageRust] = rust;
+
+        CodeSpec php = c;
+        php.hashMeta = false;
+        php.lineComments = {L"//", L"#"};
+        php.dollarVariables = true;
+        php.keywords = WordSet(L"abstract and array as break callable case catch class clone const continue declare default do echo "
+            L"else elseif empty enddeclare endfor endforeach endif endswitch endwhile extends final finally fn for foreach function "
+            L"global goto if implements include include_once instanceof insteadof interface isset list match namespace new or print "
+            L"private protected public readonly require require_once return static switch throw trait try unset use var while xor yield");
+        php.types = WordSet(L"int float string bool void mixed iterable self parent");
+        php.constants = WordSet(L"true false null TRUE FALSE NULL");
+        m[kLanguagePhp] = php;
+
+        CodeSpec py;
+        py.lineComments = {L"#"};
+        py.tripleQuotes = true;
+        py.decorators = true;
+        py.keywords = WordSet(L"and as assert async await break class continue def del elif else except finally for from global if "
+            L"import in is lambda nonlocal not or pass raise return try while with yield match case");
+        py.types = WordSet(L"int float str bool list dict set tuple bytes object type");
+        py.constants = WordSet(L"True False None self cls");
+        py.builtins = WordSet(L"print len range open isinstance enumerate zip map filter sorted super");
+        m[kLanguagePython] = py;
+
+        CodeSpec sql;
+        sql.lineComments = {L"--", L"#"};
+        sql.blockOpen = L"/*"; sql.blockClose = L"*/";
+        sql.quotes = L"\"'`";
+        sql.backslashEscapes = false;
+        sql.caseInsensitive = true;
+        sql.keywords = WordSet(L"select from where and or not insert into values update set delete create table alter drop index view "
+            L"join left right inner outer full cross on as group by order having limit offset union all distinct case when then else "
+            L"end is null in exists between like primary key foreign references default constraint unique check if begin commit "
+            L"rollback transaction declare procedure function returns return trigger database schema use show grant revoke with asc "
+            L"desc top truncate replace merge using natural over partition cast add column", true);
+        sql.types = WordSet(L"int integer bigint smallint tinyint decimal numeric float real double char varchar nvarchar text date "
+            L"datetime timestamp time boolean bool blob json jsonb uuid serial", true);
+        sql.constants = WordSet(L"true false", true);
+        sql.builtins = WordSet(L"count sum avg min max now coalesce concat substring lower upper", true);
+        m[kLanguageSql] = sql;
+
+        CodeSpec shell;
+        shell.lineComments = {L"#"};
+        shell.shellComments = true;
+        shell.quotes = L"\"'`";
+        shell.multilineQuotes = true;
+        shell.dollarVariables = true;
+        shell.keywords = WordSet(L"if then else elif fi for while until do done case esac in function return break continue local "
+            L"export readonly declare unset shift exit source alias select time trap eval exec set");
+        shell.builtins = WordSet(L"echo printf cd ls cp mv rm mkdir grep sed awk cat chmod chown sudo apt yum dnf npm npx pnpm yarn "
+            L"git docker curl wget tar ssh systemctl node python pip");
+        shell.constants = WordSet(L"true false");
+        m[kLanguageShell] = shell;
+
+        CodeSpec ps;
+        ps.lineComments = {L"#"};
+        ps.blockOpen = L"<#"; ps.blockClose = L"#>";
+        ps.multilineQuotes = true;
+        ps.backslashEscapes = false;
+        ps.dollarVariables = true;
+        ps.dashIdentifiers = true;
+        ps.caseInsensitive = true;
+        ps.keywords = WordSet(L"begin break catch class continue data do dynamicparam else elseif end enum exit filter finally for "
+            L"foreach from function if in param process return switch throw trap try until using while", true);
+        m[kLanguagePowerShell] = ps;
+
+        CodeSpec bat;
+        bat.lineComments = {L"::"};
+        bat.quotes = L"\"";
+        bat.backslashEscapes = false;
+        bat.percentVariables = true;
+        bat.caseInsensitive = true;
+        bat.keywords = WordSet(L"echo set if else for in do goto call exit not exist defined errorlevel setlocal endlocal shift pause "
+            L"cls cd pushd popd start title copy del move mkdir md rd rmdir type find findstr equ neq lss leq gtr geq nul off on", true);
+        m[kLanguageBatch] = bat;
+        return m;
+    }();
+    const auto it = specs.find(language);
+    return it == specs.end() ? nullptr : &it->second;
+}
+
+// ---- Lexer ---------------------------------------------------------------------------
+
+bool IsIdentStart(wchar_t c) { return c == L'_' || (c < 128 ? iswalpha(c) != 0 : (iswalpha(c) && c < 0x2E80)); }
+bool IsIdentChar(wchar_t c) { return IsIdentStart(c) || (c >= L'0' && c <= L'9'); }
+
+class SyntaxLexer {
+public:
+    SyntaxLexer(const std::wstring& text, std::vector<SyntaxToken>& tokens) : text_(text), tokens_(tokens) {}
+
+    void Run(int language, size_t from, size_t to) {
+        switch (language) {
+        case kLanguageHtml:
+        case kLanguageXml: Markup(from, to); break;
+        case kLanguageCss: Css(from, to); break;
+        case kLanguageJson: Json(from, to); break;
+        case kLanguageMarkdown: Markdown(from, to); break;
+        case kLanguageYaml: Yaml(from, to); break;
+        case kLanguageConfig: Config(from, to); break;
+        case kLanguageDockerfile: Dockerfile(from, to); break;
+        case kLanguageCsv: Csv(from, to); break;
+        case kLanguageLog: Log(from, to); break;
+        case kLanguageDiff: Diff(from, to); break;
+        case kLanguageBatch: Batch(from, to); break;
+        default:
+            if (const CodeSpec* spec = SpecFor(language)) Code(*spec, from, to);
+            break;
+        }
+    }
+
+private:
+    const std::wstring& text_;
+    std::vector<SyntaxToken>& tokens_;
+
+    void Add(size_t start, size_t end, Tok kind) {
+        if (end > start && kind != Tok::Plain) tokens_.push_back({static_cast<uint32_t>(start), static_cast<uint32_t>(end - start), kind});
+    }
+    bool At(size_t i, const std::wstring& s) const { return !s.empty() && text_.compare(i, s.size(), s) == 0; }
+    bool AtNoCase(size_t i, const wchar_t* s) const {
+        const size_t n = wcslen(s);
+        return i + n <= text_.size() && _wcsnicmp(text_.c_str() + i, s, n) == 0;
+    }
+    size_t LineEnd(size_t i, size_t to) const {
+        const size_t end = text_.find_first_of(L"\r\n", i);
+        return end == std::wstring::npos ? to : std::min(end, to);
+    }
+    size_t NextLine(size_t lineEnd, size_t to) const {
+        if (lineEnd < to && text_[lineEnd] == L'\r' && lineEnd + 1 < to && text_[lineEnd + 1] == L'\n') return lineEnd + 2;
+        return std::min(lineEnd + 1, to);
+    }
+    size_t SkipSpaces(size_t i, size_t to) const {
+        while (i < to && (text_[i] == L' ' || text_[i] == L'\t')) ++i;
+        return i;
+    }
+    size_t NumberEnd(size_t i, size_t to) const {
+        size_t j = i;
+        const bool hex = j + 1 < to && text_[j] == L'0' && (text_[j + 1] == L'x' || text_[j + 1] == L'X');
+        if (hex) j += 2;
+        while (j < to) {
+            const wchar_t c = text_[j];
+            if (iswalnum(c) || c == L'_' || (c == L'.' && j + 1 < to && iswdigit(text_[j + 1]))) { ++j; continue; }
+            if (!hex && (c == L'+' || c == L'-') && j > i && (text_[j - 1] == L'e' || text_[j - 1] == L'E')) { ++j; continue; }
+            break;
+        }
+        return j;
+    }
+    // Ends after the closing quote (or at the line end for an unterminated one).
+    size_t StringEnd(size_t i, size_t to, wchar_t quote, bool multiline, bool escapes) const {
+        size_t j = i + 1;
+        while (j < to) {
+            const wchar_t c = text_[j];
+            if (escapes && c == L'\\') { j += 2; continue; }
+            if (c == quote) return j + 1;
+            if ((c == L'\r' || c == L'\n') && !multiline) return j;
+            ++j;
+        }
+        return to;
+    }
+    wchar_t PreviousNonSpace(size_t i, size_t from) const {
+        while (i > from) {
+            const wchar_t c = text_[--i];
+            if (c != L' ' && c != L'\t') return c;
+        }
+        return 0;
+    }
+    std::wstring Lower(size_t start, size_t end) const { return LowerInvariantSyntax(text_.substr(start, end - start)); }
+
+    void Code(const CodeSpec& spec, size_t from, size_t to) {
+        size_t i = from;
+        bool lineStart = true;
+        while (i < to) {
+            const wchar_t c = text_[i];
+            if (c == L'\r' || c == L'\n') { lineStart = true; ++i; continue; }
+            if (c == L' ' || c == L'\t') { ++i; continue; }
+            if (At(i, spec.blockOpen)) {
+                const size_t close = text_.find(spec.blockClose, i + spec.blockOpen.size());
+                const size_t end = close == std::wstring::npos ? to : std::min(to, close + spec.blockClose.size());
+                Add(i, end, Tok::Comment);
+                i = end; lineStart = false; continue;
+            }
+            bool comment = false;
+            for (const std::wstring& marker : spec.lineComments) {
+                if (!At(i, marker)) continue;
+                if (spec.shellComments && i > from && text_[i - 1] != L' ' && text_[i - 1] != L'\t' && text_[i - 1] != L'\r' && text_[i - 1] != L'\n') continue;
+                const size_t end = LineEnd(i, to);
+                Add(i, end, Tok::Comment);
+                i = end;
+                comment = true;
+                break;
+            }
+            if (comment) continue;
+            if (spec.hashMeta && c == L'#' && lineStart) {
+                const size_t end = LineEnd(i, to);
+                // #include <x> / "x": keep the path as a string.
+                const size_t quote = text_.find_first_of(L"<\"", i);
+                if (quote != std::wstring::npos && quote < end && text_.compare(i, 8, L"#include") == 0) {
+                    Add(i, quote, Tok::Meta);
+                    Add(quote, end, Tok::String);
+                } else {
+                    Add(i, end, Tok::Meta);
                 }
-                i = finish;
+                i = end; continue;
+            }
+            lineStart = false;
+            if (spec.quotes.find(c) != std::wstring::npos) {
+                size_t end;
+                if (spec.tripleQuotes && i + 2 < to && text_[i + 1] == c && text_[i + 2] == c) {
+                    const size_t close = text_.find(std::wstring(3, c), i + 3);
+                    end = close == std::wstring::npos ? to : std::min(to, close + 3);
+                } else {
+                    end = StringEnd(i, to, c, spec.multilineQuotes || (c == L'`' && spec.backtickMultiline), spec.backslashEscapes);
+                }
+                Add(i, end, Tok::String);
+                i = end; continue;
+            }
+            if (iswdigit(c) || (c == L'.' && i + 1 < to && iswdigit(text_[i + 1]) && (i == from || !IsIdentChar(text_[i - 1])))) {
+                if (i > from && IsIdentChar(text_[i - 1])) { ++i; continue; }
+                const size_t end = NumberEnd(i, to);
+                Add(i, end, Tok::Number);
+                i = end; continue;
+            }
+            if (spec.decorators && c == L'@' && i + 1 < to && IsIdentStart(text_[i + 1])) {
+                size_t j = i + 1;
+                while (j < to && (IsIdentChar(text_[j]) || text_[j] == L'.')) ++j;
+                Add(i, j, Tok::Meta);
+                i = j; continue;
+            }
+            if (spec.dollarVariables && c == L'$' && i + 1 < to) {
+                size_t j = i + 1;
+                if (text_[j] == L'{') {
+                    const size_t close = text_.find(L'}', j);
+                    j = close == std::wstring::npos || close > LineEnd(i, to) ? j + 1 : close + 1;
+                } else {
+                    while (j < to && (IsIdentChar(text_[j]) || (spec.dashIdentifiers && text_[j] == L':'))) ++j;
+                    if (j == i + 1 && j < to && (iswdigit(text_[j]) || wcschr(L"@#?*!$-_", text_[j]))) ++j;
+                }
+                if (j > i + 1) {
+                    Add(i, j, Tok::Variable);
+                    i = j; continue;
+                }
+            }
+            if (spec.percentVariables && (c == L'%' || c == L'!') && i + 1 < to) {
+                size_t j = i + 1;
+                if (c == L'%' && (text_[j] == L'%' || text_[j] == L'~' || iswdigit(text_[j]))) {
+                    if (text_[j] == L'%') ++j;
+                    while (j < to && (iswalnum(text_[j]) || text_[j] == L'~')) ++j;
+                    Add(i, j, Tok::Variable);
+                    i = j; continue;
+                }
+                const size_t close = text_.find(c, j);
+                if (close != std::wstring::npos && close > j && close - j < 64 && close < LineEnd(i, to)) {
+                    bool simple = true;
+                    for (size_t k = j; k < close; ++k) {
+                        if (!(IsIdentChar(text_[k]) || text_[k] == L':' || text_[k] == L'~' || text_[k] == L'=' || text_[k] == L'.')) simple = false;
+                    }
+                    if (simple) {
+                        Add(i, close + 1, Tok::Variable);
+                        i = close + 1; continue;
+                    }
+                }
+            }
+            if (spec.dashIdentifiers && c == L'-' && i + 1 < to && IsIdentStart(text_[i + 1]) &&
+                (i == from || text_[i - 1] == L' ' || text_[i - 1] == L'\t' || text_[i - 1] == L'(')) {
+                size_t j = i + 1;
+                while (j < to && IsIdentChar(text_[j])) ++j;
+                Add(i, j, Tok::Attribute);
+                i = j; continue;
+            }
+            if (IsIdentStart(c)) {
+                size_t j = i + 1;
+                while (j < to && (IsIdentChar(text_[j]) ||
+                       (spec.dashIdentifiers && text_[j] == L'-' && j + 1 < to && IsIdentStart(text_[j + 1])))) ++j;
+                // String prefixes: r"..", f'..', b"..", u8"..", L"..", @"..".
+                if (j < to && spec.quotes.find(text_[j]) != std::wstring::npos && j - i <= 2) {
+                    bool prefix = true;
+                    for (size_t k = i; k < j; ++k) prefix = prefix && wcschr(L"rRbBfFuUL8", text_[k]) != nullptr;
+                    if (prefix) {
+                        const wchar_t q = text_[j];
+                        size_t end;
+                        if (spec.tripleQuotes && j + 2 < to && text_[j + 1] == q && text_[j + 2] == q) {
+                            const size_t close = text_.find(std::wstring(3, q), j + 3);
+                            end = close == std::wstring::npos ? to : std::min(to, close + 3);
+                        } else {
+                            end = StringEnd(j, to, q, spec.multilineQuotes, spec.backslashEscapes && text_[i] != L'r' && text_[i] != L'R');
+                        }
+                        Add(i, end, Tok::String);
+                        i = end; continue;
+                    }
+                }
+                const std::wstring word = text_.substr(i, j - i);
+                const std::wstring key = spec.caseInsensitive ? LowerInvariantSyntax(word) : word;
+                Tok kind = Tok::Plain;
+                if (spec.keywords.count(key)) kind = Tok::Keyword;
+                else if (spec.constants.count(key)) kind = Tok::Constant;
+                else if (spec.types.count(key)) kind = Tok::Type;
+                else if (spec.builtins.count(key)) kind = Tok::Function;
+                else {
+                    const size_t next = SkipSpaces(j, to);
+                    const wchar_t prev = PreviousNonSpace(i, from);
+                    const bool call = next < to && text_[next] == L'(';
+                    const bool macro = spec.macroBang && next < to && text_[next] == L'!';
+                    bool hasLower = false, hasLetter = false;
+                    for (const wchar_t ch : word) {
+                        hasLower = hasLower || iswlower(ch);
+                        hasLetter = hasLetter || iswalpha(ch);
+                    }
+                    if (spec.dashIdentifiers && word.find(L'-') != std::wstring::npos) kind = Tok::Function;  // cmdlets
+                    else if (call || macro) kind = Tok::Function;
+                    else if (prev == L'.' || (prev == L'>' && i >= 2 && text_[i - 2] == L'-')) kind = Tok::Property;
+                    else if (iswupper(word[0]) && hasLower && word[0] < 128) kind = Tok::Type;
+                    else if (word.size() > 1 && hasLetter && !hasLower && word[0] < 128) kind = Tok::Constant;
+                }
+                Add(i, j, kind);
+                i = j; continue;
+            }
+            ++i;
+        }
+    }
+
+    void Markup(size_t from, size_t to) {
+        size_t i = from;
+        while (i < to) {
+            if (At(i, L"<!--")) {
+                const size_t close = text_.find(L"-->", i + 4);
+                const size_t end = close == std::wstring::npos ? to : std::min(to, close + 3);
+                Add(i, end, Tok::Comment);
+                i = end; continue;
+            }
+            if (At(i, L"<![CDATA[")) {
+                const size_t close = text_.find(L"]]>", i);
+                const size_t end = close == std::wstring::npos ? to : std::min(to, close + 3);
+                Add(i, end, Tok::String);
+                i = end; continue;
+            }
+            const wchar_t c = text_[i];
+            if (c == L'<' && i + 1 < to && (text_[i + 1] == L'!' || text_[i + 1] == L'?')) {
+                const size_t close = text_.find(L'>', i);
+                const size_t end = close == std::wstring::npos ? to : std::min(to, close + 1);
+                Add(i, end, Tok::Meta);
+                i = end; continue;
+            }
+            if (c == L'<' && i + 1 < to && (IsIdentStart(text_[i + 1]) || text_[i + 1] == L'/')) {
+                size_t j = i + 1;
+                const bool closing = text_[j] == L'/';
+                if (closing) ++j;
+                const size_t nameStart = j;
+                while (j < to && (IsIdentChar(text_[j]) || text_[j] == L'-' || text_[j] == L':' || text_[j] == L'.')) ++j;
+                const std::wstring name = Lower(nameStart, j);
+                Add(i, j, Tok::Tag);
+                size_t k = j;
+                while (k < to) {
+                    k = SkipSpaces(k, to);
+                    if (k >= to) break;
+                    const wchar_t ch = text_[k];
+                    if (ch == L'\r' || ch == L'\n') { ++k; continue; }
+                    if (ch == L'>') { Add(k, k + 1, Tok::Tag); ++k; break; }
+                    if (ch == L'/' && k + 1 < to && text_[k + 1] == L'>') { Add(k, k + 2, Tok::Tag); k += 2; break; }
+                    if (ch == L'<') break;  // broken tag
+                    if (ch == L'=') {
+                        k = SkipSpaces(k + 1, to);
+                        if (k < to && (text_[k] == L'"' || text_[k] == L'\'')) {
+                            const size_t end = StringEnd(k, to, text_[k], true, false);
+                            Add(k, end, Tok::String);
+                            k = end;
+                        } else {
+                            const size_t start = k;
+                            while (k < to && !iswspace(text_[k]) && text_[k] != L'>') ++k;
+                            Add(start, k, Tok::String);
+                        }
+                        continue;
+                    }
+                    const size_t start = k;
+                    while (k < to && !iswspace(text_[k]) && text_[k] != L'=' && text_[k] != L'>' && text_[k] != L'/' && text_[k] != L'<') ++k;
+                    if (k == start) { ++k; continue; }
+                    Add(start, k, Tok::Attribute);
+                }
+                i = k;
+                if (!closing && (name == L"script" || name == L"style")) {
+                    size_t close = i;
+                    while ((close = text_.find(L"</", close)) != std::wstring::npos && !AtNoCase(close + 2, name.c_str())) close += 2;
+                    const size_t end = close == std::wstring::npos ? to : std::min(close, to);
+                    Run(name == L"script" ? kLanguageJavaScript : kLanguageCss, i, end);
+                    i = end;
+                }
+                continue;
+            }
+            if (c == L'&') {
+                size_t j = i + 1;
+                while (j < to && j - i < 12 && (iswalnum(text_[j]) || text_[j] == L'#')) ++j;
+                if (j < to && text_[j] == L';' && j > i + 1) {
+                    Add(i, j + 1, Tok::Constant);
+                    i = j + 1; continue;
+                }
+            }
+            ++i;
+        }
+    }
+
+    void Css(size_t from, size_t to) {
+        int depth = 0;
+        bool inValue = false;
+        size_t i = from;
+        while (i < to) {
+            const wchar_t c = text_[i];
+            if (At(i, L"/*")) {
+                const size_t close = text_.find(L"*/", i + 2);
+                const size_t end = close == std::wstring::npos ? to : std::min(to, close + 2);
+                Add(i, end, Tok::Comment);
+                i = end; continue;
+            }
+            if (At(i, L"//") && (i == from || iswspace(text_[i - 1]) || text_[i - 1] == L';' || text_[i - 1] == L'{' || text_[i - 1] == L'}')) {
+                const size_t end = LineEnd(i, to);
+                Add(i, end, Tok::Comment);
+                i = end; continue;
+            }
+            if (c == L'"' || c == L'\'') {
+                const size_t end = StringEnd(i, to, c, false, true);
+                Add(i, end, Tok::String);
+                i = end; continue;
+            }
+            if (c == L'{') { ++depth; inValue = false; ++i; continue; }
+            if (c == L'}') { depth = std::max(0, depth - 1); inValue = false; ++i; continue; }
+            if (c == L';') { inValue = false; ++i; continue; }
+            if (c == L'@' && i + 1 < to && IsIdentStart(text_[i + 1])) {
+                size_t j = i + 1;
+                while (j < to && (IsIdentChar(text_[j]) || text_[j] == L'-')) ++j;
+                Add(i, j, inValue ? Tok::Variable : Tok::Keyword);
+                i = j; continue;
+            }
+            if ((c == L'$' && i + 1 < to && IsIdentStart(text_[i + 1])) || At(i, L"--")) {
+                size_t j = i + (c == L'$' ? 1 : 2);
+                while (j < to && (IsIdentChar(text_[j]) || text_[j] == L'-')) ++j;
+                if (j > i + 1) {
+                    Add(i, j, Tok::Variable);
+                    i = j; continue;
+                }
+            }
+            if (c == L'!' && AtNoCase(i, L"!important")) {
+                Add(i, i + 10, Tok::Keyword);
+                i += 10; continue;
+            }
+            if (c == L'#' && inValue) {
+                size_t j = i + 1;
+                while (j < to && iswxdigit(text_[j])) ++j;
+                Add(i, j, Tok::Number);
+                i = j; continue;
+            }
+            if (iswdigit(c) || (c == L'.' && i + 1 < to && iswdigit(text_[i + 1]) && inValue)) {
+                size_t j = i;
+                while (j < to && (iswdigit(text_[j]) || text_[j] == L'.')) ++j;
+                while (j < to && (iswalpha(text_[j]) || text_[j] == L'%')) ++j;  // units
+                Add(i, j, Tok::Number);
+                i = j; continue;
+            }
+            if (c == L':' && !inValue && i + 1 < to && (text_[i + 1] == L':' || IsIdentStart(text_[i + 1]))) {
+                // A pseudo-class in a selector (a:hover) vs. a property colon (color: red).
+                size_t j = i + 1;
+                if (text_[j] == L':') ++j;
+                const size_t nameStart = j;
+                while (j < to && (IsIdentChar(text_[j]) || text_[j] == L'-')) ++j;
+                const size_t after = SkipSpaces(j, to);
+                const bool selector = depth == 0 || (after < to && (text_[after] == L'{' || text_[after] == L',' || text_[after] == L'('));
+                if (selector && j > nameStart) {
+                    Add(i, j, Tok::Keyword);
+                    i = j; continue;
+                }
+                inValue = true;
+                ++i; continue;
+            }
+            if (c == L':') { inValue = true; ++i; continue; }
+            if (IsIdentStart(c) || c == L'-' || ((c == L'.' || c == L'#') && i + 1 < to && (IsIdentStart(text_[i + 1]) || text_[i + 1] == L'-'))) {
+                size_t j = i + 1;
+                while (j < to && (IsIdentChar(text_[j]) || text_[j] == L'-')) ++j;
+                const size_t next = SkipSpaces(j, to);
+                Tok kind;
+                if (next < to && text_[next] == L'(') kind = Tok::Function;
+                else if (inValue) kind = Tok::Constant;
+                else if (depth > 0 && next < to && text_[next] == L':' && !(next + 1 < to && IsIdentStart(text_[next + 1]) && LooksLikeSelector(next, to))) kind = Tok::Property;
+                else kind = Tok::Tag;
+                Add(i, j, kind);
+                i = j; continue;
+            }
+            ++i;
+        }
+    }
+    // "a:hover {" — a colon followed by a name and then '{' on the same line.
+    bool LooksLikeSelector(size_t colon, size_t to) const {
+        const size_t end = LineEnd(colon, to);
+        const size_t brace = text_.find(L'{', colon);
+        const size_t semi = text_.find(L';', colon);
+        return brace != std::wstring::npos && brace < end && (semi == std::wstring::npos || semi > brace);
+    }
+
+    void Json(size_t from, size_t to) {
+        size_t i = from;
+        while (i < to) {
+            const wchar_t c = text_[i];
+            if (At(i, L"//")) { const size_t end = LineEnd(i, to); Add(i, end, Tok::Comment); i = end; continue; }
+            if (At(i, L"/*")) {
+                const size_t close = text_.find(L"*/", i + 2);
+                const size_t end = close == std::wstring::npos ? to : std::min(to, close + 2);
+                Add(i, end, Tok::Comment);
+                i = end; continue;
+            }
+            if (c == L'"') {
+                const size_t end = StringEnd(i, to, c, false, true);
+                const size_t next = SkipSpaces(end, to);
+                Add(i, end, next < to && text_[next] == L':' ? Tok::Property : Tok::String);
+                i = end; continue;
+            }
+            if (iswdigit(c) || (c == L'-' && i + 1 < to && iswdigit(text_[i + 1]))) {
+                const size_t end = NumberEnd(c == L'-' ? i + 1 : i, to);
+                Add(i, end, Tok::Number);
+                i = end; continue;
+            }
+            if (IsIdentStart(c)) {
+                size_t j = i;
+                while (j < to && IsIdentChar(text_[j])) ++j;
+                const std::wstring word = text_.substr(i, j - i);
+                if (word == L"true" || word == L"false" || word == L"null") Add(i, j, Tok::Constant);
+                i = j; continue;
+            }
+            ++i;
+        }
+    }
+
+    // A value after '=' / ':' in config-like files.
+    void Value(size_t start, size_t end) {
+        start = SkipSpaces(start, end);
+        while (end > start && (text_[end - 1] == L' ' || text_[end - 1] == L'\t')) --end;
+        if (start >= end) return;
+        const wchar_t c = text_[start];
+        if (c == L'"' || c == L'\'') { Add(start, end, Tok::String); return; }
+        const std::wstring lower = Lower(start, end);
+        if (lower == L"true" || lower == L"false" || lower == L"yes" || lower == L"no" || lower == L"on" ||
+            lower == L"off" || lower == L"null" || lower == L"~" || lower == L"none") {
+            Add(start, end, Tok::Constant);
+            return;
+        }
+        bool numeric = true;
+        for (size_t k = start; k < end; ++k) {
+            const wchar_t ch = text_[k];
+            if (!(iswdigit(ch) || ch == L'.' || ch == L'-' || ch == L'+' || ch == L'_' || ch == L'e' || ch == L'E')) numeric = false;
+        }
+        if (numeric && iswdigit(text_[end - 1])) { Add(start, end, Tok::Number); return; }
+        if (c == L'&' || c == L'*') { Add(start, end, Tok::Variable); return; }
+        if ((c == L'|' || c == L'>') && end - start <= 2) { Add(start, end, Tok::Keyword); return; }
+        if (c == L'[' || c == L'{') {  // inline arrays / tables: colour the pieces
+            Code(*SpecFor(kLanguageJavaScript), start, end);
+            return;
+        }
+        Add(start, end, Tok::String);
+    }
+
+    // INI, TOML, .env, .properties, .gitignore and friends.
+    void Config(size_t from, size_t to) {
+        for (size_t line = from; line < to;) {
+            const size_t end = LineEnd(line, to);
+            const size_t p = SkipSpaces(line, end);
+            if (p < end) {
+                const wchar_t c = text_[p];
+                if (c == L'#' || c == L';' || At(p, L"//")) {
+                    Add(p, end, Tok::Comment);
+                } else if (c == L'[') {
+                    const size_t close = text_.find(L']', p);
+                    Add(p, close == std::wstring::npos || close > end ? end : close + 1, Tok::Tag);
+                } else {
+                    size_t keyStart = p;
+                    if (AtNoCase(p, L"export ") || AtNoCase(p, L"set ")) {
+                        const size_t word = text_.find(L' ', p);
+                        Add(p, word, Tok::Keyword);
+                        keyStart = SkipSpaces(word, end);
+                    }
+                    const size_t equals = text_.find_first_of(L"=:", keyStart);
+                    if (equals != std::wstring::npos && equals < end) {
+                        size_t keyEnd = equals;
+                        while (keyEnd > keyStart && (text_[keyEnd - 1] == L' ' || text_[keyEnd - 1] == L'\t')) --keyEnd;
+                        Add(keyStart, keyEnd, Tok::Property);
+                        // Inline comment after a value: "value  # note"
+                        size_t valueEnd = end;
+                        const size_t hash = text_.find(L" #", equals);
+                        if (hash != std::wstring::npos && hash < end && text_.find_first_of(L"\"'", equals) > hash) {
+                            Add(hash + 1, end, Tok::Comment);
+                            valueEnd = hash;
+                        }
+                        Value(equals + 1, valueEnd);
+                    }
+                }
+            }
+            line = NextLine(end, to);
+        }
+    }
+
+    void Yaml(size_t from, size_t to) {
+        for (size_t line = from; line < to;) {
+            const size_t end = LineEnd(line, to);
+            size_t p = SkipSpaces(line, end);
+            if (p < end) {
+                if (text_[p] == L'#') {
+                    Add(p, end, Tok::Comment);
+                } else if (At(p, L"---") || At(p, L"...")) {
+                    Add(p, end, Tok::Meta);
+                } else {
+                    if (text_[p] == L'-' && (p + 1 == end || text_[p + 1] == L' ')) {
+                        Add(p, p + 1, Tok::Keyword);
+                        p = SkipSpaces(p + 1, end);
+                    }
+                    // Strip a trailing comment that is not inside quotes.
+                    size_t contentEnd = end;
+                    bool quoted = false;
+                    wchar_t quote = 0;
+                    for (size_t k = p; k < end; ++k) {
+                        const wchar_t ch = text_[k];
+                        if (quoted) { if (ch == quote) quoted = false; continue; }
+                        if (ch == L'"' || ch == L'\'') { quoted = true; quote = ch; continue; }
+                        if (ch == L'#' && k > p && (text_[k - 1] == L' ' || text_[k - 1] == L'\t')) {
+                            Add(k, end, Tok::Comment);
+                            contentEnd = k;
+                            break;
+                        }
+                    }
+                    size_t colon = std::wstring::npos;
+                    if (p < contentEnd && text_[p] != L'"' && text_[p] != L'\'' && text_[p] != L'[' && text_[p] != L'{') {
+                        for (size_t k = p; k < contentEnd; ++k) {
+                            if (text_[k] == L':' && (k + 1 == contentEnd || text_[k + 1] == L' ' || text_[k + 1] == L'\t')) { colon = k; break; }
+                        }
+                    }
+                    if (colon != std::wstring::npos) {
+                        Add(p, colon, Tok::Property);
+                        Value(colon + 1, contentEnd);
+                    } else {
+                        Value(p, contentEnd);
+                    }
+                }
+            }
+            line = NextLine(end, to);
+        }
+    }
+
+    void Markdown(size_t from, size_t to) {
+        bool inFence = false;
+        int fenceLanguage = kLanguagePlain;
+        size_t codeStart = 0;
+        for (size_t line = from; line < to;) {
+            const size_t end = LineEnd(line, to);
+            const size_t next = NextLine(end, to);
+            const size_t p = SkipSpaces(line, end);
+            const bool fence = At(p, L"```") || At(p, L"~~~");
+            if (inFence) {
+                if (fence) {
+                    if (fenceLanguage != kLanguagePlain) Run(fenceLanguage, codeStart, line);
+                    else Add(codeStart, line, Tok::String);
+                    Add(p, end, Tok::Meta);
+                    inFence = false;
+                }
+                line = next;
+                continue;
+            }
+            if (fence) {
+                inFence = true;
+                size_t infoStart = SkipSpaces(p + 3, end), infoEnd = infoStart;
+                while (infoEnd < end && !iswspace(text_[infoEnd]) && text_[infoEnd] != L'{') ++infoEnd;
+                fenceLanguage = LanguageFromName(text_.substr(infoStart, infoEnd - infoStart));
+                Add(p, end, Tok::Meta);
+                codeStart = next;
+                line = next;
+                continue;
+            }
+            size_t hashes = p;
+            while (hashes < end && text_[hashes] == L'#') ++hashes;
+            if (hashes > p && hashes - p <= 6 && (hashes == end || text_[hashes] == L' ')) {
+                Add(p, end, Tok::Heading);
+            } else if (p < end && text_[p] == L'>') {
+                Add(p, end, Tok::Comment);
+            } else if (end - p >= 3 && (At(p, L"---") || At(p, L"***") || At(p, L"___")) &&
+                       text_.find_first_not_of(text_[p], p) >= end) {
+                Add(p, end, Tok::Meta);
             } else {
+                size_t q = p;
+                if (q < end && (text_[q] == L'-' || text_[q] == L'*' || text_[q] == L'+') && q + 1 < end && text_[q + 1] == L' ') {
+                    Add(q, q + 1, Tok::Keyword);
+                    q += 2;
+                } else {
+                    size_t digits = q;
+                    while (digits < end && iswdigit(text_[digits])) ++digits;
+                    if (digits > q && digits + 1 < end && (text_[digits] == L'.' || text_[digits] == L')') && text_[digits + 1] == L' ') {
+                        Add(q, digits + 1, Tok::Keyword);
+                        q = digits + 2;
+                    }
+                }
+                Inline(q, end);
+            }
+            line = next;
+        }
+        if (inFence && codeStart < to) {
+            if (fenceLanguage != kLanguagePlain) Run(fenceLanguage, codeStart, to);
+            else Add(codeStart, to, Tok::String);
+        }
+    }
+    void Inline(size_t i, size_t end) {
+        while (i < end) {
+            const wchar_t c = text_[i];
+            if (c == L'`') {
+                const size_t close = text_.find(L'`', i + 1);
+                if (close != std::wstring::npos && close < end) { Add(i, close + 1, Tok::String); i = close + 1; continue; }
+            }
+            if ((c == L'*' || c == L'_') && i + 1 < end && text_[i + 1] == c) {
+                const size_t close = text_.find(std::wstring(2, c), i + 2);
+                if (close != std::wstring::npos && close < end) { Add(i, close + 2, Tok::Emphasis); i = close + 2; continue; }
+            }
+            if (c == L'[' || (c == L'!' && i + 1 < end && text_[i + 1] == L'[')) {
+                const size_t closeText = text_.find(L"](", i);
+                if (closeText != std::wstring::npos && closeText < end) {
+                    const size_t closeUrl = text_.find(L')', closeText);
+                    if (closeUrl != std::wstring::npos && closeUrl < end) { Add(i, closeUrl + 1, Tok::Link); i = closeUrl + 1; continue; }
+                }
+            }
+            if (At(i, L"http://") || At(i, L"https://")) {
+                size_t j = i;
+                while (j < end && !iswspace(text_[j]) && text_[j] != L')' && text_[j] != L'>') ++j;
+                Add(i, j, Tok::Link);
+                i = j; continue;
+            }
+            ++i;
+        }
+    }
+
+    void Dockerfile(size_t from, size_t to) {
+        static const std::unordered_set<std::wstring> instructions = WordSet(L"from run cmd label maintainer expose env add copy "
+            L"entrypoint volume user workdir arg onbuild stopsignal healthcheck shell as", true);
+        const CodeSpec* shell = SpecFor(kLanguageShell);
+        bool continuation = false;
+        for (size_t line = from; line < to;) {
+            const size_t end = LineEnd(line, to);
+            size_t p = SkipSpaces(line, end);
+            if (p < end && text_[p] == L'#') {
+                Add(p, end, Tok::Comment);
+            } else if (p < end) {
+                size_t word = p;
+                while (word < end && IsIdentChar(text_[word])) ++word;
+                if (!continuation && instructions.count(Lower(p, word))) {
+                    Add(p, word, Tok::Keyword);
+                    p = word;
+                }
+                Code(*shell, p, end);
+            }
+            continuation = end > line && text_[end - 1] == L'\\';
+            line = NextLine(end, to);
+        }
+    }
+
+    void Batch(size_t from, size_t to) {
+        const CodeSpec* spec = SpecFor(kLanguageBatch);
+        for (size_t line = from; line < to;) {
+            const size_t end = LineEnd(line, to);
+            size_t p = SkipSpaces(line, end);
+            if (p < end && text_[p] == L'@') ++p;
+            if (AtNoCase(p, L"rem") && (p + 3 == end || iswspace(text_[p + 3]))) Add(p, end, Tok::Comment);
+            else if (At(p, L"::")) Add(p, end, Tok::Comment);
+            else if (p < end && text_[p] == L':') Add(p, end, Tok::Tag);
+            else Code(*spec, p, end);
+            line = NextLine(end, to);
+        }
+    }
+
+    // Rainbow columns, like VS Code's Rainbow CSV.
+    void Csv(size_t from, size_t to) {
+        const size_t firstEnd = LineEnd(from, to);
+        const std::wstring firstLine = text_.substr(from, firstEnd - from);
+        wchar_t delimiter = L',';
+        const auto count = [&](wchar_t ch) { return std::count(firstLine.begin(), firstLine.end(), ch); };
+        if (count(L'\t') > count(delimiter)) delimiter = L'\t';
+        if (count(L';') > count(delimiter)) delimiter = L';';
+        static constexpr Tok columns[] = {Tok::Column0, Tok::Column1, Tok::Column2, Tok::Column3, Tok::Column4, Tok::Column5};
+        size_t i = from;
+        int column = 0;
+        size_t fieldStart = from;
+        bool quoted = false;
+        while (i <= to) {
+            const wchar_t c = i < to ? text_[i] : L'\n';
+            if (quoted) {
+                if (c == L'"') {
+                    if (i + 1 < to && text_[i + 1] == L'"') { i += 2; continue; }
+                    quoted = false;
+                }
+                ++i;
+                continue;
+            }
+            if (c == L'"' && i == fieldStart) { quoted = true; ++i; continue; }
+            if (c == delimiter || c == L'\r' || c == L'\n') {
+                Add(fieldStart, i, columns[column % 6]);
+                if (c == delimiter) ++column;
+                else column = 0;
+                fieldStart = i + 1;
+                if (c == L'\r' && i + 1 < to && text_[i + 1] == L'\n') { ++i; fieldStart = i + 1; }
+            }
+            ++i;
+        }
+    }
+
+    void Log(size_t from, size_t to) {
+        static const wchar_t* errors[] = {L"FATAL", L"CRITICAL", L"ERROR", L"ERR", L"SEVERE", L"EXCEPTION", L"FAILED", L"FAIL", L"PANIC"};
+        static const wchar_t* warnings[] = {L"WARNING", L"WARN"};
+        static const wchar_t* infos[] = {L"INFO", L"DEBUG", L"TRACE", L"NOTICE", L"VERBOSE"};
+        for (size_t line = from; line < to;) {
+            const size_t end = LineEnd(line, to);
+            size_t i = line;
+            // Leading timestamp: digits, - / : . T space and brackets.
+            size_t stamp = SkipSpaces(i, end);
+            const size_t stampStart = stamp;
+            if (stamp < end && text_[stamp] == L'[') ++stamp;
+            size_t digits = 0;
+            while (stamp < end && (iswdigit(text_[stamp]) || wcschr(L"-/:.,TZ+ ", text_[stamp]))) {
+                if (iswdigit(text_[stamp])) ++digits;
+                ++stamp;
+            }
+            if (stamp < end && text_[stamp] == L']') ++stamp;
+            if (digits >= 6) {
+                Add(stampStart, stamp, Tok::Meta);
+                i = stamp;
+            }
+            while (i < end) {
+                const wchar_t c = text_[i];
+                if (c == L'"' || c == L'\'') {
+                    const size_t close = StringEnd(i, end, c, false, true);
+                    Add(i, close, Tok::String);
+                    i = close; continue;
+                }
+                if (At(i, L"http://") || At(i, L"https://")) {
+                    size_t j = i;
+                    while (j < end && !iswspace(text_[j])) ++j;
+                    Add(i, j, Tok::Link);
+                    i = j; continue;
+                }
+                if (IsIdentStart(c) && (i == line || !IsIdentChar(text_[i - 1]))) {
+                    size_t j = i;
+                    while (j < end && IsIdentChar(text_[j])) ++j;
+                    const std::wstring word = text_.substr(i, j - i);
+                    const auto matches = [&](const auto& list) {
+                        for (const wchar_t* level : list) if (_wcsicmp(word.c_str(), level) == 0 && iswupper(word[0])) return true;
+                        return false;
+                    };
+                    if (matches(errors)) Add(i, j, Tok::Error);
+                    else if (matches(warnings)) Add(i, j, Tok::Warning);
+                    else if (matches(infos)) Add(i, j, Tok::Info);
+                    i = j; continue;
+                }
                 ++i;
             }
-        }
-    } else if (language != kLanguagePlain && language != kLanguageMarkdown) {
-        const bool singleQuotes = language != kLanguageJson;
-        for (size_t i = 0; i < text.size(); ++i) {
-            const wchar_t quote = text[i];
-            if (quote != L'"' && !(singleQuotes && (quote == L'\'' || quote == L'`'))) continue;
-            const size_t limit = quote == L'`' ? text.size() : lineEnd(i + 1);
-            size_t j = i + 1;
-            while (j < limit && text[j] != quote) j += (text[j] == L'\\') ? 2 : 1;
-            if (j >= limit) continue;  // unterminated: leave it uncoloured
-            color(i, j + 1, palette.syntaxString);
-            i = j;
+            line = NextLine(end, to);
         }
     }
 
-    if (tom) {
-        // The selection was never touched, so the caret (and the direction of
-        // a Shift-selection) stays exactly as the user left it.
-        tom.document()->Unfreeze(&freezeCount);
-        tom.document()->Undo(tomResume, nullptr);
-        return;
+    void Diff(size_t from, size_t to) {
+        for (size_t line = from; line < to;) {
+            const size_t end = LineEnd(line, to);
+            if (At(line, L"+++") || At(line, L"---") || At(line, L"diff ") || At(line, L"index ")) Add(line, end, Tok::Keyword);
+            else if (At(line, L"@@")) Add(line, end, Tok::Meta);
+            else if (line < end && text_[line] == L'+') Add(line, end, Tok::Added);
+            else if (line < end && text_[line] == L'-') Add(line, end, Tok::Removed);
+            line = NextLine(end, to);
+        }
     }
-    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&saved));
-    SendMessageW(editor, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
-    SendMessageW(editor, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(editor, nullptr, TRUE);
+};
+
+// ---- Applying colours ------------------------------------------------------------------
+
+bool SyntaxEnabled(const TabDocument& document) {
+    return EffectiveLanguage(document) != kLanguagePlain && GetWindowTextLengthW(document.editor) <= static_cast<int>(kSyntaxSizeLimit);
 }
 
-// Re-colouring after typing pauses. Very large documents are skipped to keep
-// typing responsive; they are still coloured when opened.
-constexpr UINT kTimerHighlight = 4102;
-constexpr UINT kHighlightDelayMs = 300;
-constexpr LONG kLiveHighlightLimit = 300000;
+void RetokenizeDocument(TabDocument& document) {
+    document.syntaxStale = false;
+    document.syntaxColored.clear();
+    document.syntaxTokens.clear();
+    const std::wstring text = GetEditorRawText(document.editor);
+    if (document.untitled && document.language == kLanguageAuto && document.path.empty()) {
+        document.sniffedLanguage = SniffLanguage(text);  // a new tab follows what is typed
+    }
+    if (!SyntaxEnabled(document)) return;
+    SyntaxLexer(text, document.syntaxTokens).Run(EffectiveLanguage(document), 0, text.size());
+    std::sort(document.syntaxTokens.begin(), document.syntaxTokens.end(),
+        [](const SyntaxToken& a, const SyntaxToken& b) { return a.start < b.start; });
+}
+
+struct StyleFonts {
+    TextDocumentRef& tom;
+    ITextFont* fonts[32]{};
+    explicit StyleFonts(TextDocumentRef& ref) : tom(ref) {}
+    ~StyleFonts() { for (ITextFont* font : fonts) if (font) font->Release(); }
+    StyleFonts(const StyleFonts&) = delete;
+    StyleFonts& operator=(const StyleFonts&) = delete;
+    ITextFont* For(Tok kind) {
+        ITextFont*& font = fonts[static_cast<size_t>(kind) & 31];
+        if (!font) {
+            const SyntaxStyle style = StyleFor(kind);
+            font = tom.MakeStyleFont(style.color, style.bold);
+        }
+        return font;
+    }
+};
+
+void PaintSyntaxRange(TabDocument& document, TextDocumentRef& tom, StyleFonts& fonts, LONG from, LONG to) {
+    tom.ApplyFont(from, to, fonts.For(Tok::Plain));
+    const auto& tokens = document.syntaxTokens;
+    auto it = std::lower_bound(tokens.begin(), tokens.end(), static_cast<uint32_t>(from),
+        [](const SyntaxToken& token, uint32_t value) { return token.start < value; });
+    if (it != tokens.begin() && (it - 1)->start + (it - 1)->length > static_cast<uint32_t>(from)) --it;
+    for (; it != tokens.end() && static_cast<LONG>(it->start) < to; ++it) {
+        const LONG start = std::max(from, static_cast<LONG>(it->start));
+        const LONG end = std::min(to, static_cast<LONG>(it->start + it->length));
+        if (end <= start) continue;
+        tom.ApplyFont(start, end, fonts.For(it->kind));
+    }
+}
+
+// RichEdit keeps character formatting in one array of runs; every coloured
+// token adds runs, and each insert gets slower as the array grows. Keep the
+// painted area near the view and return far-away text to plain (which merges
+// its runs back); it is repainted if the user scrolls back.
+constexpr LONG kMaxPaintedChars = 60000;
+
+// Colours whatever part of the visible text (plus a margin) is not coloured yet.
+void SyntaxColorVisible(TabDocument& document) {
+    HWND editor = document.editor;
+    if (!editor || !IsWindowVisible(editor)) return;
+    if (document.syntaxStale) RetokenizeDocument(document);
+    if (document.syntaxTokens.empty() && !document.syntaxHadColors) return;
+    const LONG length = GetWindowTextLengthW(editor);
+    RECT client{};
+    GetClientRect(editor, &client);
+    POINTL topLeft{0, 0}, bottomRight{client.right, client.bottom};
+    LONG from = static_cast<LONG>(SendMessageW(editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&topLeft)));
+    LONG to = static_cast<LONG>(SendMessageW(editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&bottomRight)));
+    from = std::max(0L, from - 2000);
+    to = std::min(length + 1, to + 2000);
+    // Gaps between already coloured intervals.
+    std::vector<std::pair<LONG, LONG>> gaps;
+    LONG cursor = from;
+    for (const auto& [start, end] : document.syntaxColored) {
+        if (end <= cursor) continue;
+        if (start >= to) break;
+        if (start > cursor) gaps.emplace_back(cursor, std::min(start, to));
+        cursor = std::max(cursor, end);
+    }
+    if (cursor < to) gaps.emplace_back(cursor, to);
+    if (gaps.empty()) return;
+
+    EditorEventMute mute(editor);
+    TextDocumentRef tom(editor);
+    if (!tom) return;
+    long freezeCount = 0;
+    tom.document()->Undo(tomSuspend, nullptr);
+    tom.document()->Freeze(&freezeCount);
+    StyleFonts fonts(tom);
+    LONG painted = 0;
+    for (const auto& [start, end] : document.syntaxColored) painted += end - start;
+    if (painted + (to - from) > kMaxPaintedChars) {
+        std::vector<std::pair<LONG, LONG>> kept;
+        for (const auto& interval : document.syntaxColored) {
+            if (interval.second < from || interval.first > to) tom.ApplyFont(interval.first, interval.second, fonts.For(Tok::Plain));
+            else kept.push_back(interval);
+        }
+        document.syntaxColored.swap(kept);
+    }
+    for (const auto& [start, end] : gaps) PaintSyntaxRange(document, tom, fonts, start, end);
+    tom.document()->Unfreeze(&freezeCount);
+    tom.document()->Undo(tomResume, nullptr);
+    document.syntaxHadColors = !document.syntaxTokens.empty();
+
+    document.syntaxColored.emplace_back(from, to);
+    std::sort(document.syntaxColored.begin(), document.syntaxColored.end());
+    std::vector<std::pair<LONG, LONG>> merged;
+    for (const auto& interval : document.syntaxColored) {
+        if (!merged.empty() && interval.first <= merged.back().second) merged.back().second = std::max(merged.back().second, interval.second);
+        else merged.push_back(interval);
+    }
+    document.syntaxColored.swap(merged);
+}
+
+// Text, language or theme changed: re-tokenize and recolour what is visible;
+// other tabs recolour when they are shown.
+void HighlightDocument(TabDocument& document) {
+    document.syntaxStale = true;
+    document.syntaxColored.clear();
+    if (document.syntaxHadColors && !SyntaxEnabled(document)) {
+        // Switched to plain text: drop old colours once.
+        EditorEventMute mute(document.editor);
+        TextDocumentRef tom(document.editor);
+        if (tom) {
+            tom.document()->Undo(tomSuspend, nullptr);
+            tom.SetStyle(0, GetWindowTextLengthW(document.editor) + 1, StyleFor(Tok::Plain).color, false);
+            tom.document()->Undo(tomResume, nullptr);
+        }
+        document.syntaxHadColors = false;
+    }
+    SyntaxColorVisible(document);
+}
 
 void HighlightDocument(const TabDocument& document) {
-    ApplySimpleSyntaxHighlight(document.editor, EffectiveLanguage(document));
+    HighlightDocument(const_cast<TabDocument&>(document));
 }
+
+// Called after the editor scrolled or resized.
+void SyntaxOnViewChanged(HWND editor) {
+    for (TabDocument& document : g_app.documents) {
+        if (document.editor == editor) {
+            SyntaxColorVisible(document);
+            return;
+        }
+    }
+}
+
+// Re-colouring after typing pauses.
+constexpr UINT kTimerHighlight = 4102;
+constexpr UINT kHighlightDelayMs = 250;
 
 // Width needed for the active document's line numbers (at least 3 digits).
 int GutterWidthFor(HWND editor) {
@@ -1400,21 +2571,88 @@ bool IsAnsiRepresentable(std::wstring_view text) {
     return size > 0 && !usedDefault;
 }
 
+// Language for a file extension or a code-fence / language name ("js", "py").
+int LanguageFromName(const std::wstring& rawName) {
+    static const std::unordered_map<std::wstring, int> names = [] {
+        std::unordered_map<std::wstring, int> m;
+        const auto add = [&](int language, const wchar_t* list) {
+            std::wistringstream stream(list);
+            for (std::wstring name; stream >> name;) m[name] = language;
+        };
+        add(kLanguageHtml, L"html htm xhtml vue svelte astro");
+        add(kLanguageXml, L"xml svg xaml csproj vcxproj vbproj props targets resx xsd xsl xslt plist nuspec config manifest");
+        add(kLanguageCss, L"css scss sass less");
+        add(kLanguageJavaScript, L"js mjs cjs jsx javascript node");
+        add(kLanguageTypeScript, L"ts tsx mts cts typescript");
+        add(kLanguageCpp, L"c cc cpp cxx c++ h hpp hh hxx inl ino ipp");
+        add(kLanguagePython, L"py pyw pyi python python3");
+        add(kLanguageJson, L"json jsonc json5 webmanifest geojson ipynb");
+        add(kLanguageMarkdown, L"md markdown mdx mkd");
+        add(kLanguageSql, L"sql mysql pgsql psql");
+        add(kLanguagePowerShell, L"ps1 psm1 psd1 powershell pwsh ps");
+        add(kLanguageYaml, L"yaml yml");
+        add(kLanguageConfig, L"ini cfg conf toml properties env dotenv editorconfig gitignore gitattributes dockerignore npmrc reg inf");
+        add(kLanguageShell, L"sh bash zsh ksh fish shell shellscript console makefile mk");
+        add(kLanguageBatch, L"bat cmd batch");
+        add(kLanguageJava, L"java kt kts kotlin gradle groovy scala");
+        add(kLanguageCSharp, L"cs csx csharp c#");
+        add(kLanguageGo, L"go golang");
+        add(kLanguageRust, L"rs rust");
+        add(kLanguagePhp, L"php phtml php3 php4 php5");
+        add(kLanguageDockerfile, L"dockerfile containerfile docker");
+        add(kLanguageCsv, L"csv tsv");
+        add(kLanguageLog, L"log out");
+        add(kLanguageDiff, L"diff patch");
+        return m;
+    }();
+    const auto it = names.find(LowerInvariantSyntax(rawName));
+    return it == names.end() ? kLanguagePlain : it->second;
+}
+
 int LanguageFromPath(const std::wstring& path) {
-    std::wstring extension = fs::path(path).extension().wstring();
-    std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
-    if (extension == L".html" || extension == L".htm" || extension == L".xml" ||
-        extension == L".xhtml" || extension == L".svg" || extension == L".vue") return kLanguageHtml;
-    if (extension == L".css" || extension == L".scss" || extension == L".less") return 2;
-    if (extension == L".js" || extension == L".mjs" || extension == L".cjs" ||
-        extension == L".ts" || extension == L".jsx" || extension == L".tsx") return 3;
-    if (extension == L".c" || extension == L".cc" || extension == L".cpp" || extension == L".cxx" ||
-        extension == L".h" || extension == L".hpp" || extension == L".hh") return 4;
-    if (extension == L".py" || extension == L".pyw") return 5;
-    if (extension == L".json" || extension == L".jsonc") return kLanguageJson;
-    if (extension == L".md" || extension == L".markdown") return kLanguageMarkdown;
-    if (extension == L".sql") return 8;
-    if (extension == L".ps1" || extension == L".psm1" || extension == L".psd1") return 9;
+    if (path.empty()) return kLanguagePlain;
+    std::wstring name = LowerInvariantSyntax(fs::path(path).filename().wstring());
+    // config.yml.example, .env.production.sample, nginx.conf.template, settings.json.bak ...
+    for (bool stripped = true; stripped;) {
+        stripped = false;
+        for (const wchar_t* suffix : {L".example", L".sample", L".template", L".dist", L".tpl", L".bak", L".orig", L".default", L".old", L".tmpl"}) {
+            const std::wstring tail = suffix;
+            if (name.size() > tail.size() && name.ends_with(tail)) {
+                name.resize(name.size() - tail.size());
+                stripped = true;
+            }
+        }
+    }
+    if (name == L"dockerfile" || name == L"containerfile" || name.starts_with(L"dockerfile.") || name.ends_with(L".dockerfile")) return kLanguageDockerfile;
+    if (name == L"makefile" || name == L"gnumakefile" || name == L".bashrc" || name == L".zshrc" || name == L".profile" || name == L".bash_profile") return kLanguageShell;
+    if (name == L".env" || name.starts_with(L".env.") || name.ends_with(L".env")) return kLanguageConfig;
+    if (name == L".prettierrc" || name == L".eslintrc" || name == L".babelrc" || name == L"composer.lock" || name == L".jshintrc") return kLanguageJson;
+    for (const wchar_t* config : {L".gitignore", L".gitattributes", L".dockerignore", L".npmrc", L".editorconfig", L".prettierignore", L".eslintignore", L".yarnrc", L".gitmodules"}) {
+        if (name == config) return kLanguageConfig;
+    }
+    const size_t dot = name.rfind(L'.');
+    if (dot == std::wstring::npos || dot + 1 >= name.size()) return kLanguagePlain;
+    return LanguageFromName(name.substr(dot + 1));
+}
+
+// For files whose name says nothing: shebang lines, XML/HTML prologs, JSON.
+int SniffLanguage(const std::wstring& text) {
+    size_t start = text.find_first_not_of(L" \t\r\n\xFEFF");
+    if (start == std::wstring::npos) return kLanguagePlain;
+    const std::wstring head = LowerInvariantSyntax(text.substr(start, 400));
+    if (head.starts_with(L"#!")) {
+        const std::wstring line = head.substr(0, head.find_first_of(L"\r\n"));
+        if (line.find(L"python") != std::wstring::npos) return kLanguagePython;
+        if (line.find(L"node") != std::wstring::npos) return kLanguageJavaScript;
+        if (line.find(L"pwsh") != std::wstring::npos || line.find(L"powershell") != std::wstring::npos) return kLanguagePowerShell;
+        if (line.find(L"php") != std::wstring::npos) return kLanguagePhp;
+        return kLanguageShell;
+    }
+    if (head.starts_with(L"<?xml")) return kLanguageXml;
+    if (head.starts_with(L"<!doctype html") || head.starts_with(L"<html")) return kLanguageHtml;
+    if (head.starts_with(L"<?php")) return kLanguagePhp;
+    if (head.starts_with(L"diff --git") || (head.starts_with(L"--- ") && head.find(L"\n+++ ") != std::wstring::npos)) return kLanguageDiff;
+    if ((head[0] == L'{' || head[0] == L'[') && head.find(L"\":") != std::wstring::npos) return kLanguageJson;
     return kLanguagePlain;
 }
 
@@ -1422,7 +2660,8 @@ int LanguageFromPath(const std::wstring& path) {
 // one implied by the file extension when set to "auto".
 int EffectiveLanguage(const TabDocument& document) {
     if (document.language > kLanguageAuto && document.language < kLanguageCount) return document.language;
-    return LanguageFromPath(document.path);
+    const int fromPath = LanguageFromPath(document.path);
+    return fromPath != kLanguagePlain ? fromPath : document.sniffedLanguage;
 }
 
 std::wstring NormalizeLineEndings(std::wstring_view text, int mode) {
@@ -1603,6 +2842,7 @@ void SelectTab(int index) {
     ShowWindow(document.editor, SW_SHOW);
     SetFocus(document.editor);
     RestoreEditorState(document);
+    SyntaxColorVisible(document);
     EnsureTabVisible(index);
     InvalidateToolbar();
     if (g_app.showLineNumbers && GutterWidthFor(document.editor) != g_app.gutterWidth) LayoutChildren(g_app.window);
@@ -1762,11 +3002,13 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         : DefWindowProcW(editor, message, wParam, lParam);
     if (message == WM_NCDESTROY) {
         g_editorProcs.erase(editor);
-    } else if (message == WM_MOUSEWHEEL || message == WM_KEYDOWN) {
+    } else if (message == WM_MOUSEWHEEL || message == WM_KEYDOWN || message == WM_VSCROLL) {
         // EN_VSCROLL is not sent for wheel or keyboard scrolling.
         RefreshGutter();
+        SyntaxOnViewChanged(editor);
     } else if (message == WM_SIZE || message == WM_SHOWWINDOW) {
         UpdateHorizontalScrollbar(editor);
+        if (message == WM_SIZE) SyntaxOnViewChanged(editor);
     }
     return result;
 }
@@ -1939,12 +3181,13 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
         languageOptions & ~static_cast<LRESULT>(IMF_AUTOFONT | IMF_DUALFONT | IMF_AUTOFONTSIZEADJUST));
     SetWindowTextW(document.editor, text.c_str());
     ApplyWordWrap(document.editor);
-    const int language = EffectiveLanguage(document);
-    if (language != kLanguagePlain && language != kLanguageMarkdown) HighlightDocument(document);
+    if (LanguageFromPath(document.path) == kLanguagePlain) document.sniffedLanguage = SniffLanguage(text);
+    // Colours are painted when the tab is shown (only the visible part).
     SendMessageW(document.editor, EM_EMPTYUNDOBUFFER, 0, 0);  // loading is not an undoable edit
     SendMessageW(document.editor, EM_SETMODIFY, modified ? TRUE : FALSE, 0);
     // Enable change/scroll notifications only after the initial text is in,
     // so loading a file does not mark it as modified.
+    document.textHash = HashText(GetEditorRawText(document.editor));
     SendMessageW(document.editor, EM_SETEVENTMASK, 0, kEditorEventMask);
     ShowWindow(document.editor, SW_HIDE);
 
@@ -3045,6 +4288,7 @@ void ReloadDocumentFromDisk(int index) {
     document.encoding = encoding;
     document.lineEnding = lineEnding;
     document.modified = false;
+    document.textHash = HashText(GetEditorRawText(document.editor));
     document.fileTimestamp = FileTimestamp(document.path);
     MarkRecoveryDirty(index);
     HighlightDocument(document);
@@ -5021,7 +6265,7 @@ std::wstring g_wrapWidth = L"80";
 std::wstring g_linePrefix = L"- ";
 std::wstring g_lineSuffix = L";";
 int g_pinyinFormat = 0;  // 0 tones, 1 plain, 2 initials
-int g_pinyinLayout = 1;  // 0 pinyin only, 1 annotate after each character, 2 pinyin line under each line
+int g_pinyinLayout = 0;  // 0 pinyin line under each line (original kept), 1 pinyin only
 
 bool IsTextToolCommand(int command) {
     return command >= kIdTextToolFirst && command <= kIdTextToolLast;
@@ -5228,6 +6472,7 @@ struct PreviewState {
     bool done = false;
     bool accepted = false;
     int choice = -1;
+    int defaultMode = 1;
     HWND view = nullptr;
     HWND dontAsk = nullptr;
     bool stopPreviewing = false;
@@ -5267,7 +6512,7 @@ LRESULT CALLBACK PreviewProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         if (state && (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)) {
             // Enter applies the default output mode; Esc cancels.
             state->accepted = LOWORD(wParam) == IDOK;
-            state->choice = state->accepted ? g_app.toolOutputMode : -1;
+            state->choice = state->accepted ? state->defaultMode : -1;
             state->stopPreviewing = SendMessageW(state->dontAsk, BM_GETCHECK, 0, 0) == BST_CHECKED;
             state->done = true;
             return 0;
@@ -5379,7 +6624,7 @@ void FillDiffView(HWND view, const std::wstring& before, const std::wstring& aft
 
 // Shows what a tool will change and how to use the result. Returns the
 // chosen output mode (0 replace, 1 new tab, 2 insert below) or -1 to cancel.
-int ConfirmChange(const wchar_t* title, const std::wstring& before, const std::wstring& after) {
+int ConfirmChange(const wchar_t* title, const std::wstring& before, const std::wstring& after, int defaultMode) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSW klass{};
@@ -5411,11 +6656,12 @@ int ConfirmChange(const wchar_t* title, const std::wstring& before, const std::w
     HWND buttons[3]{};
     const wchar_t* captions[3] = {L"替换原文", L"输出到新标签", L"插入到原文下方"};
     for (int i = 0; i < 3; ++i) {
-        const DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | (i == g_app.toolOutputMode ? BS_DEFPUSHBUTTON : 0);
+        const DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | (i == defaultMode ? BS_DEFPUSHBUTTON : 0);
         buttons[i] = CreateWindowExW(0, L"BUTTON", captions[i], style, 0, 0, 0, 0, dialog,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(301 + i)), g_app.instance, nullptr);
     }
-    HWND apply = buttons[std::clamp(g_app.toolOutputMode, 0, 2)];
+    HWND apply = buttons[std::clamp(defaultMode, 0, 2)];
+    state.defaultMode = defaultMode;
     HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
     for (HWND control : {label, state.dontAsk, buttons[0], buttons[1], buttons[2], cancel}) {
@@ -5622,7 +6868,7 @@ void RunTextTool(int command) {
     if (!document) return;
     HWND editor = document->editor;
 
-    const bool lineTool = (command >= kIdJoinLines && command <= kIdNumberLines) ||
+    bool lineTool = (command >= kIdJoinLines && command <= kIdNumberLines) ||
         (command >= kIdTrimLeading && command <= kIdTabsToSpaces);
     // Ask for parameters before touching the text.
     std::vector<std::wstring> values;
@@ -5678,11 +6924,12 @@ void RunTextTool(int command) {
     case kIdPinyinInitials: {
         std::vector<PromptChoice> choices{
             {L"拼音格式：", {L"带声调（zhōng wén）", L"不带声调（zhong wen）", L"首字母（zw）"}, g_pinyinFormat},
-            {L"结果形式：", {L"只保留拼音", L"在汉字后标注拼音：中(zhōng)文(wén)", L"在每行下方添加拼音"}, g_pinyinLayout},
+            {L"结果形式：", {L"每行中文下方添加一行拼音（保留原文）", L"只输出拼音"}, g_pinyinLayout},
         };
         if (!PromptForText(L"汉字转拼音", {}, values, nullptr, &choices)) return;
         g_pinyinFormat = std::clamp(choices[0].selected, 0, 2);
-        g_pinyinLayout = std::clamp(choices[1].selected, 0, 2);
+        g_pinyinLayout = std::clamp(choices[1].selected, 0, 1);
+        lineTool = g_pinyinLayout == 0;  // whole lines: a line, then its pinyin
         break;
     }
     case kIdRegexReplace: {
@@ -6067,7 +7314,7 @@ void RunTextTool(int command) {
         const PinyinMode mode = g_pinyinFormat == 0 ? PinyinMode::Tone : g_pinyinFormat == 1 ? PinyinMode::Plain : PinyinMode::Initials;
         SetCursor(LoadCursorW(nullptr, IDC_WAIT));
         bool ok = true;
-        if (g_pinyinLayout == 2) {
+        if (g_pinyinLayout == 0) {
             // Each line stays, followed by its pinyin (lines without Chinese get none).
             std::vector<std::wstring> output;
             for (const std::wstring& line : lines) {
@@ -6080,7 +7327,7 @@ void RunTextTool(int command) {
             }
             result = JoinLines(output);
         } else {
-            ok = ConvertToPinyin(text, mode, result, count, error, g_pinyinLayout == 1);
+            ok = ConvertToPinyin(text, mode, result, count, error);
         }
         if (!ok) {
             MessageBoxW(g_app.window, error.c_str(), kWindowTitle, MB_ICONWARNING);
@@ -6104,8 +7351,13 @@ void RunTextTool(int command) {
     if (const size_t tab = name.find(L'\t'); tab != std::wstring::npos) name.resize(tab);
     if (const size_t dots = name.find(L"..."); dots != std::wstring::npos) name.resize(dots);
     int outputMode = g_app.toolOutputMode;
+    const bool pinyinLines = (command == kIdPinyinTone || command == kIdPinyinPlain || command == kIdPinyinInitials) && g_pinyinLayout == 0;
+    if (pinyinLines) {
+        outputMode = 0;
+        notice = L"已在每行中文下方添加拼音（" + std::to_wstring(count) + L" 个汉字）";
+    }
     if (g_app.previewTextTools) {
-        outputMode = ConfirmChange(name.c_str(), text, result);
+        outputMode = ConfirmChange(name.c_str(), text, result, outputMode);
         if (outputMode < 0) return;
     }
     ApplyToolResult(*document, range, result, outputMode, name, notice);
@@ -8504,7 +9756,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         } else if (wParam == kTimerHighlight) {
             KillTimer(window, kTimerHighlight);
             if (const TabDocument* document = ActiveDocument()) {
-                if (GetWindowTextLengthW(document->editor) <= kLiveHighlightLimit) HighlightDocument(*document);
+                HighlightDocument(*document);
             }
         }
         return 0;
@@ -8515,6 +9767,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (notification == EN_CHANGE && source != nullptr && !g_app.loading) {
             for (size_t index = 0; index < g_app.documents.size(); ++index) {
                 if (g_app.documents[index].editor == source) {
+                    const uint64_t hash = HashText(GetEditorRawText(source));
+                    if (hash == g_app.documents[index].textHash) break;  // formatting only
+                    g_app.documents[index].textHash = hash;
                     const bool wasModified = g_app.documents[index].modified;
                     g_app.documents[index].modified = true;
                     MarkRecoveryDirty(static_cast<int>(index));
@@ -8523,8 +9778,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     if (g_app.showLineNumbers && GutterWidthFor(source) != g_app.gutterWidth) LayoutChildren(window);
                     UpdateHorizontalScrollbar(source);
                     RefreshGutter();
-                    const int language = EffectiveLanguage(g_app.documents[index]);
-                    if (language != kLanguagePlain && language != kLanguageMarkdown) {
+                    TabDocument& changed = g_app.documents[index];
+                    changed.syntaxStale = true;  // tokens no longer match; scrolling re-tokenizes
+                    if (EffectiveLanguage(changed) != kLanguagePlain || changed.syntaxHadColors ||
+                        (changed.untitled && changed.language == kLanguageAuto)) {
                         SetTimer(window, kTimerHighlight, kHighlightDelayMs, nullptr);  // restarts on each keystroke
                     }
                     break;
@@ -8534,6 +9791,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         if (notification == EN_VSCROLL) {
             RefreshGutter();
+            SyntaxOnViewChanged(source);
             UpdateStatusBar();
             return 0;
         }
