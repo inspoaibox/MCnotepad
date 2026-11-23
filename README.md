@@ -39,6 +39,17 @@ MCnotepad 是一个原生 Win32 C++ 文本编辑器，目标是比传统编辑�
 - 提取到新标签：邮箱、链接、IP 地址、数字、包含关键词的行、指定列（按分隔符），原文不变
 - 处理前预览：执行前显示修改前后的差异（删除的行标红、新增的行标绿），确认后才应用；可在菜单中关闭预览。每次处理都可以用一次 `Ctrl+Z` 撤销
 
+**在文件中查找 / 替换**（`Ctrl+Shift+F` / `Ctrl+Shift+H`，“搜索”菜单）
+- 范围：指定文件夹（多个用分号分隔）、所有打开的文件、当前文件；可搜索文件内容、文件名或完整路径
+- 匹配：普通文本（`\n` 表示换行）、区分大小写、全词匹配、正则表达式、任一关键词（OR）、全部关键词（AND）
+- 筛选：文件类型（如 `*.js;*.ts`）、是否包含子文件夹和隐藏文件、排除规则（默认排除 `node_modules`、`.git`、`dist` 等）、遵循 `.gitignore`、文件大小上限、最多结果数
+- 自动识别 UTF-8、UTF-8 BOM、UTF-16、GBK 等编码，自动跳过二进制文件；不跟随目录符号链接
+- 多线程后台搜索，搜索时编辑器照常可用，可随时停止；显示扫描文件数、命中文件数、匹配次数、耗时，以及跳过和出错的文件（点击查看日志）
+- 结果显示在底部面板（可拖动调整高度），按文件分组、高亮匹配内容；双击跳转到对应文件的行和列；可筛选、复制、导出 TXT / CSV / JSON，结果很多时分批加载
+- 替换前先预览：列出每个文件的修改前后差异，可勾选要修改的文件；默认先备份原文件，可一键撤销上次替换
+- 替换时保留文件原有编码和换行符；搜索后被修改过的文件、已在编辑器中打开且有未保存修改的文件会被跳过并说明原因
+- 保存最近的搜索内容、替换内容、文件夹和文件类型（“搜索 → 搜索历史”）
+
 **会话与恢复**
 - 正常关闭、系统重启或关机、意外结束后都会自动恢复工作区
 - 恢复标签顺序、活动标签、内容、光标、滚动位置，以及窗口位置和大小
@@ -53,7 +64,9 @@ MCnotepad 是一个原生 Win32 C++ 文本编辑器，目标是比传统编辑�
 | `Ctrl+W` | 关闭标签 |
 | `Ctrl+F` / `Ctrl+H` / `Ctrl+G` | 查找 / 替换 / 跳转到行 |
 | `F3` / `Shift+F3` | 查找下一个 / 上一个 |
-| `Ctrl+Shift+F` | 格式化 JSON |
+| `Ctrl+Shift+F` / `Ctrl+Shift+H` | 在文件夹中查找 / 替换 |
+| `Enter` / `Esc`（搜索面板中） | 开始搜索 / 停止搜索或关闭面板 |
+| `Shift+Alt+F` | 格式化 JSON |
 | `F5` | 运行当前文件 |
 | `F2` | 重命名标签 / 文件 |
 | `Ctrl+,` | 偏好设置 |
@@ -75,6 +88,8 @@ cmake --build --preset windows-x64-release --parallel 4
 %LOCALAPPDATA%\MCnotepad\session.dat          会话与设置
 %LOCALAPPDATA%\MCnotepad\recovery\*.snapshot  每个标签的恢复快照
 %LOCALAPPDATA%\MCnotepad\running.lock         运行标记，用于检测异常退出
+%LOCALAPPDATA%\MCnotepad\search.dat           搜索历史与搜索选项
+%LOCALAPPDATA%\MCnotepad\replace-backups\     在文件中替换前的原文件备份（保留最近 10 次）
 ```
 
 详见 [SESSION_RECOVERY.md](SESSION_RECOVERY.md)。
@@ -83,3 +98,10 @@ cmake --build --preset windows-x64-release --parallel 4
 
 - [cpp-pinyin](https://github.com/wolfgitpr/cpp-pinyin)（Apache-2.0）：汉字转拼音，源码和普通话词典位于 `third_party/cpp-pinyin`，构建时词典会复制到程序目录的 `dict/`
 - [OpenCC](https://github.com/BYVoid/OpenCC)（Apache-2.0）：简繁转换，库源码位于 `third_party/opencc`，简繁词典（文本格式）位于 `resources/opencc`，转换结果为 OpenCC 标准繁体
+
+## 已知限制
+
+- 在文件中查找暂不支持 DOCX、XLSX、PDF 内容和扫描件 OCR，也没有搜索索引
+- `.gitignore` 支持常见写法（通配符、`目录/`、开头的 `/`、`**/`），不支持 `!` 取反规则
+- 搜索面板目前固定在窗口底部；快捷键暂不支持自定义
+- 正则表达式使用 C++ 标准库（ECMAScript 语法），对超大文件和复杂表达式较慢

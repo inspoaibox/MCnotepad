@@ -8,6 +8,9 @@
 #include <tom.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
+#include <shlwapi.h>
+#include <process.h>
 #include <windowsx.h>
 #include <winreg.h>
 #include <gdiplus.h>
@@ -18,6 +21,10 @@
 #include <cmath>
 #include <cstdint>
 #include <regex>
+#include <atomic>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <wincrypt.h>
 #include <cwctype>
 #include <filesystem>
@@ -62,6 +69,8 @@ constexpr ULONG_PTR kCopyDataOpenFiles = 0x4D434E50;  // 'MCNP'
 constexpr UINT kMessageOpenPendingFiles = WM_APP + 1;
 constexpr UINT kMessageCheckExternalChanges = WM_APP + 2;
 constexpr UINT kMessageOpenMenuBar = WM_APP + 3;
+constexpr UINT kMessageSearchDone = WM_APP + 4;
+constexpr UINT kTimerSearchProgress = 4201;
 constexpr int kMenuBarHeight = 30;
 constexpr int kToolbarHeight = 36;
 constexpr int kTabHeight = 34;
@@ -87,6 +96,19 @@ constexpr int kIdHelpAbout = 1201;
 constexpr int kIdFindNext = 1206;
 constexpr int kIdFindPrevious = 1207;
 constexpr int kIdFileRename = 1007;
+constexpr int kIdSearchInFolder = 1210;
+constexpr int kIdReplaceInFolder = 1211;
+constexpr int kIdSearchCurrentFile = 1212;
+constexpr int kIdSearchOpenFiles = 1213;
+constexpr int kIdSearchFileNames = 1214;
+constexpr int kIdSearchRegex = 1215;
+constexpr int kIdToggleSearchPanel = 1216;
+constexpr int kIdExportSearchResults = 1217;
+constexpr int kIdClearSearchResults = 1218;
+constexpr int kIdSearchErrorLog = 1219;
+constexpr int kIdUndoReplaceInFiles = 1220;
+constexpr int kIdCopySearchResults = 1221;
+constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
     kIdTextToolFirst = 2001,
@@ -221,6 +243,10 @@ struct AppState {
     std::vector<TabDocument> documents;
     std::vector<std::wstring> pendingOpenFiles;
     std::wstring statusNotice;
+    int searchPanelHeight = 340;
+    HWND searchPanel = nullptr;
+    bool searchPanelVisible = false;
+    HMENU searchHistoryMenu = nullptr;
     bool previewTextTools = true;
     ULONGLONG statusNoticeUntil = 0;
     UINT dpi = 96;
@@ -281,6 +307,10 @@ bool CloseDocument(int index);
 void RenameDocument(int index);
 void AppendTextToolMenus(HMENU menu);
 void ThemeCheckbox(HWND box);
+void ShowNotice(const std::wstring& text);
+void ApplySearchPanelTheme();
+void HideSearchPanel();
+bool EncodeTextBytes(std::wstring_view text, int encoding, std::string& bytes);
 void ShowEditorContextMenu(HWND editor, POINT screen);
 void UpdateHorizontalScrollbar(HWND editor);
 void RefreshChrome();
@@ -1411,37 +1441,41 @@ std::wstring NormalizeLineEndings(std::wstring_view text, int mode) {
     return normalized;
 }
 
+// Encodes text exactly as given (line breaks untouched) in one of kEncodingNames.
+bool EncodeTextBytes(std::wstring_view text, int encoding, std::string& bytes) {
+    bytes.clear();
+    if (encoding == 2 || encoding == 3) {
+        bytes.reserve(text.size() * 2 + 2);
+        bytes.append(encoding == 2 ? "\xFF\xFE" : "\xFE\xFF", 2);
+        for (wchar_t value : text) {
+            const uint16_t unit = static_cast<uint16_t>(value);
+            const char low = static_cast<char>(unit & 0xFF);
+            const char high = static_cast<char>((unit >> 8) & 0xFF);
+            if (encoding == 2) { bytes.push_back(low); bytes.push_back(high); }
+            else { bytes.push_back(high); bytes.push_back(low); }
+        }
+        return true;
+    }
+    if (encoding == kEncodingAnsi) {
+        const int size = WideCharToMultiByte(CP_ACP, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, "?", nullptr);
+        if (size <= 0) return text.empty();
+        bytes.resize(static_cast<size_t>(size));
+        WideCharToMultiByte(CP_ACP, 0, text.data(), static_cast<int>(text.size()), bytes.data(), size, "?", nullptr);
+        return true;
+    }
+    const std::string utf8 = WideToUtf8(text);
+    // Never report success for a conversion that lost the whole text.
+    if (utf8.empty() && !text.empty()) return false;
+    if (encoding == 1) bytes.append("\xEF\xBB\xBF", 3);
+    bytes += utf8;
+    return true;
+}
+
 bool WriteTextFile(const fs::path& path, std::wstring_view text, int encodingIndex = -1, int lineEndingIndex = -1) {
     if (encodingIndex < 0) encodingIndex = g_app.encodingIndex;
     if (lineEndingIndex < 0) lineEndingIndex = g_app.lineEndingIndex;
-    const std::wstring normalized = NormalizeLineEndings(text, lineEndingIndex);
     std::string bytes;
-    if (encodingIndex == 2 || encodingIndex == 3) {
-        bytes.reserve(normalized.size() * 2 + 2);
-        if (encodingIndex == 2) bytes.append("\xFF\xFE", 2);
-        else bytes.append("\xFE\xFF", 2);
-        for (wchar_t value : normalized) {
-            const uint16_t unit = static_cast<uint16_t>(value);
-            if (encodingIndex == 2) {
-                bytes.push_back(static_cast<char>(unit & 0xFF));
-                bytes.push_back(static_cast<char>((unit >> 8) & 0xFF));
-            } else {
-                bytes.push_back(static_cast<char>((unit >> 8) & 0xFF));
-                bytes.push_back(static_cast<char>(unit & 0xFF));
-            }
-        }
-    } else if (encodingIndex == 4) {
-        const int size = WideCharToMultiByte(CP_ACP, 0, normalized.data(), static_cast<int>(normalized.size()), nullptr, 0, "?", nullptr);
-        if (size <= 0 && !normalized.empty()) return false;
-        bytes.resize(static_cast<size_t>(size));
-        if (size > 0) WideCharToMultiByte(CP_ACP, 0, normalized.data(), static_cast<int>(normalized.size()), bytes.data(), size, "?", nullptr);
-    } else {
-        const std::string utf8 = WideToUtf8(normalized);
-        // Never report success for a conversion that lost the whole text.
-        if (utf8.empty() && !normalized.empty()) return false;
-        if (encodingIndex == 1) bytes.append("\xEF\xBB\xBF", 3);
-        bytes += utf8;
-    }
+    if (!EncodeTextBytes(NormalizeLineEndings(text, lineEndingIndex), encodingIndex, bytes)) return false;
     return WriteAtomicFile(path, bytes);
 }
 
@@ -1518,7 +1552,16 @@ void LayoutChildren(HWND window) {
     const int statusHeight = Scale(kStatusHeight);
     const int tabY = menuHeight + toolbarHeight;
     const int contentY = tabY + tabHeight;
-    const int contentHeight = std::max(0, height - contentY - statusHeight);
+    const int areaHeight = std::max(0, height - contentY - statusHeight);
+    // The find-in-files panel takes the bottom of the content area, leaving
+    // the editor at least a few lines.
+    const int panelHeight = g_app.searchPanel && g_app.searchPanelVisible
+        ? std::clamp(g_app.searchPanelHeight, std::min(Scale(160), areaHeight), std::max(0, areaHeight - Scale(120))) : 0;
+    const int contentHeight = areaHeight - panelHeight;
+    if (g_app.searchPanel) {
+        MoveWindow(g_app.searchPanel, 0, contentY + contentHeight, width, panelHeight, TRUE);
+        ShowWindow(g_app.searchPanel, panelHeight > 0 ? SW_SHOW : SW_HIDE);
+    }
     const int editorWidth = width;
     HWND activeEditor = (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size()))
         ? g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor : nullptr;
@@ -2129,6 +2172,7 @@ void SetMenuState() {
         (g_app.wordWrap ? MF_CHECKED : MF_UNCHECKED));
     CheckDocumentMenuItems(menu);
     CheckMenuItem(menu, kIdTogglePreview, MF_BYCOMMAND | (g_app.previewTextTools ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, kIdToggleSearchPanel, MF_BYCOMMAND | (g_app.searchPanelVisible ? MF_CHECKED : MF_UNCHECKED));
 }
 
 HMENU CreateApplicationMenu() {
@@ -2165,11 +2209,31 @@ HMENU CreateApplicationMenu() {
     AppendTextToolMenus(edit);
 
     AppendMenuW(search, MF_STRING, kIdToolbarFind, L"查找\tCtrl+F");
+    AppendMenuW(search, MF_STRING, kIdToolbarReplace, L"替换\tCtrl+H");
     AppendMenuW(search, MF_STRING, kIdFindNext, L"查找下一个\tF3");
     AppendMenuW(search, MF_STRING, kIdFindPrevious, L"查找上一个\tShift+F3");
     AppendMenuW(search, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(search, MF_STRING, kIdToolbarReplace, L"替换\tCtrl+H");
-    AppendMenuW(search, MF_STRING, kIdToolbarGoto, L"跳转\tCtrl+G");
+    AppendMenuW(search, MF_STRING, kIdSearchCurrentFile, L"在当前文件中查找...");
+    AppendMenuW(search, MF_STRING, kIdSearchOpenFiles, L"在所有打开文件中查找...");
+    AppendMenuW(search, MF_STRING, kIdSearchInFolder, L"在文件夹中查找...\tCtrl+Shift+F");
+    AppendMenuW(search, MF_STRING, kIdReplaceInFolder, L"在文件夹中替换...\tCtrl+Shift+H");
+    AppendMenuW(search, MF_STRING, kIdSearchFileNames, L"搜索文件名...");
+    AppendMenuW(search, MF_STRING, kIdSearchRegex, L"正则表达式搜索...");
+    AppendMenuW(search, MF_SEPARATOR, 0, nullptr);
+    g_app.searchHistoryMenu = CreatePopupMenu();
+    AppendMenuW(g_app.searchHistoryMenu, MF_STRING | MF_GRAYED, 0, L"（暂无搜索历史）");
+    AppendMenuW(search, MF_POPUP, reinterpret_cast<UINT_PTR>(g_app.searchHistoryMenu), L"搜索历史");
+    HMENU results = CreatePopupMenu();
+    AppendMenuW(results, MF_STRING, kIdToggleSearchPanel, L"显示搜索面板");
+    AppendMenuW(results, MF_STRING, kIdCopySearchResults, L"复制全部结果");
+    AppendMenuW(results, MF_STRING, kIdExportSearchResults, L"导出搜索结果...");
+    AppendMenuW(results, MF_STRING, kIdClearSearchResults, L"清空搜索结果");
+    AppendMenuW(results, MF_STRING, kIdSearchErrorLog, L"查看错误日志");
+    AppendMenuW(results, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(results, MF_STRING, kIdUndoReplaceInFiles, L"撤销上次在文件中替换...");
+    AppendMenuW(search, MF_POPUP, reinterpret_cast<UINT_PTR>(results), L"搜索结果管理");
+    AppendMenuW(search, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(search, MF_STRING, kIdToolbarGoto, L"跳转到行\tCtrl+G");
     AppendMenuW(view, MF_STRING, kIdToolbarLineNumbers, L"行号");
     AppendMenuW(view, MF_STRING, kIdToolbarWrap, L"自动换行");
     AppendEncodingItems(encoding);
@@ -2177,7 +2241,7 @@ HMENU CreateApplicationMenu() {
         AppendMenuW(language, MF_STRING, kIdLanguageFirst + index, kLanguageNames[index]);
     }
     AppendMenuW(run, MF_STRING, kIdToolbarRun, L"运行当前文件\tF5");
-    AppendMenuW(tools, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tCtrl+Shift+F");
+    AppendMenuW(tools, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tShift+Alt+F");
     AppendMenuW(theme, MF_STRING, kIdThemeDark, L"深色");
     AppendMenuW(theme, MF_STRING, kIdThemeLight, L"浅色");
     AppendMenuW(theme, MF_STRING, kIdThemeGreen, L"护眼绿");
@@ -2609,7 +2673,9 @@ HACCEL CreateAccelerators() {
         { FCONTROL | FVIRTKEY, 'F', kIdToolbarFind },
         { FCONTROL | FVIRTKEY, 'H', kIdToolbarReplace },
         { FCONTROL | FVIRTKEY, 'G', kIdToolbarGoto },
-        { FCONTROL | FSHIFT | FVIRTKEY, 'F', kIdToolbarFormat },
+        { FALT | FSHIFT | FVIRTKEY, 'F', kIdToolbarFormat },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'F', kIdSearchInFolder },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'H', kIdReplaceInFolder },
         { FVIRTKEY, VK_F5, kIdToolbarRun },
         { FVIRTKEY, VK_F2, kIdFileRename },
         { FCONTROL | FVIRTKEY, VK_OEM_COMMA, kIdToolbarSettings },
@@ -2620,6 +2686,22 @@ HACCEL CreateAccelerators() {
 }
 
 void HandleEditCommand(int command) {
+    HWND focus = GetFocus();
+    if (focus && g_app.searchPanel && IsChild(g_app.searchPanel, focus)) {
+        wchar_t className[32]{};
+        GetClassNameW(focus, className, 32);
+        if (_wcsicmp(className, L"Edit") == 0) {
+            switch (command) {
+            case kIdEditUndo: SendMessageW(focus, EM_UNDO, 0, 0); break;
+            case kIdEditCut: SendMessageW(focus, WM_CUT, 0, 0); break;
+            case kIdEditCopy: SendMessageW(focus, WM_COPY, 0, 0); break;
+            case kIdEditPaste: SendMessageW(focus, WM_PASTE, 0, 0); break;
+            case kIdEditSelectAll: SendMessageW(focus, EM_SETSEL, 0, -1); break;
+            default: break;
+            }
+            return;
+        }
+    }
     if (g_app.activeIndex < 0 || g_app.activeIndex >= static_cast<int>(g_app.documents.size())) {
         return;
     }
@@ -3780,7 +3862,7 @@ std::wstring ToolTipText(int id) {
     case kIdToolbarFind: return L"查找 (Ctrl+F)";
     case kIdToolbarReplace: return L"替换 (Ctrl+H)";
     case kIdToolbarGoto: return L"跳转到行 (Ctrl+G)";
-    case kIdToolbarFormat: return L"格式化 JSON (Ctrl+Shift+F)";
+    case kIdToolbarFormat: return L"格式化 JSON (Shift+Alt+F)";
     case kIdToolbarRun: return L"运行当前文件 (F5)";
     case kIdToolbarEncoding: return L"编码和换行符";
     case kIdToolbarLineNumbers: return L"显示行号";
@@ -4018,7 +4100,14 @@ int TabHitTest(const TabLayout& layout, POINT point, bool* onClose) {
 bool CloseDocument(int index);
 
 void CopyTextToClipboard(const std::wstring& text) {
-    if (!OpenClipboard(g_app.window)) return;
+    // Clipboard history and other viewers briefly hold the clipboard after
+    // every change; retry instead of silently copying nothing.
+    bool opened = false;
+    for (int attempt = 0; attempt < 20 && !(opened = OpenClipboard(g_app.window)); ++attempt) Sleep(15);
+    if (!opened) {
+        ShowNotice(L"剪贴板正被其他程序占用，复制失败");
+        return;
+    }
     EmptyClipboard();
     const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
     if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
@@ -4452,6 +4541,7 @@ void CreateChrome(HWND window) {
 }
 
 void RefreshChrome() {
+    ApplySearchPanelTheme();
     for (HWND window : {g_app.menuBar, g_app.toolbar, g_app.tabs, g_app.statusBar}) {
         if (window) InvalidateRect(window, nullptr, FALSE);
     }
@@ -4555,6 +4645,12 @@ LRESULT CALLBACK PromptProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 // text of each field and receives the result.
 void ThemeCheckbox(HWND box) {
     if (g_app.darkTheme) SetWindowTheme(box, L"", L"");
+}
+
+void ThemePushButtons(std::initializer_list<HWND> buttons) {
+    for (HWND button : buttons) {
+        if (button && g_app.darkTheme) SetWindowTheme(button, L"DarkMode_Explorer", nullptr);
+    }
 }
 
 bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels, std::vector<std::wstring>& values,
@@ -4915,7 +5011,7 @@ void AppendTextToolMenus(HMENU menu) {
     AppendMenuW(chinese, MF_STRING, kIdAsciiPunctToChinese, L"英文标点转中文标点");
 
     HMENU developer = CreatePopupMenu();
-    AppendMenuW(developer, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tCtrl+Shift+F");
+    AppendMenuW(developer, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tShift+Alt+F");
     AppendMenuW(developer, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(developer, MF_STRING, kIdBase64Encode, L"Base64 编码");
     AppendMenuW(developer, MF_STRING, kIdBase64Decode, L"Base64 解码");
@@ -5124,18 +5220,18 @@ COLORREF Blend(COLORREF a, COLORREF b, int percentB) {
                (GetBValue(a) * (100 - percentB) + GetBValue(b) * percentB) / 100);
 }
 
-// Shows what a tool will change and asks for confirmation. Returns true to apply.
-bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::wstring& after) {
+// Renders a line diff into a read-only RichEdit: removed lines red, added
+// green, unchanged context grey; long unchanged runs are collapsed.
+void FillDiffView(HWND view, const std::wstring& before, const std::wstring& after, int& removed, int& added) {
     const std::vector<DiffLine> diff = DiffLines(SplitLines(before), SplitLines(after));
-    int removed = 0, added = 0;
+    removed = 0;
+    added = 0;
     for (const DiffLine& line : diff) {
         if (line.kind == DiffKind::Removed) ++removed;
         if (line.kind == DiffKind::Added) ++added;
     }
-
-    // Changed lines with two lines of context; long unchanged runs collapse.
     std::wstring text;
-    std::vector<std::pair<LONG, DiffKind>> marks;  // start of each coloured line
+    std::vector<std::pair<LONG, DiffKind>> marks;
     std::vector<LONG> lineLengths;
     const auto nearChange = [&](size_t index) {
         for (size_t k = (index >= 2 ? index - 2 : 0); k <= std::min(diff.size() - 1, index + 2); ++k) {
@@ -5144,8 +5240,7 @@ bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::
         return false;
     };
     constexpr size_t kMaxShown = 3000;
-    size_t shown = 0;
-    size_t skipped = 0;
+    size_t shown = 0, skipped = 0;
     LONG position = 0;
     const auto emit = [&](const std::wstring& line, DiffKind kind) {
         if (!text.empty()) {
@@ -5173,6 +5268,31 @@ bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::
     }
     if (shown >= kMaxShown) emit(L"   ⋯ 更多改动未显示", DiffKind::Same);
 
+    const ThemePalette& palette = CurrentPalette();
+    SendMessageW(view, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(view, EM_SETBKGNDCOLOR, 0, palette.editorBackground);
+    SetWindowTextW(view, text.c_str());
+    const COLORREF removedColor = g_app.darkTheme ? RGB(240, 128, 128) : RGB(176, 32, 32);
+    const COLORREF addedColor = g_app.darkTheme ? RGB(120, 214, 150) : RGB(20, 120, 50);
+    for (size_t k = 0; k < marks.size(); ++k) {
+        CHARFORMAT2W format{};
+        format.cbSize = sizeof(format);
+        format.dwMask = CFM_COLOR | CFM_BACKCOLOR;
+        const DiffKind kind = marks[k].second;
+        format.crTextColor = kind == DiffKind::Removed ? removedColor : kind == DiffKind::Added ? addedColor : palette.gutterText;
+        format.crBackColor = kind == DiffKind::Removed ? Blend(palette.editorBackground, removedColor, 14)
+            : kind == DiffKind::Added ? Blend(palette.editorBackground, addedColor, 14) : palette.editorBackground;
+        CHARRANGE range{marks[k].first, marks[k].first + lineLengths[k] + 1};
+        SendMessageW(view, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+        SendMessageW(view, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+    }
+    SendMessageW(view, EM_SETSEL, 0, 0);
+    SendMessageW(view, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(view, nullptr, TRUE);
+}
+
+// Shows what a tool will change and asks for confirmation. Returns true to apply.
+bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::wstring& after) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSW klass{};
@@ -5194,9 +5314,7 @@ bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::
     if (!dialog) return true;
     ApplyWindowFrameTheme(dialog);
 
-    const std::wstring summary = L"将删除 " + std::to_wstring(removed) + L" 行，新增 " + std::to_wstring(added) +
-        L" 行。应用后可以按 Ctrl+Z 一次撤销。";
-    HWND label = CreateWindowExW(0, L"STATIC", summary.c_str(), WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
+    HWND label = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
         dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(100)), g_app.instance, nullptr);
     state.view = CreateWindowExW(0, L"RICHEDIT50W", nullptr,
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
@@ -5212,27 +5330,14 @@ bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::
     }
     SendMessageW(state.view, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
     ThemeCheckbox(state.dontAsk);
+    ThemePushButtons({apply, cancel});
     SetWindowTheme(state.view, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-    const ThemePalette& palette = CurrentPalette();
-    SendMessageW(state.view, EM_SETBKGNDCOLOR, 0, palette.editorBackground);
     SendMessageW(state.view, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(4), 0));
     SendMessageW(state.view, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
-    SetWindowTextW(state.view, text.c_str());
-    const COLORREF removedColor = g_app.darkTheme ? RGB(240, 128, 128) : RGB(176, 32, 32);
-    const COLORREF addedColor = g_app.darkTheme ? RGB(120, 214, 150) : RGB(20, 120, 50);
-    for (size_t k = 0; k < marks.size(); ++k) {
-        CHARFORMAT2W format{};
-        format.cbSize = sizeof(format);
-        format.dwMask = CFM_COLOR | CFM_BACKCOLOR;
-        const DiffKind kind = marks[k].second;
-        format.crTextColor = kind == DiffKind::Removed ? removedColor : kind == DiffKind::Added ? addedColor : palette.gutterText;
-        format.crBackColor = kind == DiffKind::Removed ? Blend(palette.editorBackground, removedColor, 14)
-            : kind == DiffKind::Added ? Blend(palette.editorBackground, addedColor, 14) : palette.editorBackground;
-        CHARRANGE range{marks[k].first, marks[k].first + lineLengths[k] + 1};
-        SendMessageW(state.view, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
-        SendMessageW(state.view, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
-    }
-    SendMessageW(state.view, EM_SETSEL, 0, 0);
+    int removed = 0, added = 0;
+    FillDiffView(state.view, before, after, removed, added);
+    SetWindowTextW(label, (L"将删除 " + std::to_wstring(removed) + L" 行，新增 " + std::to_wstring(added) +
+        L" 行。应用后可以按 Ctrl+Z 一次撤销。").c_str());
 
     RECT client{};
     GetClientRect(dialog, &client);
@@ -5917,6 +6022,2265 @@ void ShowEditorContextMenu(HWND editor, POINT screen) {
     if (command != 0) SendMessageW(g_app.window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
 }
 
+// ===========================================================================
+// Find / replace in files: engine
+// Runs on background threads. Reads files itself and never writes anything;
+// replacing happens later on the UI thread after the user confirms a preview.
+// ===========================================================================
+
+enum class SearchScope { Folder = 0, OpenFiles = 1, CurrentFile = 2 };
+enum class SearchTarget { Content = 0, FileName = 1, FullPath = 2 };
+enum class SearchMode { Plain = 0, Regex = 1, AnyKeyword = 2, AllKeywords = 3 };
+
+struct SearchOptions {
+    std::wstring query;
+    std::wstring replacement;
+    std::vector<std::wstring> folders;
+    SearchScope scope = SearchScope::Folder;
+    SearchTarget target = SearchTarget::Content;
+    SearchMode mode = SearchMode::Plain;
+    bool matchCase = false;
+    bool wholeWord = false;
+    bool recursive = true;
+    bool includeHidden = false;
+    bool useExcludes = true;
+    bool useGitignore = true;
+    std::wstring fileTypes;
+    std::wstring excludes;
+    uint64_t maxFileBytes = 20ull << 20;
+    size_t maxMatches = 20000;
+    bool forReplace = false;
+};
+
+struct SearchHit {
+    int line = 0;           // 1-based; 0 for file name / path hits
+    int column = 0;         // 1-based, UTF-16 units
+    size_t offset = 0;      // in the \n-normalised text
+    size_t length = 0;
+    std::wstring lineText;  // shown in the results (may be a window of a long line)
+    size_t lineMatchStart = 0;
+};
+
+struct SearchFileResult {
+    std::wstring path;      // empty for an untitled open tab
+    std::wstring display;   // path relative to the search folder
+    HWND editor = nullptr;  // set when searched from an open tab's text
+    std::vector<SearchHit> hits;
+    int encoding = 0;
+    std::wstring eol = L"\r\n";
+    bool mixedEol = false;
+    uint64_t timestamp = 0;
+    uint64_t size = 0;
+    std::wstring before;    // replace mode only, \n line breaks
+    std::wstring after;
+    int replacements = 0;
+};
+
+struct SearchSource {       // text of an open tab, captured on the UI thread
+    std::wstring path;
+    std::wstring display;
+    HWND editor = nullptr;
+    std::wstring text;
+};
+
+std::vector<std::wstring> SplitPatterns(std::wstring_view text) {
+    std::vector<std::wstring> parts;
+    std::wstring current;
+    for (const wchar_t c : text) {
+        if (c == L';' || c == L',' || c == L'\r' || c == L'\n' || c == L'；' || c == L'，') {
+            const std::wstring trimmed = TrimCopy(current);
+            if (!trimmed.empty()) parts.push_back(trimmed);
+            current.clear();
+        } else {
+            current += c;
+        }
+    }
+    const std::wstring trimmed = TrimCopy(current);
+    if (!trimmed.empty()) parts.push_back(trimmed);
+    return parts;
+}
+
+std::wstring LowerInvariant(std::wstring_view text) {
+    if (text.empty()) return {};
+    std::wstring result(text);
+    LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, text.data(), static_cast<int>(text.size()),
+        result.data(), static_cast<int>(result.size()), nullptr, nullptr, 0);
+    return result;
+}
+
+// Letters, digits and '_' outside the CJK ranges count as word characters, so
+// whole-word matching works for code and English without breaking Chinese.
+bool IsSearchWordChar(wchar_t c) {
+    return c < 0x2E80 && (iswalnum(c) || c == L'_');
+}
+
+class SearchMatcher {
+public:
+    bool Init(const SearchOptions& options, std::wstring& error) {
+        options_ = options;
+        if (options.mode == SearchMode::Regex) {
+            try {
+                auto flags = std::regex_constants::ECMAScript | std::regex_constants::multiline;
+                if (!options.matchCase) flags |= std::regex_constants::icase;
+                regex_ = std::make_shared<std::wregex>(options.query, flags);
+            } catch (const std::regex_error& e) {
+                error = L"正则表达式有误：" + Utf8ToWide(e.what());
+                return false;
+            }
+        } else if (options.mode == SearchMode::Plain) {
+            std::wstring needle = UnescapeInput(options.query);  // \n and \t allow multi-line searches
+            std::replace(needle.begin(), needle.end(), L'\r', L'\n');
+            needles_.push_back(options.matchCase ? needle : LowerInvariant(needle));
+        } else {
+            std::wistringstream stream(options.query);
+            for (std::wstring word; stream >> word;) needles_.push_back(options.matchCase ? word : LowerInvariant(word));
+        }
+        if (options.mode != SearchMode::Regex && needles_.empty()) {
+            error = L"请输入要查找的内容。";
+            return false;
+        }
+        replacement_ = UnescapeInput(options.replacement);
+        std::replace(replacement_.begin(), replacement_.end(), L'\r', L'\n');
+        return true;
+    }
+
+    const SearchOptions& options() const { return options_; }
+    const std::wregex* regex() const { return regex_.get(); }
+
+    // Non-overlapping matches as (offset, length), sorted.
+    void Find(const std::wstring& text, std::vector<std::pair<size_t, size_t>>& out) const {
+        out.clear();
+        if (regex_) {
+            for (std::wsregex_iterator it(text.begin(), text.end(), *regex_), end; it != end; ++it) {
+                const size_t offset = static_cast<size_t>(it->position(0));
+                const size_t length = static_cast<size_t>(it->length(0));
+                if (length == 0 || !WordBoundaryOk(text, offset, length)) continue;
+                out.emplace_back(offset, length);
+            }
+            return;
+        }
+        const std::wstring lowered = options_.matchCase ? std::wstring() : LowerInvariant(text);
+        const std::wstring& haystack = options_.matchCase ? text : lowered;
+        for (const std::wstring& needle : needles_) {
+            size_t found = 0;
+            bool any = false;
+            for (size_t position = 0; (found = haystack.find(needle, position)) != std::wstring::npos;) {
+                if (WordBoundaryOk(haystack, found, needle.size())) {
+                    out.emplace_back(found, needle.size());
+                    any = true;
+                }
+                position = found + std::max<size_t>(1, needle.size());
+            }
+            if (options_.mode == SearchMode::AllKeywords && !any) {
+                out.clear();
+                return;
+            }
+        }
+        if (needles_.size() > 1) {
+            std::sort(out.begin(), out.end());
+            std::vector<std::pair<size_t, size_t>> merged;
+            for (const auto& match : out) {
+                if (!merged.empty() && match.first < merged.back().first + merged.back().second) continue;
+                merged.push_back(match);
+            }
+            out.swap(merged);
+        }
+    }
+
+    // Matching against a file name or path (single-line strings).
+    bool MatchName(const std::wstring& name, std::pair<size_t, size_t>& match) const {
+        std::vector<std::pair<size_t, size_t>> matches;
+        Find(name, matches);
+        if (matches.empty()) return false;
+        match = matches.front();
+        return true;
+    }
+
+    std::wstring Replace(const std::wstring& text, int& count) const {
+        count = 0;
+        std::wstring result;
+        size_t cursor = 0;
+        if (regex_) {
+            for (std::wsregex_iterator it(text.begin(), text.end(), *regex_), end; it != end; ++it) {
+                const size_t offset = static_cast<size_t>(it->position(0));
+                const size_t length = static_cast<size_t>(it->length(0));
+                if (length == 0 || !WordBoundaryOk(text, offset, length)) continue;
+                result.append(text, cursor, offset - cursor);
+                result += it->format(replacement_);
+                cursor = offset + length;
+                ++count;
+            }
+        } else {
+            std::vector<std::pair<size_t, size_t>> matches;
+            Find(text, matches);
+            for (const auto& [offset, length] : matches) {
+                result.append(text, cursor, offset - cursor);
+                result += replacement_;
+                cursor = offset + length;
+                ++count;
+            }
+        }
+        result.append(text, cursor, std::wstring::npos);
+        return result;
+    }
+
+    // Replacement text for one already-selected match (used by "replace here").
+    std::wstring ReplaceOne(const std::wstring& matched) const {
+        if (!regex_) return replacement_;
+        try {
+            return std::regex_replace(matched, *regex_, replacement_, std::regex_constants::format_first_only);
+        } catch (...) {
+            return replacement_;
+        }
+    }
+
+private:
+    bool WordBoundaryOk(const std::wstring& text, size_t offset, size_t length) const {
+        if (!options_.wholeWord || length == 0) return true;
+        if (IsSearchWordChar(text[offset]) && offset > 0 && IsSearchWordChar(text[offset - 1])) return false;
+        const size_t end = offset + length;
+        if (IsSearchWordChar(text[end - 1]) && end < text.size() && IsSearchWordChar(text[end])) return false;
+        return true;
+    }
+
+    SearchOptions options_;
+    std::shared_ptr<std::wregex> regex_;
+    std::vector<std::wstring> needles_;
+    std::wstring replacement_;
+};
+
+// Converts any line-break style to \n and reports the original style.
+std::wstring NormalizeToLf(std::wstring_view text, std::wstring& eol, bool& mixed) {
+    std::wstring result;
+    result.reserve(text.size());
+    int crlf = 0, cr = 0, lf = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\r') {
+            if (i + 1 < text.size() && text[i + 1] == L'\n') { ++i; ++crlf; } else { ++cr; }
+            result += L'\n';
+        } else {
+            if (text[i] == L'\n') ++lf;
+            result += text[i];
+        }
+    }
+    eol = crlf >= lf && crlf >= cr ? L"\r\n" : lf >= cr ? L"\n" : L"\r";
+    mixed = (crlf > 0) + (cr > 0) + (lf > 0) > 1;
+    if (crlf + cr + lf == 0) eol = L"\r\n";
+    return result;
+}
+
+// Fills line/column and a display excerpt for each match.
+void DescribeHits(const std::wstring& text, const std::vector<std::pair<size_t, size_t>>& matches, std::vector<SearchHit>& hits) {
+    std::vector<size_t> lineStarts{0};
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\n') lineStarts.push_back(i + 1);
+    }
+    for (const auto& [offset, length] : matches) {
+        const size_t line = static_cast<size_t>(std::upper_bound(lineStarts.begin(), lineStarts.end(), offset) - lineStarts.begin()) - 1;
+        const size_t start = lineStarts[line];
+        size_t end = text.find(L'\n', start);
+        if (end == std::wstring::npos) end = text.size();
+        SearchHit hit;
+        hit.line = static_cast<int>(line + 1);
+        hit.column = static_cast<int>(offset - start + 1);
+        hit.offset = offset;
+        hit.length = length;
+        // Long lines (minified files) are cut to a window around the match.
+        size_t from = start;
+        size_t to = end;
+        if (to - from > 300) {
+            from = offset > start + 80 ? offset - 80 : start;
+            to = std::min(end, offset + std::min<size_t>(length, 120) + 160);
+        }
+        hit.lineText = text.substr(from, to - from);
+        hit.lineMatchStart = offset - from;
+        if (from > start) {
+            hit.lineText.insert(0, L"…");
+            hit.lineMatchStart += 1;
+        }
+        if (to < end) hit.lineText += L"…";
+        std::replace(hit.lineText.begin(), hit.lineText.end(), L'\t', L' ');
+        hits.push_back(std::move(hit));
+    }
+}
+
+// ---- .gitignore (common subset: globs, dir/ suffix, leading /, ** prefixes; no negation)
+
+struct GitIgnoreRule {
+    std::wstring base;     // directory containing the .gitignore
+    std::wstring pattern;  // backslash separated
+    bool directoryOnly = false;
+    bool anchored = false; // contains a slash: matched against the path below `base`
+};
+
+void LoadGitIgnore(const std::wstring& directory, std::vector<GitIgnoreRule>& rules) {
+    std::vector<char> bytes;
+    if (!ReadBinaryFile(fs::path(directory) / L".gitignore", bytes)) return;
+    for (std::wstring line : SplitLines(DecodeTextBytes(bytes))) {
+        line = TrimCopy(line);
+        if (line.empty() || line[0] == L'#' || line[0] == L'!') continue;
+        GitIgnoreRule rule;
+        rule.base = directory;
+        if (line.back() == L'/') {
+            rule.directoryOnly = true;
+            line.pop_back();
+        }
+        if (line.size() > 3 && line.ends_with(L"/**")) {
+            line.resize(line.size() - 3);
+            rule.directoryOnly = true;
+        }
+        while (line.starts_with(L"**/")) line.erase(0, 3);
+        if (line.starts_with(L"/")) {
+            line.erase(0, 1);
+            rule.anchored = true;
+        }
+        if (line.find(L'/') != std::wstring::npos) rule.anchored = true;
+        std::replace(line.begin(), line.end(), L'/', L'\\');
+        if (line.empty()) continue;
+        rule.pattern = line;
+        rules.push_back(std::move(rule));
+    }
+}
+
+bool GitIgnored(const std::vector<GitIgnoreRule>& rules, const std::wstring& fullPath, const std::wstring& name, bool isDirectory) {
+    for (const GitIgnoreRule& rule : rules) {
+        if (rule.directoryOnly && !isDirectory) continue;
+        if (rule.anchored) {
+            if (fullPath.size() <= rule.base.size() + 1) continue;
+            const std::wstring relative = fullPath.substr(rule.base.size() + 1);
+            if (PathMatchSpecW(relative.c_str(), rule.pattern.c_str())) return true;
+        } else if (PathMatchSpecW(name.c_str(), rule.pattern.c_str())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---- Job ------------------------------------------------------------------------
+
+struct SearchFileEntry {
+    std::wstring path;
+    std::wstring display;
+    uint64_t size = 0;
+};
+
+struct SearchJob {
+    int generation = 0;
+    SearchMatcher matcher;
+    std::vector<SearchSource> sources;  // open-tab scopes
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> enumerating{true};
+    std::atomic<int> enumerated{0};
+    std::atomic<int> scanned{0};
+    std::atomic<int> skippedLarge{0};
+    std::atomic<int> skippedBinary{0};
+    std::atomic<int> errorCount{0};
+    std::atomic<int> filesHit{0};
+    std::atomic<long long> matches{0};
+    std::atomic<bool> truncated{false};
+    std::mutex mutex;
+    std::vector<std::unique_ptr<SearchFileResult>> pending;
+    std::vector<std::wstring> errors;
+    ULONGLONG started = 0;
+    ULONGLONG elapsed = 0;
+    HWND notify = nullptr;
+    HANDLE finished = nullptr;
+
+    void AddError(const std::wstring& path, const std::wstring& reason) {
+        ++errorCount;
+        std::lock_guard lock(mutex);
+        if (errors.size() < 5000) errors.push_back(path + L"\t" + reason);
+    }
+    bool Stopped() const { return cancel.load() || truncated.load(); }
+};
+
+unsigned __stdcall SearchThreadEntry(void* parameter) {
+    std::unique_ptr<std::function<void()>> function(static_cast<std::function<void()>*>(parameter));
+    (*function)();
+    return 0;
+}
+
+// std::regex recurses deeply on long matches; give workers a large stack.
+HANDLE StartSearchThread(std::function<void()> function) {
+    auto* heap = new std::function<void()>(std::move(function));
+    const uintptr_t handle = _beginthreadex(nullptr, 64u << 20, SearchThreadEntry, heap, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (handle == 0) {
+        delete heap;
+        return nullptr;
+    }
+    return reinterpret_cast<HANDLE>(handle);
+}
+
+bool MatchesAnyPattern(const std::wstring& name, const std::vector<std::wstring>& patterns) {
+    for (const std::wstring& pattern : patterns) {
+        if (PathMatchSpecW(name.c_str(), pattern.c_str())) return true;
+    }
+    return false;
+}
+
+void EnumerateSearchFiles(SearchJob& job, std::vector<SearchFileEntry>& files) {
+    const SearchOptions& options = job.matcher.options();
+    std::vector<std::wstring> types = SplitPatterns(options.fileTypes);
+    const bool allTypes = types.empty() || std::any_of(types.begin(), types.end(),
+        [](const std::wstring& t) { return t == L"*" || t == L"*.*"; });
+    // "js" or ".js" mean "*.js".
+    for (std::wstring& type : types) {
+        if (type.find_first_of(L"*?") == std::wstring::npos) type = (type[0] == L'.' ? L"*" : L"*.") + type;
+    }
+    std::vector<std::wstring> excludeNames;
+    std::vector<std::wstring> excludePaths;
+    if (options.useExcludes) {
+        for (std::wstring pattern : SplitPatterns(options.excludes)) {
+            std::replace(pattern.begin(), pattern.end(), L'/', L'\\');
+            while (!pattern.empty() && pattern.back() == L'\\') pattern.pop_back();
+            if (pattern.empty()) continue;
+            (pattern.find(L'\\') != std::wstring::npos ? excludePaths : excludeNames).push_back(pattern);
+        }
+    }
+    std::unordered_map<std::wstring, bool> seen;  // overlapping folders: each file once
+
+    for (std::wstring root : options.folders) {
+        while (root.size() > 3 && (root.back() == L'\\' || root.back() == L'/')) root.pop_back();
+        struct Frame { std::wstring directory; std::vector<GitIgnoreRule> rules; };
+        std::vector<Frame> stack;
+        Frame first{root, {}};
+        if (options.useGitignore) LoadGitIgnore(root, first.rules);
+        stack.push_back(std::move(first));
+        while (!stack.empty() && !job.Stopped()) {
+            Frame frame = std::move(stack.back());
+            stack.pop_back();
+            WIN32_FIND_DATAW data{};
+            HANDLE find = FindFirstFileExW((frame.directory + L"\\*").c_str(), FindExInfoBasic, &data,
+                FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+            if (find == INVALID_HANDLE_VALUE) {
+                const DWORD code = GetLastError();
+                if (code != ERROR_FILE_NOT_FOUND) job.AddError(frame.directory, code == ERROR_ACCESS_DENIED ? L"没有访问权限" : L"无法读取目录（错误 " + std::to_wstring(code) + L"）");
+                continue;
+            }
+            std::vector<Frame> children;
+            do {
+                const std::wstring name = data.cFileName;
+                if (name == L"." || name == L"..") continue;
+                const bool isDirectory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                if (!options.includeHidden && (data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN)) continue;
+                if (isDirectory && (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;  // no symlink loops
+                const std::wstring full = frame.directory + L"\\" + name;
+                const std::wstring relative = full.size() > root.size() + 1 ? full.substr(root.size() + 1) : name;
+                if (MatchesAnyPattern(name, excludeNames) || MatchesAnyPattern(relative, excludePaths)) continue;
+                if (options.useGitignore && GitIgnored(frame.rules, full, name, isDirectory)) continue;
+                if (isDirectory) {
+                    if (!options.recursive) continue;
+                    Frame child{full, frame.rules};
+                    if (options.useGitignore) LoadGitIgnore(full, child.rules);
+                    children.push_back(std::move(child));
+                    continue;
+                }
+                if (!allTypes && !MatchesAnyPattern(name, types)) continue;
+                if (!seen.emplace(LowerInvariant(full), true).second) continue;
+                const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+                files.push_back({full, options.folders.size() > 1 ? full : relative, size});
+                ++job.enumerated;
+            } while (!job.Stopped() && FindNextFileW(find, &data));
+            FindClose(find);
+            // Depth-first, alphabetical: push in reverse so the first child is processed first.
+            for (auto it = children.rbegin(); it != children.rend(); ++it) stack.push_back(std::move(*it));
+        }
+    }
+}
+
+void PublishResult(SearchJob& job, std::unique_ptr<SearchFileResult> result) {
+    const long long total = job.matches.fetch_add(static_cast<long long>(result->hits.size())) +
+        static_cast<long long>(result->hits.size());
+    ++job.filesHit;
+    if (total >= static_cast<long long>(job.matcher.options().maxMatches)) job.truncated = true;
+    std::lock_guard lock(job.mutex);
+    job.pending.push_back(std::move(result));
+}
+
+void SearchText(SearchJob& job, std::unique_ptr<SearchFileResult> result, const std::wstring& normalized) {
+    std::vector<std::pair<size_t, size_t>> matches;
+    try {
+        job.matcher.Find(normalized, matches);
+        if (matches.empty()) return;
+        DescribeHits(normalized, matches, result->hits);
+        if (job.matcher.options().forReplace) {
+            result->before = normalized;
+            result->after = job.matcher.Replace(normalized, result->replacements);
+            if (result->after == result->before) return;
+        }
+    } catch (const std::exception&) {
+        job.AddError(result->path.empty() ? result->display : result->path, L"正则表达式匹配失败（表达式过于复杂或文件过大）");
+        return;
+    }
+    PublishResult(job, std::move(result));
+}
+
+void SearchOneFile(SearchJob& job, const SearchFileEntry& entry) {
+    const SearchOptions& options = job.matcher.options();
+    if (options.target != SearchTarget::Content) {
+        const std::wstring subject = options.target == SearchTarget::FileName
+            ? fs::path(entry.path).filename().wstring() : entry.path;
+        ++job.scanned;
+        std::pair<size_t, size_t> match;
+        if (!job.matcher.MatchName(subject, match)) return;
+        auto result = std::make_unique<SearchFileResult>();
+        result->path = entry.path;
+        result->display = entry.display;
+        SearchHit hit;
+        hit.offset = match.first;
+        hit.length = match.second;
+        hit.lineText = subject;
+        hit.lineMatchStart = match.first;
+        result->hits.push_back(std::move(hit));
+        PublishResult(job, std::move(result));
+        return;
+    }
+    if (entry.size > options.maxFileBytes) {
+        ++job.skippedLarge;
+        job.AddError(entry.path, L"已跳过：文件大于 " + std::to_wstring(options.maxFileBytes >> 20) + L" MB");
+        return;
+    }
+    std::vector<char> bytes;
+    if (!ReadBinaryFile(entry.path, bytes)) {
+        job.AddError(entry.path, L"无法读取（可能没有权限或正被占用）");
+        return;
+    }
+    ++job.scanned;
+    const bool utf16Bom = bytes.size() >= 2 &&
+        ((static_cast<unsigned char>(bytes[0]) == 0xFF && static_cast<unsigned char>(bytes[1]) == 0xFE) ||
+         (static_cast<unsigned char>(bytes[0]) == 0xFE && static_cast<unsigned char>(bytes[1]) == 0xFF));
+    if (!utf16Bom && memchr(bytes.data(), 0, std::min<size_t>(bytes.size(), 8192)) != nullptr) {
+        ++job.skippedBinary;
+        return;
+    }
+    auto result = std::make_unique<SearchFileResult>();
+    result->path = entry.path;
+    result->display = entry.display;
+    result->size = bytes.size();
+    result->timestamp = FileTimestamp(entry.path);
+    const std::wstring text = DecodeTextBytes(bytes, &result->encoding);
+    const std::wstring normalized = NormalizeToLf(text, result->eol, result->mixedEol);
+    SearchText(job, std::move(result), normalized);
+}
+
+void RunSearchJob(std::shared_ptr<SearchJob> job) {
+    std::vector<SearchFileEntry> files;
+    if (job->matcher.options().scope == SearchScope::Folder) EnumerateSearchFiles(*job, files);
+    job->enumerating = false;
+
+    if (!job->sources.empty()) {
+        for (SearchSource& source : job->sources) {
+            if (job->Stopped()) break;
+            ++job->scanned;
+            if (job->matcher.options().target != SearchTarget::Content) {
+                std::pair<size_t, size_t> match;
+                const std::wstring subject = job->matcher.options().target == SearchTarget::FileName
+                    ? source.display : (source.path.empty() ? source.display : source.path);
+                if (!job->matcher.MatchName(subject, match)) continue;
+                auto result = std::make_unique<SearchFileResult>();
+                result->path = source.path;
+                result->display = source.display;
+                result->editor = source.editor;
+                SearchHit hit;
+                hit.offset = match.first;
+                hit.length = match.second;
+                hit.lineText = subject;
+                hit.lineMatchStart = match.first;
+                result->hits.push_back(std::move(hit));
+                PublishResult(*job, std::move(result));
+                continue;
+            }
+            auto result = std::make_unique<SearchFileResult>();
+            result->path = source.path;
+            result->display = source.display;
+            result->editor = source.editor;
+            SearchText(*job, std::move(result), source.text);
+        }
+    } else {
+        std::atomic<size_t> next{0};
+        const unsigned threads = std::clamp(std::thread::hardware_concurrency(), 2u, 8u);
+        std::vector<HANDLE> handles;
+        for (unsigned i = 0; i < threads; ++i) {
+            HANDLE handle = StartSearchThread([&] {
+                for (size_t index; !job->Stopped() && (index = next.fetch_add(1)) < files.size();) {
+                    try {
+                        SearchOneFile(*job, files[index]);
+                    } catch (...) {
+                        job->AddError(files[index].path, L"处理失败");
+                    }
+                }
+            });
+            if (handle) handles.push_back(handle);
+        }
+        if (handles.empty()) {  // could not start threads: do it here
+            for (const SearchFileEntry& entry : files) {
+                if (job->Stopped()) break;
+                SearchOneFile(*job, entry);
+            }
+        }
+        if (!handles.empty()) WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(), TRUE, INFINITE);
+        for (HANDLE handle : handles) CloseHandle(handle);
+    }
+    job->elapsed = GetTickCount64() - job->started;
+    PostMessageW(job->notify, kMessageSearchDone, static_cast<WPARAM>(job->generation), 0);
+    SetEvent(job->finished);
+}
+
+// ===========================================================================
+// Find / replace in files: panel UI
+// ===========================================================================
+
+enum SearchControl : int {
+    kSearchFind = 3001, kSearchReplace, kSearchScope, kSearchFolder, kSearchBrowse, kSearchTypes,
+    kSearchExcludes, kSearchTarget, kSearchMode, kSearchRecursive, kSearchHidden, kSearchMatchCase,
+    kSearchWholeWord, kSearchUseExcludes, kSearchGitignore, kSearchStart, kSearchStop, kSearchReplaceButton,
+    kSearchClear, kSearchFilter, kSearchStats, kSearchTree, kSearchClose, kSearchMaxSize, kSearchMaxResults,
+};
+constexpr int kSearchHistoryLimit = 20;
+constexpr wchar_t kDefaultExcludes[] = L"node_modules;.git;.next;dist;build;coverage;vendor;*.min.js;*.map;*.lock";
+constexpr wchar_t kDefaultFileTypes[] = L"*.*";
+
+struct SearchItemRef { int file; int hit; int prefixLength; };
+
+struct SearchUiState {
+    HWND panel = nullptr;
+    HWND tree = nullptr;
+    HWND stats = nullptr;
+    std::unordered_map<int, HWND> controls;
+    std::vector<HWND> labels;
+    std::shared_ptr<SearchJob> job;
+    std::shared_ptr<SearchMatcher> lastMatcher;
+    int generation = 0;
+    std::vector<std::unique_ptr<SearchFileResult>> results;
+    std::vector<SearchItemRef> items;
+    std::vector<bool> populated;
+    std::vector<HTREEITEM> fileNodes;
+    HTREEITEM loadMoreNode = nullptr;
+    int shownFiles = 0;
+    int nextFile = 0;
+    std::wstring filter;
+    std::vector<std::wstring> errors;
+    std::wstring summary;
+    std::wstring lastQuery;
+    std::wstring lastFolders;
+    bool running = false;
+    bool previewWhenDone = false;
+    bool resultsStale = false;
+    std::vector<std::wstring> findHistory, replaceHistory, folderHistory, typeHistory;
+    std::wstring excludes = kDefaultExcludes;
+    int optionScope = 0, optionTarget = 0, optionMode = 0;
+    bool optionRecursive = true, optionHidden = false, optionMatchCase = false, optionWholeWord = false;
+    bool optionUseExcludes = true, optionGitignore = true;
+    int maxFileMb = 20;
+    int maxResults = 20000;
+    std::wstring lastBackupDirectory;
+    bool dragging = false;
+    int dragStartY = 0;
+    int dragStartHeight = 0;
+};
+SearchUiState g_search;
+
+HWND SearchControl(int id) {
+    const auto it = g_search.controls.find(id);
+    return it == g_search.controls.end() ? nullptr : it->second;
+}
+
+bool SearchChecked(int id) { return SendMessageW(SearchControl(id), BM_GETCHECK, 0, 0) == BST_CHECKED; }
+
+fs::path SearchStatePath() { return g_app.dataDirectory / L"search.dat"; }
+
+void PushHistory(std::vector<std::wstring>& history, const std::wstring& value) {
+    if (value.empty()) return;
+    history.erase(std::remove(history.begin(), history.end(), value), history.end());
+    history.insert(history.begin(), value);
+    if (history.size() > kSearchHistoryLimit) history.resize(kSearchHistoryLimit);
+}
+
+void LoadSearchState() {
+    std::vector<char> bytes;
+    if (!ReadBinaryFile(SearchStatePath(), bytes)) return;
+    std::string content(bytes.begin(), bytes.end());
+    std::istringstream stream(content);
+    for (std::string line; std::getline(stream, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::vector<std::string> parts = SplitTabs(line);
+        if (parts.size() < 2) continue;
+        const std::wstring value = Utf8ToWide(HexDecode(parts[1]));
+        if (parts[0] == "FIND") g_search.findHistory.push_back(value);
+        else if (parts[0] == "REPLACE") g_search.replaceHistory.push_back(value);
+        else if (parts[0] == "FOLDER") g_search.folderHistory.push_back(value);
+        else if (parts[0] == "TYPES") g_search.typeHistory.push_back(value);
+        else if (parts[0] == "EXCLUDES") g_search.excludes = value;
+        else if (parts[0] == "BACKUP") g_search.lastBackupDirectory = value;
+        else if (parts[0] == "OPTIONS" && parts.size() >= 14) {
+            int v[13]{};
+            for (int i = 0; i < 13; ++i) ParseInt(parts[static_cast<size_t>(i + 1)], v[i]);
+            g_search.optionScope = std::clamp(v[0], 0, 2);
+            g_search.optionTarget = std::clamp(v[1], 0, 2);
+            g_search.optionMode = std::clamp(v[2], 0, 3);
+            g_search.optionRecursive = v[3] != 0;
+            g_search.optionHidden = v[4] != 0;
+            g_search.optionMatchCase = v[5] != 0;
+            g_search.optionWholeWord = v[6] != 0;
+            g_search.optionUseExcludes = v[7] != 0;
+            g_search.optionGitignore = v[8] != 0;
+            g_search.maxFileMb = std::clamp(v[9], 1, 2048);
+            g_search.maxResults = std::clamp(v[10], 100, 1000000);
+            g_app.searchPanelHeight = std::clamp(v[11], 160, 2000);
+            g_app.searchPanelVisible = v[12] != 0;
+        }
+    }
+}
+
+void ReadSearchOptionsFromControls();
+
+void SaveSearchState() {
+    if (g_search.panel) ReadSearchOptionsFromControls();
+    std::ostringstream output;
+    const auto list = [&](const char* tag, const std::vector<std::wstring>& values) {
+        for (const std::wstring& value : values) output << tag << '\t' << HexEncode(WideToUtf8(value)) << '\n';
+    };
+    list("FIND", g_search.findHistory);
+    list("REPLACE", g_search.replaceHistory);
+    list("FOLDER", g_search.folderHistory);
+    list("TYPES", g_search.typeHistory);
+    output << "EXCLUDES\t" << HexEncode(WideToUtf8(g_search.excludes)) << '\n';
+    output << "BACKUP\t" << HexEncode(WideToUtf8(g_search.lastBackupDirectory)) << '\n';
+    output << "OPTIONS\t" << g_search.optionScope << '\t' << g_search.optionTarget << '\t' << g_search.optionMode << '\t'
+           << g_search.optionRecursive << '\t' << g_search.optionHidden << '\t' << g_search.optionMatchCase << '\t'
+           << g_search.optionWholeWord << '\t' << g_search.optionUseExcludes << '\t' << g_search.optionGitignore << '\t'
+           << g_search.maxFileMb << '\t' << g_search.maxResults << '\t' << g_app.searchPanelHeight << '\t'
+           << (g_app.searchPanelVisible ? 1 : 0) << '\n';
+    WriteAtomicFile(SearchStatePath(), output.str());
+}
+
+void FillCombo(HWND combo, const std::vector<std::wstring>& values) {
+    const std::wstring current = GetWindowTextValue(combo);
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    for (const std::wstring& value : values) SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value.c_str()));
+    SetWindowTextW(combo, current.c_str());
+}
+
+void RebuildSearchHistoryMenu() {
+    if (!g_app.searchHistoryMenu) return;
+    while (GetMenuItemCount(g_app.searchHistoryMenu) > 0) DeleteMenu(g_app.searchHistoryMenu, 0, MF_BYPOSITION);
+    if (g_search.findHistory.empty()) {
+        AppendMenuW(g_app.searchHistoryMenu, MF_STRING | MF_GRAYED, 0, L"（暂无搜索历史）");
+        return;
+    }
+    for (size_t i = 0; i < g_search.findHistory.size() && i < 15; ++i) {
+        std::wstring label = g_search.findHistory[i];
+        if (label.size() > 40) label = label.substr(0, 40) + L"…";
+        for (size_t p = 0; (p = label.find(L'&', p)) != std::wstring::npos; p += 2) label.insert(p, L"&");
+        AppendMenuW(g_app.searchHistoryMenu, MF_STRING, static_cast<UINT_PTR>(kIdSearchHistoryFirst + static_cast<int>(i)), label.c_str());
+    }
+}
+
+void ReadSearchOptionsFromControls() {
+    g_search.optionScope = std::max(0, static_cast<int>(SendMessageW(SearchControl(kSearchScope), CB_GETCURSEL, 0, 0)));
+    g_search.optionTarget = std::max(0, static_cast<int>(SendMessageW(SearchControl(kSearchTarget), CB_GETCURSEL, 0, 0)));
+    g_search.optionMode = std::max(0, static_cast<int>(SendMessageW(SearchControl(kSearchMode), CB_GETCURSEL, 0, 0)));
+    g_search.optionRecursive = SearchChecked(kSearchRecursive);
+    g_search.optionHidden = SearchChecked(kSearchHidden);
+    g_search.optionMatchCase = SearchChecked(kSearchMatchCase);
+    g_search.optionWholeWord = SearchChecked(kSearchWholeWord);
+    g_search.optionUseExcludes = SearchChecked(kSearchUseExcludes);
+    g_search.optionGitignore = SearchChecked(kSearchGitignore);
+    g_search.excludes = GetWindowTextValue(SearchControl(kSearchExcludes));
+    g_search.maxFileMb = std::clamp(_wtoi(GetWindowTextValue(SearchControl(kSearchMaxSize)).c_str()), 1, 2048);
+    g_search.maxResults = std::clamp(_wtoi(GetWindowTextValue(SearchControl(kSearchMaxResults)).c_str()), 100, 1000000);
+}
+
+// ---- Results tree ----------------------------------------------------------------
+
+bool HitPassesFilter(const SearchFileResult& file, const SearchHit& hit) {
+    if (g_search.filter.empty()) return true;
+    return LowerInvariant(hit.lineText).find(g_search.filter) != std::wstring::npos ||
+        LowerInvariant(file.display).find(g_search.filter) != std::wstring::npos;
+}
+
+int VisibleHitCount(const SearchFileResult& file) {
+    int count = 0;
+    for (const SearchHit& hit : file.hits) count += HitPassesFilter(file, hit) ? 1 : 0;
+    return count;
+}
+
+void PopulateFileNode(int fileIndex) {
+    if (fileIndex < 0 || fileIndex >= static_cast<int>(g_search.results.size()) || g_search.populated[static_cast<size_t>(fileIndex)]) return;
+    g_search.populated[static_cast<size_t>(fileIndex)] = true;
+    const SearchFileResult& file = *g_search.results[static_cast<size_t>(fileIndex)];
+    for (size_t h = 0; h < file.hits.size(); ++h) {
+        const SearchHit& hit = file.hits[h];
+        if (!HitPassesFilter(file, hit)) continue;
+        std::wstring prefix = hit.line > 0
+            ? std::to_wstring(hit.line) + L":" + std::to_wstring(hit.column) + L"    "
+            : L"文件名    ";
+        std::wstring text = prefix + hit.lineText;
+        g_search.items.push_back({fileIndex, static_cast<int>(h), static_cast<int>(prefix.size())});
+        TVINSERTSTRUCTW insert{};
+        insert.hParent = g_search.fileNodes[static_cast<size_t>(fileIndex)];
+        insert.hInsertAfter = TVI_LAST;
+        insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+        insert.item.pszText = text.data();
+        insert.item.lParam = static_cast<LPARAM>(g_search.items.size() - 1);
+        TreeView_InsertItem(g_search.tree, &insert);
+    }
+}
+
+constexpr int kLiveTreeFiles = 300;   // file nodes shown while a search runs
+constexpr int kTreeBatchFiles = 500;  // file nodes added per "load more"
+constexpr int kLoadMoreItem = -2;
+
+void SyncTreeVectors() {
+    g_search.fileNodes.resize(g_search.results.size(), nullptr);
+    g_search.populated.resize(g_search.results.size(), false);
+}
+
+// Returns false if the file has nothing to show under the current filter.
+bool AddFileNode(int fileIndex) {
+    SyncTreeVectors();
+    const SearchFileResult& file = *g_search.results[static_cast<size_t>(fileIndex)];
+    const int visible = VisibleHitCount(file);
+    if (visible == 0) return false;
+    std::wstring text = file.display + L"  (" + std::to_wstring(visible) + L")";
+    g_search.items.push_back({fileIndex, -1, 0});
+    TVINSERTSTRUCTW insert{};
+    insert.hParent = TVI_ROOT;
+    insert.hInsertAfter = TVI_LAST;
+    insert.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
+    insert.item.pszText = text.data();
+    insert.item.cChildren = 1;
+    insert.item.lParam = static_cast<LPARAM>(g_search.items.size() - 1);
+    HTREEITEM node = TreeView_InsertItem(g_search.tree, &insert);
+    g_search.fileNodes[static_cast<size_t>(fileIndex)] = node;
+    g_search.populated[static_cast<size_t>(fileIndex)] = false;
+    ++g_search.shownFiles;
+    // The first files open expanded; the rest load their lines when expanded.
+    if (g_search.shownFiles <= 40) {
+        PopulateFileNode(fileIndex);
+        TreeView_Expand(g_search.tree, node, TVE_EXPAND);
+    }
+    return true;
+}
+
+void RemoveLoadMoreNode() {
+    if (g_search.loadMoreNode) TreeView_DeleteItem(g_search.tree, g_search.loadMoreNode);
+    g_search.loadMoreNode = nullptr;
+}
+
+// Adds file nodes from `nextFile` until `limit` are shown, then a "load more"
+// row if results remain. Keeps the UI responsive with huge result sets.
+void AppendFileNodes(int limit) {
+    RemoveLoadMoreNode();
+    while (g_search.nextFile < static_cast<int>(g_search.results.size()) && g_search.shownFiles < limit) {
+        AddFileNode(g_search.nextFile++);
+    }
+    int remaining = 0;
+    for (int i = g_search.nextFile; i < static_cast<int>(g_search.results.size()); ++i) {
+        remaining += VisibleHitCount(*g_search.results[static_cast<size_t>(i)]) > 0 ? 1 : 0;
+    }
+    if (remaining > 0 && !g_search.running) {
+        std::wstring text = L"还有 " + std::to_wstring(remaining) + L" 个文件未显示，双击或按 Enter 加载更多";
+        g_search.items.push_back({kLoadMoreItem, -1, 0});
+        TVINSERTSTRUCTW insert{};
+        insert.hParent = TVI_ROOT;
+        insert.hInsertAfter = TVI_LAST;
+        insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+        insert.item.pszText = text.data();
+        insert.item.lParam = static_cast<LPARAM>(g_search.items.size() - 1);
+        g_search.loadMoreNode = TreeView_InsertItem(g_search.tree, &insert);
+    }
+}
+
+void LoadMoreResults() {
+    SendMessageW(g_search.tree, WM_SETREDRAW, FALSE, 0);
+    AppendFileNodes(g_search.shownFiles + kTreeBatchFiles);
+    SendMessageW(g_search.tree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_search.tree, nullptr, TRUE);
+}
+
+void RebuildResultTree() {
+    if (!g_search.tree) return;
+    SendMessageW(g_search.tree, WM_SETREDRAW, FALSE, 0);
+    g_search.loadMoreNode = nullptr;
+    TreeView_DeleteAllItems(g_search.tree);
+    g_search.items.clear();
+    g_search.fileNodes.assign(g_search.results.size(), nullptr);
+    g_search.populated.assign(g_search.results.size(), false);
+    g_search.shownFiles = 0;
+    g_search.nextFile = 0;
+    AppendFileNodes(g_search.running ? kLiveTreeFiles : kTreeBatchFiles);
+    SendMessageW(g_search.tree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_search.tree, nullptr, TRUE);
+}
+
+std::wstring FormatSeconds(ULONGLONG milliseconds) {
+    wchar_t buffer[32]{};
+    swprintf_s(buffer, L"%.2f", static_cast<double>(milliseconds) / 1000.0);
+    return buffer;
+}
+
+void UpdateSearchStats() {
+    if (!g_search.stats) return;
+    std::wstring text;
+    const std::shared_ptr<SearchJob> job = g_search.job;
+    if (!job) {
+        text = g_search.summary.empty() ? L"输入要查找的内容，按 Enter 开始搜索" : g_search.summary;
+    } else {
+        long long matches = 0;
+        for (const auto& file : g_search.results) matches += static_cast<long long>(file->hits.size());
+        if (g_search.running) {
+            text = job->enumerating ? L"正在列出文件… 已找到 " + std::to_wstring(job->enumerated.load()) + L" 个"
+                : L"正在搜索… 已扫描 " + std::to_wstring(job->scanned.load()) + L" / " + std::to_wstring(job->enumerated.load()) + L" 个文件";
+            text += L" | " + std::to_wstring(g_search.results.size()) + L" 个文件命中 | " + std::to_wstring(matches) + L" 处匹配";
+        } else {
+            text = L"已扫描 " + std::to_wstring(job->scanned.load()) + L" 个文件 | " + std::to_wstring(g_search.results.size()) +
+                L" 个文件命中 | " + std::to_wstring(matches) + L" 处匹配 | " + FormatSeconds(job->elapsed) + L" 秒";
+            const int skipped = job->skippedLarge.load() + job->skippedBinary.load();
+            if (skipped > 0) {
+                text += L" | 跳过 " + std::to_wstring(skipped) + L" 个（过大 " + std::to_wstring(job->skippedLarge.load()) +
+                    L"，二进制 " + std::to_wstring(job->skippedBinary.load()) + L"）";
+            }
+            const int errors = job->errorCount.load() - job->skippedLarge.load();
+            if (errors > 0) text += L" | " + std::to_wstring(errors) + L" 个错误（点击查看）";
+            if (job->truncated) text += L" | 结果过多，已在 " + std::to_wstring(g_search.maxResults) + L" 处后停止";
+            if (job->cancel) text += L" | 已停止";
+            if (g_search.resultsStale) text += L" | 文件已被替换，结果可能已过期";
+        }
+    }
+    SetWindowTextW(g_search.stats, text.c_str());
+    EnableWindow(SearchControl(kSearchStop), g_search.running);
+}
+
+
+void DrainSearchResults() {
+    const std::shared_ptr<SearchJob> job = g_search.job;
+    if (!job) return;
+    std::vector<std::unique_ptr<SearchFileResult>> batch;
+    {
+        std::lock_guard lock(job->mutex);
+        batch.swap(job->pending);
+    }
+    if (batch.empty()) return;
+    SendMessageW(g_search.tree, WM_SETREDRAW, FALSE, 0);
+    for (auto& result : batch) g_search.results.push_back(std::move(result));
+    SyncTreeVectors();
+    AppendFileNodes(kLiveTreeFiles);
+    SendMessageW(g_search.tree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_search.tree, nullptr, FALSE);
+}
+
+void CancelSearch(bool wait) {
+    const std::shared_ptr<SearchJob> job = g_search.job;
+    if (!job) return;
+    job->cancel = true;
+    if (wait && job->finished) WaitForSingleObject(job->finished, 3000);
+}
+
+void ClearSearchResults() {
+    CancelSearch(false);
+    g_search.running = false;
+    g_search.job.reset();
+    g_search.results.clear();
+    g_search.errors.clear();
+    g_search.summary.clear();
+    g_search.resultsStale = false;
+    if (g_search.panel) KillTimer(g_search.panel, kTimerSearchProgress);
+    RebuildResultTree();
+    UpdateSearchStats();
+}
+
+// ---- Starting a search -------------------------------------------------------------
+
+void ShowReplaceInFilesPreview();
+
+void StartSearch(bool forReplace) {
+    if (!g_search.panel) return;
+    ReadSearchOptionsFromControls();
+    SearchOptions options;
+    options.query = GetWindowTextValue(SearchControl(kSearchFind));
+    options.replacement = GetWindowTextValue(SearchControl(kSearchReplace));
+    options.scope = static_cast<SearchScope>(g_search.optionScope);
+    options.target = static_cast<SearchTarget>(g_search.optionTarget);
+    options.mode = static_cast<SearchMode>(g_search.optionMode);
+    options.matchCase = g_search.optionMatchCase;
+    options.wholeWord = g_search.optionWholeWord;
+    options.recursive = g_search.optionRecursive;
+    options.includeHidden = g_search.optionHidden;
+    options.useExcludes = g_search.optionUseExcludes;
+    options.useGitignore = g_search.optionGitignore;
+    options.fileTypes = GetWindowTextValue(SearchControl(kSearchTypes));
+    options.excludes = g_search.excludes;
+    options.maxFileBytes = static_cast<uint64_t>(g_search.maxFileMb) << 20;
+    options.maxMatches = static_cast<size_t>(g_search.maxResults);
+    options.forReplace = forReplace;
+    if (forReplace && options.target != SearchTarget::Content) {
+        MessageBoxW(g_app.window, L"替换只适用于“文件内容”搜索。", kWindowTitle, MB_ICONINFORMATION);
+        return;
+    }
+    if (TrimCopy(options.query).empty()) {
+        SetFocus(SearchControl(kSearchFind));
+        MessageBeep(MB_ICONWARNING);
+        return;
+    }
+
+    auto job = std::make_shared<SearchJob>();
+    std::wstring error;
+    if (!job->matcher.Init(options, error)) {
+        MessageBoxW(g_app.window, error.c_str(), kWindowTitle, MB_ICONWARNING);
+        SetFocus(SearchControl(kSearchFind));
+        return;
+    }
+    const std::wstring folderText = GetWindowTextValue(SearchControl(kSearchFolder));
+    if (options.scope == SearchScope::Folder) {
+        std::vector<std::wstring> folders;
+        for (std::wstring folder : SplitPatterns(folderText)) {
+            std::replace(folder.begin(), folder.end(), L'/', L'\\');
+            std::error_code ec;
+            if (!fs::is_directory(folder, ec)) {
+                MessageBoxW(g_app.window, (L"找不到文件夹：" + folder).c_str(), kWindowTitle, MB_ICONWARNING);
+                SetFocus(SearchControl(kSearchFolder));
+                return;
+            }
+            folders.push_back(fs::absolute(folder, ec).lexically_normal().wstring());
+        }
+        if (folders.empty()) {
+            MessageBoxW(g_app.window, L"请选择要搜索的文件夹（多个文件夹用分号分隔）。", kWindowTitle, MB_ICONINFORMATION);
+            SetFocus(SearchControl(kSearchFolder));
+            return;
+        }
+        // Re-initialise so the matcher's copy of the options has the folders.
+        options.folders = folders;
+        job->matcher.Init(options, error);
+        PushHistory(g_search.folderHistory, folderText);
+    } else {
+        // Open-tab scopes search the editor text as it is now (unsaved edits included).
+        for (size_t i = 0; i < g_app.documents.size(); ++i) {
+            if (options.scope == SearchScope::CurrentFile && static_cast<int>(i) != g_app.activeIndex) continue;
+            const TabDocument& document = g_app.documents[i];
+            SearchSource source;
+            source.path = document.untitled ? std::wstring() : document.path;
+            source.display = document.untitled ? document.title : document.path;
+            source.editor = document.editor;
+            source.text = GetEditorRawText(document.editor);
+            std::replace(source.text.begin(), source.text.end(), L'\r', L'\n');
+            job->sources.push_back(std::move(source));
+        }
+    }
+
+    CancelSearch(false);
+    PushHistory(g_search.findHistory, options.query);
+    if (forReplace) PushHistory(g_search.replaceHistory, options.replacement);
+    PushHistory(g_search.typeHistory, options.fileTypes);
+    for (auto [id, history] : {std::pair{kSearchFind, &g_search.findHistory}, {kSearchReplace, &g_search.replaceHistory},
+             {kSearchFolder, &g_search.folderHistory}, {kSearchTypes, &g_search.typeHistory}}) {
+        FillCombo(SearchControl(id), *history);
+    }
+    RebuildSearchHistoryMenu();
+    SaveSearchState();
+
+    g_search.results.clear();
+    g_search.errors.clear();
+    g_search.summary.clear();
+    g_search.resultsStale = false;
+    g_search.filter.clear();
+    SetWindowTextW(SearchControl(kSearchFilter), L"");
+    RebuildResultTree();
+    g_search.lastQuery = options.query;
+    g_search.lastFolders = options.scope == SearchScope::Folder ? folderText
+        : options.scope == SearchScope::OpenFiles ? L"所有打开的文件" : L"当前文件";
+    g_search.lastMatcher = std::shared_ptr<SearchMatcher>(job, &job->matcher);
+    g_search.previewWhenDone = forReplace;
+    job->generation = ++g_search.generation;
+    job->notify = g_search.panel;
+    job->started = GetTickCount64();
+    job->finished = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_search.job = job;
+    g_search.running = true;
+    HANDLE thread = StartSearchThread([job] { RunSearchJob(job); });
+    if (!thread) {
+        g_search.running = false;
+        MessageBoxW(g_app.window, L"无法启动搜索线程。", kWindowTitle, MB_ICONERROR);
+        return;
+    }
+    CloseHandle(thread);
+    SetTimer(g_search.panel, kTimerSearchProgress, 150, nullptr);
+    UpdateSearchStats();
+}
+
+void FinishSearch(int generation) {
+    const std::shared_ptr<SearchJob> job = g_search.job;
+    if (!job || job->generation != generation) return;
+    KillTimer(g_search.panel, kTimerSearchProgress);
+    DrainSearchResults();
+    g_search.running = false;
+    {
+        std::lock_guard lock(job->mutex);
+        g_search.errors = job->errors;
+    }
+    // Stable, readable order once everything is in.
+    std::stable_sort(g_search.results.begin(), g_search.results.end(),
+        [](const auto& a, const auto& b) { return _wcsicmp(a->display.c_str(), b->display.c_str()) < 0; });
+    RebuildResultTree();
+    UpdateSearchStats();
+    if (g_search.previewWhenDone) {
+        g_search.previewWhenDone = false;
+        if (job->cancel) return;
+        if (g_search.results.empty()) {
+            MessageBoxW(g_app.window, L"没有找到可以替换的内容。", kWindowTitle, MB_ICONINFORMATION);
+            return;
+        }
+        if (job->truncated) {
+            MessageBoxW(g_app.window, L"匹配数量超过了“最多结果”上限，只会预览和替换已找到的部分。\n如需全部替换，请调大上限后重试。",
+                kWindowTitle, MB_ICONINFORMATION);
+        }
+        ShowReplaceInFilesPreview();
+    }
+}
+
+// ---- Opening a result ----------------------------------------------------------------
+
+void OpenSearchResult(int itemIndex) {
+    if (itemIndex < 0 || itemIndex >= static_cast<int>(g_search.items.size())) return;
+    const SearchItemRef ref = g_search.items[static_cast<size_t>(itemIndex)];
+    if (ref.file == kLoadMoreItem) {
+        LoadMoreResults();
+        return;
+    }
+    const SearchFileResult& file = *g_search.results[static_cast<size_t>(ref.file)];
+    int documentIndex = -1;
+    if (file.editor) {
+        documentIndex = IndexOfEditor(file.editor);
+        if (documentIndex < 0 && file.path.empty()) {
+            ShowNotice(L"该标签已经关闭");
+            return;
+        }
+    }
+    if (documentIndex < 0) {
+        if (!OpenFileInNewTab(file.path)) return;
+        documentIndex = g_app.activeIndex;
+    } else {
+        SelectTab(documentIndex);
+    }
+    const int hitIndex = ref.hit >= 0 ? ref.hit : 0;
+    if (file.hits.empty() || file.hits[static_cast<size_t>(hitIndex)].line == 0) return;
+    const SearchHit& hit = file.hits[static_cast<size_t>(hitIndex)];
+    HWND editor = g_app.documents[static_cast<size_t>(documentIndex)].editor;
+    // RichEdit keeps one character per line break, like the \n-normalised text.
+    const std::wstring text = GetEditorRawText(editor);
+    LONG position = 0;
+    for (int line = 1; line < hit.line && position < static_cast<LONG>(text.size()); ++position) {
+        if (text[static_cast<size_t>(position)] == L'\r') ++line;
+    }
+    position += hit.column - 1;
+    CHARRANGE range{position, position + static_cast<LONG>(hit.length)};
+    range.cpMin = std::min(range.cpMin, static_cast<LONG>(text.size()));
+    range.cpMax = std::min(range.cpMax, static_cast<LONG>(text.size()));
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+    SendMessageW(editor, EM_SCROLLCARET, 0, 0);
+    SetFocus(editor);
+    RefreshGutter();
+    UpdateStatusBar();
+}
+
+int SelectedSearchItem() {
+    HTREEITEM item = TreeView_GetSelection(g_search.tree);
+    if (!item) return -1;
+    TVITEMW data{};
+    data.mask = TVIF_PARAM;
+    data.hItem = item;
+    TreeView_GetItem(g_search.tree, &data);
+    return static_cast<int>(data.lParam);
+}
+
+// ---- Copy / export -------------------------------------------------------------------
+
+std::wstring SearchResultLine(const SearchFileResult&, const SearchHit& hit) {
+    return hit.line > 0 ? std::to_wstring(hit.line) + L":" + std::to_wstring(hit.column) + L": " + hit.lineText : hit.lineText;
+}
+
+std::wstring SearchResultsAsText() {
+    long long matches = 0;
+    for (const auto& file : g_search.results) matches += static_cast<long long>(file->hits.size());
+    std::wstring text = L"搜索内容：" + g_search.lastQuery + L"\r\n搜索范围：" + g_search.lastFolders + L"\r\n" +
+        L"命中文件：" + std::to_wstring(g_search.results.size()) + L"\r\n匹配次数：" + std::to_wstring(matches) + L"\r\n";
+    for (const auto& file : g_search.results) {
+        text += L"\r\n" + (file->path.empty() ? file->display : file->path) + L" (" + std::to_wstring(file->hits.size()) + L")\r\n";
+        for (const SearchHit& hit : file->hits) {
+            if (HitPassesFilter(*file, hit)) text += L"  " + SearchResultLine(*file, hit) + L"\r\n";
+        }
+    }
+    return text;
+}
+
+std::wstring CsvField(const std::wstring& value) {
+    std::wstring escaped = L"\"";
+    for (const wchar_t c : value) {
+        if (c == L'"') escaped += L'"';
+        escaped += c;
+    }
+    return escaped + L"\"";
+}
+
+std::wstring JsonString(const std::wstring& value) {
+    std::wstring escaped = L"\"";
+    for (const wchar_t c : value) {
+        switch (c) {
+        case L'"': escaped += L"\\\""; break;
+        case L'\\': escaped += L"\\\\"; break;
+        case L'\n': escaped += L"\\n"; break;
+        case L'\r': escaped += L"\\r"; break;
+        case L'\t': escaped += L"\\t"; break;
+        default:
+            if (c < 0x20) {
+                wchar_t buffer[8]{};
+                swprintf_s(buffer, L"\\u%04x", static_cast<unsigned>(c));
+                escaped += buffer;
+            } else {
+                escaped += c;
+            }
+        }
+    }
+    return escaped + L"\"";
+}
+
+void ExportSearchResults() {
+    if (g_search.results.empty()) {
+        ShowNotice(L"没有可以导出的搜索结果");
+        return;
+    }
+    wchar_t fileName[MAX_PATH] = L"搜索结果.txt";
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = g_app.window;
+    dialog.lpstrFilter = L"文本文件 (*.txt)\0*.txt\0CSV 表格 (*.csv)\0*.csv\0JSON (*.json)\0*.json\0";
+    dialog.lpstrFile = fileName;
+    dialog.nMaxFile = MAX_PATH;
+    dialog.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    dialog.lpstrDefExt = L"txt";
+    if (!GetSaveFileNameW(&dialog)) return;
+    std::wstring extension = fs::path(fileName).extension().wstring();
+    extension = LowerInvariant(extension);
+    std::wstring content;
+    if (extension == L".csv") {
+        content = L"文件,行,列,匹配内容,行内容\r\n";
+        for (const auto& file : g_search.results) {
+            for (const SearchHit& hit : file->hits) {
+                if (!HitPassesFilter(*file, hit)) continue;
+                const std::wstring matched = hit.lineText.substr(std::min(hit.lineMatchStart, hit.lineText.size()), hit.length);
+                content += CsvField(file->path.empty() ? file->display : file->path) + L"," + std::to_wstring(hit.line) + L"," +
+                    std::to_wstring(hit.column) + L"," + CsvField(matched) + L"," + CsvField(hit.lineText) + L"\r\n";
+            }
+        }
+    } else if (extension == L".json") {
+        content = L"{\n  \"query\": " + JsonString(g_search.lastQuery) + L",\n  \"scope\": " + JsonString(g_search.lastFolders) + L",\n  \"results\": [";
+        bool first = true;
+        for (const auto& file : g_search.results) {
+            for (const SearchHit& hit : file->hits) {
+                if (!HitPassesFilter(*file, hit)) continue;
+                const std::wstring matched = hit.lineText.substr(std::min(hit.lineMatchStart, hit.lineText.size()), hit.length);
+                content += std::wstring(first ? L"\n" : L",\n") + L"    {\"file\": " + JsonString(file->path.empty() ? file->display : file->path) +
+                    L", \"line\": " + std::to_wstring(hit.line) + L", \"column\": " + std::to_wstring(hit.column) +
+                    L", \"match\": " + JsonString(matched) + L", \"text\": " + JsonString(hit.lineText) + L"}";
+                first = false;
+            }
+        }
+        content += L"\n  ]\n}\n";
+    } else {
+        content = SearchResultsAsText();
+    }
+    // UTF-8 with BOM so Excel opens the CSV with the right encoding.
+    std::string bytes = "\xEF\xBB\xBF" + WideToUtf8(content);
+    if (WriteAtomicFile(fileName, bytes)) ShowNotice(L"已导出到 " + fs::path(fileName).filename().wstring());
+    else MessageBoxW(g_app.window, L"导出失败，请检查路径和权限。", kWindowTitle, MB_ICONERROR);
+}
+
+void ShowSearchErrorLog() {
+    if (g_search.errors.empty()) {
+        ShowNotice(L"本次搜索没有错误记录");
+        return;
+    }
+    std::wstring text = L"搜索内容：" + g_search.lastQuery + L"\r\n搜索范围：" + g_search.lastFolders + L"\r\n\r\n";
+    for (const std::wstring& line : g_search.errors) {
+        const size_t tab = line.find(L'\t');
+        text += tab == std::wstring::npos ? line : line.substr(0, tab) + L"    " + line.substr(tab + 1);
+        text += L"\r\n";
+    }
+    const int index = CreateDocument({}, L"搜索错误日志", text, true, false, 0, 0, 0);
+    if (index >= 0) SelectTab(index);
+}
+
+void ReplaceSelectedResultHere() {
+    const int itemIndex = SelectedSearchItem();
+    if (itemIndex < 0 || !g_search.lastMatcher) return;
+    const SearchItemRef ref = g_search.items[static_cast<size_t>(itemIndex)];
+    if (ref.file < 0) return;
+    if (ref.hit < 0 || g_search.results[static_cast<size_t>(ref.file)]->hits[static_cast<size_t>(ref.hit)].line == 0) return;
+    OpenSearchResult(itemIndex);
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    CHARRANGE selection{};
+    SendMessageW(document->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    std::wstring selected(static_cast<size_t>(selection.cpMax - selection.cpMin) + 1, L'\0');
+    selected.resize(static_cast<size_t>(SendMessageW(document->editor, EM_GETSELTEXT, 0, reinterpret_cast<LPARAM>(selected.data()))));
+    std::wstring replacement = g_search.lastMatcher->ReplaceOne(selected);
+    std::replace(replacement.begin(), replacement.end(), L'\n', L'\r');
+    SendMessageW(document->editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
+    ShowNotice(L"已在编辑器中替换此处（未保存，可按 Ctrl+Z 撤销）");
+}
+
+void ShowSearchTreeMenu(POINT screen) {
+    int itemIndex = SelectedSearchItem();
+    if (itemIndex >= 0 && g_search.items[static_cast<size_t>(itemIndex)].file == kLoadMoreItem) itemIndex = -1;
+    const bool hasItem = itemIndex >= 0;
+    const bool isHit = hasItem && g_search.items[static_cast<size_t>(itemIndex)].hit >= 0;
+    const bool hasResults = !g_search.results.empty();
+    const UINT itemState = hasItem ? 0 : MF_GRAYED;
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | itemState, 1, L"打开\tEnter");
+    AppendMenuW(menu, MF_STRING | (isHit ? 0 : MF_GRAYED), 2, L"在编辑器中替换此处");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | itemState, 3, L"复制此条\tCtrl+C");
+    AppendMenuW(menu, MF_STRING | itemState, 4, L"复制文件路径");
+    AppendMenuW(menu, MF_STRING | (hasResults ? 0 : MF_GRAYED), 5, L"复制全部结果");
+    AppendMenuW(menu, MF_STRING | (hasResults ? 0 : MF_GRAYED), 6, L"导出结果（TXT / CSV / JSON）...");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (hasResults ? 0 : MF_GRAYED), 7, L"全部展开");
+    AppendMenuW(menu, MF_STRING | (hasResults ? 0 : MF_GRAYED), 8, L"全部折叠");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (hasResults ? 0 : MF_GRAYED), 9, L"清空结果");
+    const int command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, g_app.window, nullptr);
+    DestroyMenu(menu);
+    const SearchItemRef ref = hasItem ? g_search.items[static_cast<size_t>(itemIndex)] : SearchItemRef{-1, -1, 0};
+    switch (command) {
+    case 1: OpenSearchResult(itemIndex); break;
+    case 2: ReplaceSelectedResultHere(); break;
+    case 3: {
+        const SearchFileResult& file = *g_search.results[static_cast<size_t>(ref.file)];
+        const std::wstring name = file.path.empty() ? file.display : file.path;
+        CopyTextToClipboard(ref.hit < 0 ? name : name + L":" + SearchResultLine(file, file.hits[static_cast<size_t>(ref.hit)]));
+        break;
+    }
+    case 4: {
+        const SearchFileResult& file = *g_search.results[static_cast<size_t>(ref.file)];
+        CopyTextToClipboard(file.path.empty() ? file.display : file.path);
+        break;
+    }
+    case 5: CopyTextToClipboard(SearchResultsAsText()); ShowNotice(L"已复制全部搜索结果"); break;
+    case 6: ExportSearchResults(); break;
+    case 7:
+    case 8:
+        SendMessageW(g_search.tree, WM_SETREDRAW, FALSE, 0);
+        for (size_t i = 0; i < g_search.fileNodes.size(); ++i) {
+            if (!g_search.fileNodes[i]) continue;
+            if (command == 7) PopulateFileNode(static_cast<int>(i));
+            TreeView_Expand(g_search.tree, g_search.fileNodes[i], command == 7 ? TVE_EXPAND : TVE_COLLAPSE);
+        }
+        SendMessageW(g_search.tree, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_search.tree, nullptr, TRUE);
+        break;
+    case 9: ClearSearchResults(); break;
+    default: break;
+    }
+}
+
+// ---- Panel window ----------------------------------------------------------------
+
+void ApplySearchPanelTheme() {
+    if (!g_search.panel) return;
+    const ThemePalette& palette = CurrentPalette();
+    const wchar_t* dark = g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer";
+    for (auto& [id, control] : g_search.controls) {
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        wchar_t className[32]{};
+        GetClassNameW(control, className, 32);
+        if (_wcsicmp(className, L"ComboBox") == 0) SetWindowTheme(control, g_app.darkTheme ? L"DarkMode_CFD" : nullptr, nullptr);
+        else if (_wcsicmp(className, L"Button") == 0) {
+            const LONG style = GetWindowLongW(control, GWL_STYLE) & BS_TYPEMASK;
+            if (style == BS_AUTOCHECKBOX) SetWindowTheme(control, g_app.darkTheme ? L"" : nullptr, g_app.darkTheme ? L"" : nullptr);
+            else SetWindowTheme(control, g_app.darkTheme ? dark : nullptr, nullptr);
+        } else if (_wcsicmp(className, L"Edit") == 0) {
+            SetWindowTheme(control, g_app.darkTheme ? L"DarkMode_CFD" : nullptr, nullptr);
+        }
+    }
+    for (HWND label : g_search.labels) SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+    if (g_search.tree) {
+        SetWindowTheme(g_search.tree, dark, nullptr);
+        TreeView_SetBkColor(g_search.tree, palette.editorBackground);
+        TreeView_SetTextColor(g_search.tree, palette.editorText);
+        TreeView_SetLineColor(g_search.tree, palette.gutterText);
+    }
+    InvalidateRect(g_search.panel, nullptr, TRUE);
+    RedrawWindow(g_search.panel, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME);
+}
+
+void LayoutSearchPanel() {
+    if (!g_search.panel) return;
+    RECT client{};
+    GetClientRect(g_search.panel, &client);
+    const int width = client.right;
+    const int height = client.bottom;
+    const int margin = Scale(12);
+    const int rowHeight = Scale(30);
+    const int fieldHeight = Scale(24);
+    const int labelWidth = Scale(64);
+    const int formWidth = std::clamp(width * 42 / 100, Scale(360), Scale(520));
+    const int fieldLeft = margin + labelWidth;
+    const int fieldWidth = formWidth - labelWidth - margin;
+    const auto place = [&](int id, int x, int y, int w, int h) {
+        if (HWND control = SearchControl(id)) MoveWindow(control, x, y, std::max(0, w), h, FALSE);
+    };
+    const auto placeLabel = [&](size_t index, int y) {
+        if (index < g_search.labels.size()) MoveWindow(g_search.labels[index], margin, y + Scale(3), labelWidth - Scale(4), fieldHeight, FALSE);
+    };
+    place(kSearchClose, width - Scale(34), Scale(6), Scale(24), Scale(24));
+    int y = Scale(36);
+    placeLabel(0, y); place(kSearchFind, fieldLeft, y, fieldWidth, Scale(240)); y += rowHeight;
+    placeLabel(1, y); place(kSearchReplace, fieldLeft, y, fieldWidth, Scale(240)); y += rowHeight;
+    const int half = (fieldWidth - Scale(6)) / 2;
+    placeLabel(2, y); place(kSearchScope, fieldLeft, y, half, Scale(200)); place(kSearchTarget, fieldLeft + half + Scale(6), y, fieldWidth - half - Scale(6), Scale(200)); y += rowHeight;
+    placeLabel(3, y); place(kSearchFolder, fieldLeft, y, fieldWidth - Scale(34), Scale(240)); place(kSearchBrowse, fieldLeft + fieldWidth - Scale(28), y, Scale(28), fieldHeight); y += rowHeight;
+    placeLabel(4, y); place(kSearchTypes, fieldLeft, y, fieldWidth, Scale(240)); y += rowHeight;
+    placeLabel(5, y); place(kSearchExcludes, fieldLeft, y, fieldWidth, fieldHeight); y += rowHeight;
+    placeLabel(6, y); place(kSearchMode, fieldLeft, y, half, Scale(200));
+    {
+        const int x = fieldLeft + half + Scale(6);
+        const int rest = fieldWidth - half - Scale(6);
+        place(kSearchMaxSize, x, y, rest / 2 - Scale(2), fieldHeight);
+        place(kSearchMaxResults, x + rest / 2 + Scale(2), y, rest - rest / 2 - Scale(2), fieldHeight);
+    }
+    y += rowHeight;
+    const int checkWidth = (formWidth - margin * 2) / 3;
+    const int checks[] = {kSearchRecursive, kSearchHidden, kSearchMatchCase, kSearchWholeWord, kSearchUseExcludes, kSearchGitignore};
+    for (int i = 0; i < 6; ++i) place(checks[i], margin + (i % 3) * checkWidth, y + (i / 3) * Scale(26), checkWidth - Scale(4), Scale(22));
+    y += Scale(56);
+    const int buttonWidth = (formWidth - margin * 2 - Scale(18)) / 4;
+    const int buttons[] = {kSearchStart, kSearchStop, kSearchReplaceButton, kSearchClear};
+    for (int i = 0; i < 4; ++i) place(buttons[i], margin + i * (buttonWidth + Scale(6)), y, buttonWidth, Scale(28));
+
+    const int resultsLeft = formWidth + Scale(4);
+    const int resultsWidth = width - resultsLeft - margin;
+    if (g_search.labels.size() > 7) MoveWindow(g_search.labels[7], resultsLeft, Scale(36) + Scale(3), Scale(40), fieldHeight, FALSE);
+    place(kSearchFilter, resultsLeft + Scale(40), Scale(36), std::min(Scale(220), resultsWidth / 3), fieldHeight);
+    const int statsLeft = resultsLeft + Scale(40) + std::min(Scale(220), resultsWidth / 3) + Scale(12);
+    place(kSearchStats, statsLeft, Scale(36) + Scale(3), width - statsLeft - margin, fieldHeight);
+    place(kSearchTree, resultsLeft, Scale(66), resultsWidth, height - Scale(66) - Scale(8));
+    InvalidateRect(g_search.panel, nullptr, TRUE);
+}
+
+LRESULT HandleSearchTreeCustomDraw(NMTVCUSTOMDRAW* draw) {
+    switch (draw->nmcd.dwDrawStage) {
+    case CDDS_PREPAINT:
+        return CDRF_NOTIFYITEMDRAW;
+    case CDDS_ITEMPREPAINT: {
+        const ThemePalette& palette = CurrentPalette();
+        const int index = static_cast<int>(draw->nmcd.lItemlParam);
+        const bool valid = index >= 0 && index < static_cast<int>(g_search.items.size());
+        if (valid && g_search.items[static_cast<size_t>(index)].file == kLoadMoreItem) {
+            draw->clrText = palette.accent;
+            draw->clrTextBk = (draw->nmcd.uItemState & CDIS_SELECTED) ? palette.toolbarButtonPressed : palette.editorBackground;
+            return CDRF_DODEFAULT;
+        }
+        const bool isFile = valid && g_search.items[static_cast<size_t>(index)].hit < 0;
+        const bool selected = (draw->nmcd.uItemState & CDIS_SELECTED) != 0;
+        draw->clrText = isFile ? palette.tabActiveText : palette.editorText;
+        draw->clrTextBk = selected ? palette.toolbarButtonPressed : palette.editorBackground;
+        if (isFile) {
+            SelectObject(draw->nmcd.hdc, g_app.uiBoldFont);
+            return CDRF_NEWFONT;
+        }
+        return CDRF_NOTIFYPOSTPAINT;
+    }
+    case CDDS_ITEMPOSTPAINT: {
+        // Paint the matched part of the line on a highlight.
+        const int index = static_cast<int>(draw->nmcd.lItemlParam);
+        if (index < 0 || index >= static_cast<int>(g_search.items.size())) return CDRF_DODEFAULT;
+        const SearchItemRef ref = g_search.items[static_cast<size_t>(index)];
+        if (ref.hit < 0 || ref.file < 0) return CDRF_DODEFAULT;
+        const SearchHit& hit = g_search.results[static_cast<size_t>(ref.file)]->hits[static_cast<size_t>(ref.hit)];
+        const std::wstring prefix = hit.line > 0 ? std::to_wstring(hit.line) + L":" + std::to_wstring(hit.column) + L"    " : L"文件名    ";
+        const std::wstring full = prefix + hit.lineText;
+        const size_t start = prefix.size() + std::min(hit.lineMatchStart, hit.lineText.size());
+        const size_t length = std::min(hit.length, full.size() - start);
+        if (length == 0) return CDRF_DODEFAULT;
+        RECT textRect{};
+        if (!TreeView_GetItemRect(g_search.tree, reinterpret_cast<HTREEITEM>(draw->nmcd.dwItemSpec), &textRect, TRUE)) return CDRF_DODEFAULT;
+        HDC dc = draw->nmcd.hdc;
+        HGDIOBJ previous = SelectObject(dc, g_app.uiFont);
+        SIZE whole{}, before{}, matched{};
+        GetTextExtentPoint32W(dc, full.c_str(), static_cast<int>(full.size()), &whole);
+        GetTextExtentPoint32W(dc, full.c_str(), static_cast<int>(start), &before);
+        GetTextExtentPoint32W(dc, full.c_str() + start, static_cast<int>(length), &matched);
+        const int padding = std::max(0, static_cast<int>((textRect.right - textRect.left) - whole.cx) / 2);
+        RECT mark{textRect.left + padding + before.cx, textRect.top + 1, textRect.left + padding + before.cx + matched.cx, textRect.bottom - 1};
+        mark.right = std::min(mark.right, textRect.right);
+        if (mark.right > mark.left) {
+            const ThemePalette& palette = CurrentPalette();
+            FillSolid(dc, mark, Blend(palette.editorBackground, palette.attention, g_app.darkTheme ? 40 : 45));
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, palette.tabActiveText);
+            RECT textBox = mark;
+            textBox.top = textRect.top;
+            textBox.bottom = textRect.bottom;
+            DrawTextW(dc, full.c_str() + start, static_cast<int>(length), &textBox, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+        }
+        SelectObject(dc, previous);
+        return CDRF_DODEFAULT;
+    }
+    default:
+        return CDRF_DODEFAULT;
+    }
+}
+
+HWND AddSearchControl(int id, const wchar_t* className, const wchar_t* text, DWORD style, DWORD exStyle = 0) {
+    HWND control = CreateWindowExW(exStyle, className, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0,
+        g_search.panel, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+    g_search.controls[id] = control;
+    return control;
+}
+
+void AddSearchLabel(const wchar_t* text) {
+    g_search.labels.push_back(CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 0, 0, 0, 0,
+        g_search.panel, nullptr, g_app.instance, nullptr));
+}
+
+void CreateSearchPanelControls() {
+    const DWORD combo = WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL;
+    const DWORD list = WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST;
+    const DWORD check = WS_TABSTOP | BS_AUTOCHECKBOX;
+    for (const wchar_t* label : {L"查找", L"替换为", L"范围", L"目录", L"文件类型", L"排除", L"匹配方式", L"筛选"}) AddSearchLabel(label);
+    AddSearchControl(kSearchFind, L"COMBOBOX", nullptr, combo);
+    AddSearchControl(kSearchReplace, L"COMBOBOX", nullptr, combo);
+    HWND scope = AddSearchControl(kSearchScope, L"COMBOBOX", nullptr, list);
+    for (const wchar_t* item : {L"指定文件夹", L"所有打开的文件", L"当前文件"}) SendMessageW(scope, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+    HWND target = AddSearchControl(kSearchTarget, L"COMBOBOX", nullptr, list);
+    for (const wchar_t* item : {L"搜索文件内容", L"搜索文件名", L"搜索完整路径"}) SendMessageW(target, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+    AddSearchControl(kSearchFolder, L"COMBOBOX", nullptr, combo);
+    AddSearchControl(kSearchBrowse, L"BUTTON", L"…", WS_TABSTOP);
+    AddSearchControl(kSearchTypes, L"COMBOBOX", nullptr, combo);
+    AddSearchControl(kSearchExcludes, L"EDIT", g_search.excludes.c_str(), WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE);
+    HWND mode = AddSearchControl(kSearchMode, L"COMBOBOX", nullptr, list);
+    for (const wchar_t* item : {L"普通文本", L"正则表达式", L"任一关键词（OR）", L"全部关键词（AND）"}) SendMessageW(mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+    AddSearchControl(kSearchMaxSize, L"EDIT", std::to_wstring(g_search.maxFileMb).c_str(), WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE);
+    AddSearchControl(kSearchMaxResults, L"EDIT", std::to_wstring(g_search.maxResults).c_str(), WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE);
+    SendMessageW(SearchControl(kSearchMaxSize), EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"文件上限 MB"));
+    SendMessageW(SearchControl(kSearchMaxResults), EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"最多结果"));
+    AddSearchControl(kSearchRecursive, L"BUTTON", L"包含子文件夹", check);
+    AddSearchControl(kSearchHidden, L"BUTTON", L"包含隐藏文件", check);
+    AddSearchControl(kSearchMatchCase, L"BUTTON", L"区分大小写", check);
+    AddSearchControl(kSearchWholeWord, L"BUTTON", L"全词匹配", check);
+    AddSearchControl(kSearchUseExcludes, L"BUTTON", L"使用排除规则", check);
+    AddSearchControl(kSearchGitignore, L"BUTTON", L"遵循 .gitignore", check);
+    AddSearchControl(kSearchStart, L"BUTTON", L"搜索", WS_TABSTOP | BS_DEFPUSHBUTTON);
+    AddSearchControl(kSearchStop, L"BUTTON", L"停止", WS_TABSTOP);
+    AddSearchControl(kSearchReplaceButton, L"BUTTON", L"替换…", WS_TABSTOP);
+    AddSearchControl(kSearchClear, L"BUTTON", L"清空", WS_TABSTOP);
+    AddSearchControl(kSearchFilter, L"EDIT", nullptr, WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE);
+    SendMessageW(SearchControl(kSearchFilter), EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"在结果中筛选"));
+    g_search.stats = AddSearchControl(kSearchStats, L"STATIC", nullptr, SS_NOTIFY | SS_NOPREFIX | SS_ENDELLIPSIS);
+    g_search.tree = AddSearchControl(kSearchTree, WC_TREEVIEWW, nullptr,
+        WS_TABSTOP | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_FULLROWSELECT | TVS_NOHSCROLL);
+    TreeView_SetExtendedStyle(g_search.tree, TVS_EX_DOUBLEBUFFER, TVS_EX_DOUBLEBUFFER);
+    AddSearchControl(kSearchClose, L"BUTTON", L"×", WS_TABSTOP | BS_OWNERDRAW);
+
+    SendMessageW(scope, CB_SETCURSEL, g_search.optionScope, 0);
+    SendMessageW(target, CB_SETCURSEL, g_search.optionTarget, 0);
+    SendMessageW(mode, CB_SETCURSEL, g_search.optionMode, 0);
+    const std::pair<int, bool> states[] = {{kSearchRecursive, g_search.optionRecursive}, {kSearchHidden, g_search.optionHidden},
+        {kSearchMatchCase, g_search.optionMatchCase}, {kSearchWholeWord, g_search.optionWholeWord},
+        {kSearchUseExcludes, g_search.optionUseExcludes}, {kSearchGitignore, g_search.optionGitignore}};
+    for (const auto& [id, on] : states) SendMessageW(SearchControl(id), BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    FillCombo(SearchControl(kSearchFind), g_search.findHistory);
+    FillCombo(SearchControl(kSearchReplace), g_search.replaceHistory);
+    FillCombo(SearchControl(kSearchFolder), g_search.folderHistory);
+    FillCombo(SearchControl(kSearchTypes), g_search.typeHistory);
+    SetWindowTextW(SearchControl(kSearchTypes), g_search.typeHistory.empty() ? kDefaultFileTypes : g_search.typeHistory.front().c_str());
+    if (!g_search.folderHistory.empty()) SetWindowTextW(SearchControl(kSearchFolder), g_search.folderHistory.front().c_str());
+    EnableWindow(SearchControl(kSearchStop), FALSE);
+
+    HWND tip = CreateTooltip(g_search.panel);
+    const std::pair<int, const wchar_t*> tips[] = {
+        {kSearchFind, L"普通文本中可用 \\n 表示换行；关键词模式下用空格分隔多个关键词"},
+        {kSearchReplace, L"正则表达式模式下可用 $1、$2 引用分组"},
+        {kSearchFolder, L"多个文件夹用分号分隔"},
+        {kSearchTypes, L"例如 *.js;*.ts;*.json，*.* 表示所有文本文件（自动跳过二进制文件）"},
+        {kSearchExcludes, L"按文件名或文件夹名排除，分号分隔，支持 * 和 ?"},
+        {kSearchMaxSize, L"大于此大小（MB）的文件会被跳过"},
+        {kSearchMaxResults, L"匹配数量达到上限后停止搜索"},
+        {kSearchStats, L"点击查看跳过和出错的文件"},
+    };
+    for (const auto& [id, text] : tips) {
+        TOOLINFOW tool{sizeof(tool)};
+        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        tool.hwnd = g_search.panel;
+        tool.uId = reinterpret_cast<UINT_PTR>(SearchControl(id));
+        tool.lpszText = const_cast<wchar_t*>(text);
+        SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+    }
+}
+
+void BrowseSearchFolder() {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return;
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dialog->SetTitle(L"选择要搜索的文件夹");
+    const std::wstring current = SplitPatterns(GetWindowTextValue(SearchControl(kSearchFolder))).empty() ? std::wstring()
+        : SplitPatterns(GetWindowTextValue(SearchControl(kSearchFolder))).front();
+    IShellItem* folder = nullptr;
+    if (!current.empty() && SUCCEEDED(SHCreateItemFromParsingName(current.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
+        dialog->SetFolder(folder);
+        folder->Release();
+    }
+    if (SUCCEEDED(dialog->Show(g_app.window))) {
+        IShellItem* result = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&result))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                SetWindowTextW(SearchControl(kSearchFolder), path);
+                CoTaskMemFree(path);
+                SendMessageW(SearchControl(kSearchScope), CB_SETCURSEL, 0, 0);
+            }
+            result->Release();
+        }
+    }
+    dialog->Release();
+}
+
+LRESULT CALLBACK SearchPanelProc(HWND panel, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE:
+        g_search.panel = panel;
+        g_app.searchPanel = panel;
+        CreateSearchPanelControls();
+        ApplySearchPanelTheme();
+        return 0;
+    case WM_SIZE:
+        LayoutSearchPanel();
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        BufferedPaint paint(panel);
+        const ThemePalette& palette = CurrentPalette();
+        FillSolid(paint.dc(), paint.client(), palette.toolbarBackground);
+        DrawHairline(paint.dc(), 0, 0, paint.client().right, 0, palette.panelBorder);
+        SelectObject(paint.dc(), g_app.uiBoldFont);
+        DrawLabel(paint.dc(), L"在文件中查找 / 替换", RECT{Scale(12), Scale(6), Scale(400), Scale(30)}, palette.toolbarText);
+        return 0;
+    }
+    case WM_SETCURSOR: {
+        POINT point{};
+        GetCursorPos(&point);
+        ScreenToClient(panel, &point);
+        if (reinterpret_cast<HWND>(wParam) == panel && point.y < Scale(5)) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZENS));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_LBUTTONDOWN:
+        if (GET_Y_LPARAM(lParam) < Scale(5)) {
+            g_search.dragging = true;
+            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(panel, &point);
+            g_search.dragStartY = point.y;
+            g_search.dragStartHeight = g_app.searchPanelHeight;
+            SetCapture(panel);
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (g_search.dragging) {
+            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(panel, &point);
+            g_app.searchPanelHeight = std::max(Scale(160), g_search.dragStartHeight - static_cast<int>(point.y - g_search.dragStartY));
+            LayoutChildren(g_app.window);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (g_search.dragging) {
+            g_search.dragging = false;
+            ReleaseCapture();
+            SaveSearchState();
+        }
+        return 0;
+    case WM_TIMER:
+        if (wParam == kTimerSearchProgress) {
+            DrainSearchResults();
+            UpdateSearchStats();
+        }
+        return 0;
+    case kMessageSearchDone:
+        FinishSearch(static_cast<int>(wParam));
+        return 0;
+    case WM_DRAWITEM: {
+        const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (item && item->CtlID == kSearchClose) {
+            const ThemePalette& palette = CurrentPalette();
+            FillSolid(item->hDC, item->rcItem, palette.toolbarBackground);
+            if (item->itemState & (ODS_SELECTED | ODS_FOCUS)) FillRounded(item->hDC, item->rcItem, Scale(4), palette.toolbarButtonBackground);
+            DrawCross(item->hDC, (item->rcItem.left + item->rcItem.right) / 2, (item->rcItem.top + item->rcItem.bottom) / 2, Scale(5), palette.toolbarIcon);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        const ThemePalette& palette = CurrentPalette();
+        SetTextColor(dc, reinterpret_cast<HWND>(lParam) == g_search.stats ? palette.statusText : palette.toolbarText);
+        SetBkColor(dc, palette.toolbarBackground);
+        return reinterpret_cast<LRESULT>(g_app.toolbarBrush);
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        const ThemePalette& palette = CurrentPalette();
+        SetTextColor(dc, palette.controlText);
+        SetBkColor(dc, palette.controlBackground);
+        return reinterpret_cast<LRESULT>(g_app.controlBrush);
+    }
+    case WM_COMMAND: {
+        const int id = LOWORD(wParam);
+        const int code = HIWORD(wParam);
+        if (id == IDOK) {  // Enter
+            if (GetFocus() == g_search.tree) OpenSearchResult(SelectedSearchItem());
+            else StartSearch(false);
+            return 0;
+        }
+        if (id == IDCANCEL) {  // Esc: stop a running search, otherwise close the panel
+            if (g_search.running) CancelSearch(false);
+            else HideSearchPanel();
+            return 0;
+        }
+        switch (id) {
+        case kSearchStart: StartSearch(false); return 0;
+        case kSearchStop: CancelSearch(false); return 0;
+        case kSearchReplaceButton: StartSearch(true); return 0;
+        case kSearchClear: ClearSearchResults(); return 0;
+        case kSearchBrowse: BrowseSearchFolder(); return 0;
+        case kSearchClose: HideSearchPanel(); return 0;
+        case kSearchStats:
+            if (code == STN_CLICKED && !g_search.errors.empty()) ShowSearchErrorLog();
+            return 0;
+        case kSearchFilter:
+            if (code == EN_CHANGE) {
+                g_search.filter = LowerInvariant(TrimCopy(GetWindowTextValue(SearchControl(kSearchFilter))));
+                RebuildResultTree();
+            }
+            return 0;
+        default: break;
+        }
+        return 0;
+    }
+    case WM_NOTIFY: {
+        auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (header->hwndFrom != g_search.tree) break;
+        if (header->code == NM_CUSTOMDRAW) return HandleSearchTreeCustomDraw(reinterpret_cast<NMTVCUSTOMDRAW*>(lParam));
+        if (header->code == TVN_ITEMEXPANDINGW) {
+            const auto* info = reinterpret_cast<NMTREEVIEWW*>(lParam);
+            const int index = static_cast<int>(info->itemNew.lParam);
+            if (info->action == TVE_EXPAND && index >= 0 && index < static_cast<int>(g_search.items.size()) &&
+                g_search.items[static_cast<size_t>(index)].file >= 0) {
+                PopulateFileNode(g_search.items[static_cast<size_t>(index)].file);
+            }
+            return FALSE;
+        }
+        if (header->code == NM_DBLCLK) {
+            const int index = SelectedSearchItem();
+            if (index >= 0 && (g_search.items[static_cast<size_t>(index)].hit >= 0 ||
+                               g_search.items[static_cast<size_t>(index)].file == kLoadMoreItem)) {
+                OpenSearchResult(index);
+                return TRUE;  // don't toggle the node
+            }
+            return FALSE;
+        }
+        if (header->code == NM_RCLICK) {
+            POINT point{};
+            GetCursorPos(&point);
+            TVHITTESTINFO hit{};
+            hit.pt = point;
+            ScreenToClient(g_search.tree, &hit.pt);
+            if (HTREEITEM item = TreeView_HitTest(g_search.tree, &hit)) TreeView_SelectItem(g_search.tree, item);
+            ShowSearchTreeMenu(point);
+            return TRUE;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(panel, message, wParam, lParam);
+}
+
+void EnsureSearchPanel() {
+    if (g_search.panel) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{};
+        klass.hInstance = g_app.instance;
+        klass.lpfnWndProc = SearchPanelProc;
+        klass.lpszClassName = L"MCSearchPanel";
+        klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        registered = RegisterClassW(&klass) != 0;
+    }
+    CreateWindowExW(WS_EX_CONTROLPARENT, L"MCSearchPanel", nullptr, WS_CHILD | WS_CLIPCHILDREN,
+        0, 0, 0, 0, g_app.window, nullptr, g_app.instance, nullptr);
+    RebuildSearchHistoryMenu();
+}
+
+void HideSearchPanel() {
+    if (!g_search.panel) return;
+    g_app.searchPanelVisible = false;
+    ShowWindow(g_search.panel, SW_HIDE);
+    LayoutChildren(g_app.window);
+    if (TabDocument* document = ActiveDocument()) SetFocus(document->editor);
+    SaveSearchState();
+}
+
+// Opens the panel; `focusReplace` puts the caret in the replace box.
+void ShowSearchPanel(int scope, int target, int mode, bool focusReplace) {
+    EnsureSearchPanel();
+    if (!g_search.panel) return;
+    if (scope >= 0) SendMessageW(SearchControl(kSearchScope), CB_SETCURSEL, scope, 0);
+    if (target >= 0) SendMessageW(SearchControl(kSearchTarget), CB_SETCURSEL, target, 0);
+    if (mode >= 0) SendMessageW(SearchControl(kSearchMode), CB_SETCURSEL, mode, 0);
+    // A short single-line selection becomes the search text.
+    if (TabDocument* document = ActiveDocument()) {
+        CHARRANGE selection{};
+        SendMessageW(document->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+        const LONG length = selection.cpMax - selection.cpMin;
+        if (length > 0 && length < 200) {
+            std::wstring selected(static_cast<size_t>(length) + 1, L'\0');
+            selected.resize(static_cast<size_t>(SendMessageW(document->editor, EM_GETSELTEXT, 0, reinterpret_cast<LPARAM>(selected.data()))));
+            if (!selected.empty() && selected.find_first_of(L"\r\n") == std::wstring::npos) SetWindowTextW(SearchControl(kSearchFind), selected.c_str());
+        }
+        if (GetWindowTextLengthW(SearchControl(kSearchFolder)) == 0 && !document->untitled && !document->path.empty()) {
+            SetWindowTextW(SearchControl(kSearchFolder), fs::path(document->path).parent_path().c_str());
+        }
+    }
+    g_app.searchPanelVisible = true;
+    ShowWindow(g_search.panel, SW_SHOW);
+    LayoutChildren(g_app.window);
+    HWND focus = SearchControl(focusReplace ? kSearchReplace : kSearchFind);
+    SetFocus(focus);
+    SendMessageW(focus, CB_SETEDITSEL, 0, MAKELPARAM(0, -1));
+}
+
+void ToggleSearchPanel() {
+    if (g_app.searchPanelVisible) HideSearchPanel();
+    else ShowSearchPanel(-1, -1, -1, false);
+}
+
+void RunSearchFromHistory(int index) {
+    if (index < 0 || index >= static_cast<int>(g_search.findHistory.size())) return;
+    const std::wstring query = g_search.findHistory[static_cast<size_t>(index)];
+    ShowSearchPanel(-1, -1, -1, false);
+    SetWindowTextW(SearchControl(kSearchFind), query.c_str());
+    StartSearch(false);
+}
+
+// ===========================================================================
+// Find / replace in files: preview, apply with backup, undo
+// ===========================================================================
+
+struct ReplacePreviewState {
+    bool done = false;
+    bool accepted = false;
+    HWND list = nullptr;
+    HWND view = nullptr;
+    HWND summary = nullptr;
+    HWND backup = nullptr;
+    std::vector<bool> checked;
+    bool backupChecked = true;
+};
+
+void UpdateReplacePreviewSummary(ReplacePreviewState& state) {
+    int files = 0, replacements = 0, selectedFiles = 0, selectedReplacements = 0;
+    for (size_t i = 0; i < g_search.results.size(); ++i) {
+        const int count = g_search.results[i]->replacements;
+        ++files;
+        replacements += count;
+        if (ListView_GetCheckState(state.list, static_cast<int>(i))) {
+            ++selectedFiles;
+            selectedReplacements += count;
+        }
+    }
+    const std::wstring text = L"共找到 " + std::to_wstring(files) + L" 个文件、" + std::to_wstring(replacements) +
+        L" 处可替换。将修改已勾选的 " + std::to_wstring(selectedFiles) + L" 个文件、" + std::to_wstring(selectedReplacements) + L" 处。";
+    SetWindowTextW(state.summary, text.c_str());
+    EnableWindow(GetDlgItem(GetParent(state.list), IDOK), selectedFiles > 0);
+}
+
+LRESULT CALLBACK ReplacePreviewProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<ReplacePreviewState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE:
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));
+        return 0;
+    case WM_SIZE: {
+        if (!state || !state->list) break;
+        const int width = LOWORD(lParam);
+        const int height = HIWORD(lParam);
+        const int bottom = height - Scale(48);
+        const int listWidth = std::clamp(width * 38 / 100, Scale(240), Scale(420));
+        MoveWindow(state->summary, Scale(16), Scale(12), width - Scale(32), Scale(22), TRUE);
+        MoveWindow(state->list, Scale(16), Scale(40), listWidth, std::max(0, bottom - Scale(48)), TRUE);
+        MoveWindow(state->view, Scale(24) + listWidth, Scale(40), width - listWidth - Scale(40), std::max(0, bottom - Scale(48)), TRUE);
+        ListView_SetColumnWidth(state->list, 0, listWidth - Scale(80));
+        MoveWindow(GetDlgItem(window, 201), Scale(16), bottom + Scale(10), Scale(70), Scale(28), TRUE);
+        MoveWindow(GetDlgItem(window, 202), Scale(92), bottom + Scale(10), Scale(70), Scale(28), TRUE);
+        MoveWindow(state->backup, Scale(176), bottom + Scale(12), Scale(280), Scale(24), TRUE);
+        MoveWindow(GetDlgItem(window, IDOK), width - Scale(16 + 82 + 8 + 120), bottom + Scale(10), Scale(120), Scale(28), TRUE);
+        MoveWindow(GetDlgItem(window, IDCANCEL), width - Scale(16 + 82), bottom + Scale(10), Scale(82), Scale(28), TRUE);
+        return 0;
+    }
+    case WM_NOTIFY: {
+        auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (state && header->hwndFrom == state->list && header->code == LVN_ITEMCHANGED) {
+            const auto* change = reinterpret_cast<NMLISTVIEW*>(lParam);
+            if ((change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_STATEIMAGEMASK)) {
+                UpdateReplacePreviewSummary(*state);
+            }
+            if ((change->uChanged & LVIF_STATE) && (change->uNewState & LVIS_SELECTED) && !(change->uOldState & LVIS_SELECTED)) {
+                const SearchFileResult& file = *g_search.results[static_cast<size_t>(change->iItem)];
+                int removed = 0, added = 0;
+                FillDiffView(state->view, file.before, file.after, removed, added);
+            }
+        }
+        break;
+    }
+    case WM_COMMAND:
+        if (!state) break;
+        if (LOWORD(wParam) == 201 || LOWORD(wParam) == 202) {
+            for (int i = 0; i < ListView_GetItemCount(state->list); ++i) ListView_SetCheckState(state->list, i, LOWORD(wParam) == 201);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+            state->accepted = LOWORD(wParam) == IDOK;
+            state->checked.clear();
+            for (int i = 0; i < ListView_GetItemCount(state->list); ++i) state->checked.push_back(ListView_GetCheckState(state->list, i) != 0);
+            state->backupChecked = SendMessageW(state->backup, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            state->done = true;
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        if (state) state->done = true;
+        return 0;
+    case WM_GETMINMAXINFO:
+        reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = POINT{Scale(640), Scale(360)};
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.windowBrush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, CurrentPalette().controlText);
+        SetBkColor(dc, CurrentPalette().windowBackground);
+        return reinterpret_cast<LRESULT>(g_app.windowBrush);
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+std::wstring NowStamp() {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    wchar_t buffer[32]{};
+    swprintf_s(buffer, L"%04u%02u%02u-%02u%02u%02u", time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
+    return buffer;
+}
+
+fs::path ReplaceBackupRoot() { return g_app.dataDirectory / L"replace-backups"; }
+
+// Keeps the ten most recent backup folders.
+void PruneReplaceBackups() {
+    std::error_code error;
+    std::vector<fs::path> folders;
+    for (fs::directory_iterator it(ReplaceBackupRoot(), error), end; !error && it != end; it.increment(error)) {
+        if (it->is_directory(error)) folders.push_back(it->path());
+    }
+    std::sort(folders.begin(), folders.end());
+    while (folders.size() > 10) {
+        fs::remove_all(folders.front(), error);
+        folders.erase(folders.begin());
+    }
+}
+
+void ExecuteReplaceInFiles(const std::vector<bool>& checked, bool backup) {
+    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const fs::path backupDirectory = ReplaceBackupRoot() / NowStamp();
+    if (backup && !EnsureDirectory(backupDirectory)) {
+        MessageBoxW(g_app.window, L"无法创建备份文件夹，已取消替换。", kWindowTitle, MB_ICONERROR);
+        return;
+    }
+    std::ostringstream manifest;
+    std::vector<std::wstring> failures;
+    int filesDone = 0, replacementsDone = 0, backupIndex = 0;
+    std::unordered_map<std::wstring, bool> handled;  // never touch one file twice
+
+    for (size_t i = 0; i < g_search.results.size() && i < checked.size(); ++i) {
+        if (!checked[i]) continue;
+        SearchFileResult& file = *g_search.results[i];
+        const std::wstring name = file.path.empty() ? file.display : file.path;
+        if (!handled.emplace(LowerInvariant(name), true).second) continue;
+
+        if (file.editor) {  // open-tab scopes: change the editor text, undoable there
+            const int index = IndexOfEditor(file.editor);
+            if (index < 0) {
+                failures.push_back(name + L"：标签已关闭");
+                continue;
+            }
+            const std::wstring current = [&] { std::wstring t = GetEditorRawText(file.editor); std::replace(t.begin(), t.end(), L'\r', L'\n'); return t; }();
+            if (current != file.before) {
+                failures.push_back(name + L"：内容在搜索后被修改，已跳过");
+                continue;
+            }
+            std::wstring text = file.after;
+            std::replace(text.begin(), text.end(), L'\n', L'\r');
+            SendMessageW(file.editor, EM_SETSEL, 0, -1);
+            SendMessageW(file.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(text.c_str()));
+            ++filesDone;
+            replacementsDone += file.replacements;
+            continue;
+        }
+
+        int openIndex = -1;
+        for (size_t d = 0; d < g_app.documents.size(); ++d) {
+            if (!g_app.documents[d].untitled && SamePath(g_app.documents[d].path, file.path)) openIndex = static_cast<int>(d);
+        }
+        if (openIndex >= 0 && g_app.documents[static_cast<size_t>(openIndex)].modified) {
+            failures.push_back(name + L"：已在编辑器中打开且有未保存的修改，已跳过");
+            continue;
+        }
+        std::error_code error;
+        const uint64_t size = fs::file_size(file.path, error);
+        if (error || size != file.size || FileTimestamp(file.path) != file.timestamp) {
+            failures.push_back(name + L"：文件在搜索后被修改或已删除，已跳过");
+            continue;
+        }
+        // Keep the file's own line breaks and encoding.
+        std::wstring text;
+        text.reserve(file.after.size() + file.after.size() / 16);
+        for (const wchar_t c : file.after) {
+            if (c == L'\n') text += file.eol;
+            else text += c;
+        }
+        if (file.encoding == kEncodingAnsi && !IsAnsiRepresentable(text)) {
+            failures.push_back(name + L"：替换后的内容包含 ANSI 编码无法表示的字符，已跳过");
+            continue;
+        }
+        std::string bytes;
+        if (!EncodeTextBytes(text, file.encoding, bytes)) {
+            failures.push_back(name + L"：编码转换失败，已跳过");
+            continue;
+        }
+        std::wstring backupName;
+        if (backup) {
+            backupName = std::to_wstring(++backupIndex) + L".bak";
+            if (!CopyFileW(file.path.c_str(), (backupDirectory / backupName).c_str(), FALSE)) {
+                failures.push_back(name + L"：备份失败（错误 " + std::to_wstring(GetLastError()) + L"），未修改");
+                continue;
+            }
+        }
+        if (!WriteAtomicFile(file.path, bytes)) {
+            failures.push_back(name + L"：写入失败（文件可能只读或正被占用，错误 " + std::to_wstring(GetLastError()) + L"）");
+            continue;
+        }
+        ++filesDone;
+        replacementsDone += file.replacements;
+        if (backup) {
+            manifest << HexEncode(WideToUtf8(file.path)) << '\t' << HexEncode(WideToUtf8(backupName)) << '\t'
+                     << bytes.size() << '\t' << FileTimestamp(file.path) << '\n';
+        }
+        if (openIndex >= 0) ReloadDocumentFromDisk(openIndex);
+    }
+
+    if (backup && backupIndex > 0) {
+        WriteAtomicFile(backupDirectory / L"manifest.txt", manifest.str());
+        g_search.lastBackupDirectory = backupDirectory.wstring();
+        PruneReplaceBackups();
+    } else if (backup) {
+        std::error_code error;
+        fs::remove_all(backupDirectory, error);
+    }
+    for (const std::wstring& failure : failures) g_search.errors.push_back(failure);
+    g_search.resultsStale = true;
+    SaveSearchState();
+    UpdateSearchStats();
+
+    std::wstring message = L"已替换 " + std::to_wstring(filesDone) + L" 个文件，共 " + std::to_wstring(replacementsDone) + L" 处。";
+    if (backup && backupIndex > 0) message += L"\n原文件已备份，可通过“搜索 → 搜索结果管理 → 撤销上次在文件中替换”恢复。";
+    if (!failures.empty()) {
+        message += L"\n\n以下 " + std::to_wstring(failures.size()) + L" 个文件未修改：\n";
+        for (size_t i = 0; i < failures.size() && i < 12; ++i) message += L"• " + failures[i] + L"\n";
+        if (failures.size() > 12) message += L"……（完整列表见“查看错误日志”）";
+    }
+    MessageBoxW(g_app.window, message.c_str(), kWindowTitle, failures.empty() ? MB_ICONINFORMATION : MB_ICONWARNING);
+}
+
+void ShowReplaceInFilesPreview() {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{};
+        klass.hInstance = g_app.instance;
+        klass.lpfnWndProc = ReplacePreviewProc;
+        klass.lpszClassName = L"MCnotepadReplacePreview";
+        klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        registered = RegisterClassW(&klass) != 0;
+    }
+    ReplacePreviewState state;
+    RECT owner{};
+    GetWindowRect(g_app.window, &owner);
+    const int width = std::min(Scale(980), static_cast<int>(owner.right - owner.left) - Scale(20));
+    const int height = std::min(Scale(620), static_cast<int>(owner.bottom - owner.top) - Scale(20));
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"MCnotepadReplacePreview", L"预览在文件中替换",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+        owner.left + (owner.right - owner.left - width) / 2, owner.top + (owner.bottom - owner.top - height) / 2,
+        width, height, g_app.window, nullptr, g_app.instance, &state);
+    if (!dialog) return;
+    ApplyWindowFrameTheme(dialog);
+    const ThemePalette& palette = CurrentPalette();
+    state.summary = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
+    state.list = CreateWindowExW(0, WC_LISTVIEWW, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+        0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
+    ListView_SetExtendedListViewStyle(state.list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    state.view = CreateWindowExW(0, L"RICHEDIT50W", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+        0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
+    HWND all = CreateWindowExW(0, L"BUTTON", L"全选", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(201), g_app.instance, nullptr);
+    HWND none = CreateWindowExW(0, L"BUTTON", L"全不选", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(202), g_app.instance, nullptr);
+    state.backup = CreateWindowExW(0, L"BUTTON", L"替换前备份原文件（可撤销）", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
+    HWND apply = CreateWindowExW(0, L"BUTTON", L"替换勾选的文件", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(IDOK), g_app.instance, nullptr);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(IDCANCEL), g_app.instance, nullptr);
+    for (HWND control : {state.summary, state.list, all, none, state.backup, apply, cancel}) {
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+    }
+    SendMessageW(state.backup, BM_SETCHECK, BST_CHECKED, 0);
+    ThemeCheckbox(state.backup);
+    ThemePushButtons({all, none, apply, cancel});
+    SetWindowTheme(state.list, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    ListView_SetBkColor(state.list, palette.editorBackground);
+    ListView_SetTextBkColor(state.list, palette.editorBackground);
+    ListView_SetTextColor(state.list, palette.editorText);
+    if (HWND headerControl = ListView_GetHeader(state.list)) SetWindowTheme(headerControl, g_app.darkTheme ? L"DarkMode_ItemsView" : nullptr, nullptr);
+    SendMessageW(state.view, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+    SetWindowTheme(state.view, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    SendMessageW(state.view, EM_SETBKGNDCOLOR, 0, palette.editorBackground);
+    SendMessageW(state.view, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+
+    LVCOLUMNW column{};
+    column.mask = LVCF_TEXT | LVCF_WIDTH;
+    column.pszText = const_cast<wchar_t*>(L"文件");
+    column.cx = Scale(260);
+    ListView_InsertColumn(state.list, 0, &column);
+    column.pszText = const_cast<wchar_t*>(L"处数");
+    column.cx = Scale(56);
+    ListView_InsertColumn(state.list, 1, &column);
+    for (size_t i = 0; i < g_search.results.size(); ++i) {
+        const SearchFileResult& file = *g_search.results[i];
+        std::wstring label = file.display;
+        if (file.mixedEol) label += L"（换行混用，将统一为 " + std::wstring(file.eol == L"\r\n" ? L"CRLF" : file.eol == L"\n" ? L"LF" : L"CR") + L"）";
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = static_cast<int>(i);
+        item.pszText = label.data();
+        ListView_InsertItem(state.list, &item);
+        std::wstring count = std::to_wstring(file.replacements);
+        ListView_SetItemText(state.list, static_cast<int>(i), 1, count.data());
+        ListView_SetCheckState(state.list, static_cast<int>(i), TRUE);
+    }
+    RECT client{};
+    GetClientRect(dialog, &client);
+    SendMessageW(dialog, WM_SIZE, 0, MAKELPARAM(client.right, client.bottom));
+    UpdateReplacePreviewSummary(state);
+    ListView_SetItemState(state.list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+
+    EnableWindow(g_app.window, FALSE);
+    ShowWindow(dialog, SW_SHOW);
+    SetFocus(state.list);
+    MSG message{};
+    while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dialog, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    if (message.message == WM_QUIT) PostQuitMessage(static_cast<int>(message.wParam));
+    EnableWindow(g_app.window, TRUE);
+    DestroyWindow(dialog);
+    SetForegroundWindow(g_app.window);
+    if (!state.accepted) return;
+    if (!state.backupChecked && MessageBoxW(g_app.window, L"不备份原文件将无法撤销这次替换。确定继续吗？", kWindowTitle,
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    ExecuteReplaceInFiles(state.checked, state.backupChecked);
+}
+
+void UndoLastReplaceInFiles() {
+    const fs::path directory = g_search.lastBackupDirectory;
+    std::vector<char> bytes;
+    if (directory.empty() || !ReadBinaryFile(directory / L"manifest.txt", bytes)) {
+        MessageBoxW(g_app.window, L"没有可以撤销的“在文件中替换”。", kWindowTitle, MB_ICONINFORMATION);
+        return;
+    }
+    struct Entry { std::wstring path; std::wstring backup; uint64_t size; uint64_t timestamp; };
+    std::vector<Entry> entries;
+    std::istringstream stream(std::string(bytes.begin(), bytes.end()));
+    for (std::string line; std::getline(stream, line);) {
+        const std::vector<std::string> parts = SplitTabs(line);
+        if (parts.size() < 4) continue;
+        int64_t size = 0, timestamp = 0;
+        ParseInt64(parts[2], size);
+        ParseInt64(parts[3], timestamp);
+        entries.push_back({Utf8ToWide(HexDecode(parts[0])), Utf8ToWide(HexDecode(parts[1])), static_cast<uint64_t>(size), static_cast<uint64_t>(timestamp)});
+    }
+    int changedSince = 0;
+    for (const Entry& entry : entries) {
+        std::error_code error;
+        if (fs::file_size(entry.path, error) != entry.size || error || FileTimestamp(entry.path) != entry.timestamp) ++changedSince;
+    }
+    std::wstring prompt = L"将把上次替换的 " + std::to_wstring(entries.size()) + L" 个文件恢复为替换前的内容。";
+    if (changedSince > 0) prompt += L"\n\n注意：其中 " + std::to_wstring(changedSince) + L" 个文件在替换后又被修改过，恢复会覆盖这些修改。";
+    prompt += L"\n\n确定恢复吗？";
+    if (MessageBoxW(g_app.window, prompt.c_str(), kWindowTitle, MB_YESNO | MB_ICONQUESTION | (changedSince ? MB_DEFBUTTON2 : 0)) != IDYES) return;
+
+    int restored = 0;
+    std::vector<std::wstring> failures;
+    for (const Entry& entry : entries) {
+        if (!CopyFileW((directory / entry.backup).c_str(), entry.path.c_str(), FALSE)) {
+            failures.push_back(entry.path + L"（错误 " + std::to_wstring(GetLastError()) + L"）");
+            continue;
+        }
+        ++restored;
+        for (size_t d = 0; d < g_app.documents.size(); ++d) {
+            const TabDocument& document = g_app.documents[d];
+            if (!document.untitled && !document.modified && SamePath(document.path, entry.path)) ReloadDocumentFromDisk(static_cast<int>(d));
+        }
+    }
+    std::error_code error;
+    fs::rename(directory / L"manifest.txt", directory / L"manifest.undone.txt", error);
+    g_search.lastBackupDirectory.clear();
+    g_search.resultsStale = true;
+    SaveSearchState();
+    UpdateSearchStats();
+    std::wstring message = L"已恢复 " + std::to_wstring(restored) + L" 个文件。";
+    if (!failures.empty()) {
+        message += L"\n\n恢复失败：\n";
+        for (size_t i = 0; i < failures.size() && i < 12; ++i) message += L"• " + failures[i] + L"\n";
+    }
+    MessageBoxW(g_app.window, message.c_str(), kWindowTitle, failures.empty() ? MB_ICONINFORMATION : MB_ICONWARNING);
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (g_app.findReplaceMessage != 0 && message == g_app.findReplaceMessage) {
         HandleFindReplaceMessage(lParam);
@@ -5947,6 +8311,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         g_app.darkTheme = g_app.theme == ThemeKind::Dark || g_app.theme == ThemeKind::Blue;
         ApplyWindowFrameTheme(window);
         ApplyMenuColorMode();
+        LoadSearchState();
+        if (g_app.searchPanelVisible) EnsureSearchPanel();
         RefreshChrome();
         LayoutChildren(window);
         SetMenuState();
@@ -6020,6 +8386,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         }
 
+        if (command >= kIdSearchHistoryFirst && command < kIdSearchHistoryFirst + 20) {
+            RunSearchFromHistory(command - kIdSearchHistoryFirst);
+            return 0;
+        }
         if (IsTextToolCommand(command)) {
             RunTextTool(command);
             SetMenuState();
@@ -6041,6 +8411,18 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToolbarGoto: OpenGotoDialog(); break;
         case kIdToolbarFormat: FormatActiveDocument(); break;
         case kIdFileRename: RenameDocument(g_app.activeIndex); break;
+        case kIdSearchInFolder: ShowSearchPanel(0, 0, -1, false); break;
+        case kIdReplaceInFolder: ShowSearchPanel(0, 0, -1, true); break;
+        case kIdSearchCurrentFile: ShowSearchPanel(2, 0, -1, false); break;
+        case kIdSearchOpenFiles: ShowSearchPanel(1, 0, -1, false); break;
+        case kIdSearchFileNames: ShowSearchPanel(0, 1, -1, false); break;
+        case kIdSearchRegex: ShowSearchPanel(-1, 0, 1, false); break;
+        case kIdToggleSearchPanel: ToggleSearchPanel(); break;
+        case kIdExportSearchResults: ExportSearchResults(); break;
+        case kIdCopySearchResults: CopyTextToClipboard(SearchResultsAsText()); ShowNotice(L"已复制全部搜索结果"); break;
+        case kIdClearSearchResults: ClearSearchResults(); break;
+        case kIdSearchErrorLog: ShowSearchErrorLog(); break;
+        case kIdUndoReplaceInFiles: UndoLastReplaceInFiles(); break;
         case kIdToolbarRun: RunActiveDocument(); break;
         case kIdToolbarEncoding:
             ShowEncodingMenu(ToolbarItemScreenRect(kIdToolbarEncoding));
@@ -6164,6 +8546,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             }
             g_app.closing = true;
             KillTimer(window, kTimerAutosave);
+            CancelSearch(true);
+            SaveSearchState();
             const bool persisted = PersistAll(true);
             if (!persisted) {
                 MessageBoxW(window, L"会话恢复数据保存失败，程序将继续退出。", kWindowTitle, MB_ICONWARNING);
@@ -6323,7 +8707,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
 
     INITCOMMONCONTROLSEX commonControls{};
     commonControls.dwSize = sizeof(commonControls);
-    commonControls.dwICC = ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
+    commonControls.dwICC = ICC_TAB_CLASSES | ICC_STANDARD_CLASSES | ICC_TREEVIEW_CLASSES | ICC_LISTVIEW_CLASSES;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);  // folder picker
     InitCommonControlsEx(&commonControls);
 
     WNDCLASSW gutterClass{};
@@ -6391,6 +8776,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         // Modeless dialogs first: gives them Tab/Enter/Esc handling and keeps the
         // main window's Ctrl+C/V/Z accelerators from hijacking their text boxes.
+        // Search panel: app shortcuts first (edit commands are routed to its
+        // text boxes), then Tab/Enter/Esc dialog navigation.
+        if (g_app.searchPanel && IsChild(g_app.searchPanel, message.hwnd)) {
+            if (TranslateAcceleratorW(window, accelerators, &message)) continue;
+            if (IsDialogMessageW(g_app.searchPanel, &message)) continue;
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+            continue;
+        }
         bool handled = false;
         for (HWND dialog : {g_app.findDialog, g_app.gotoWindow, g_app.settingsWindow}) {
             if (dialog && IsWindow(dialog) && IsDialogMessageW(dialog, &message)) {
