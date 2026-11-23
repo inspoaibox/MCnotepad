@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -44,6 +45,7 @@ constexpr UINT kTimerAutosave = 4101;
 constexpr wchar_t kSingleInstanceMutex[] = L"Local\\MCnotepad.SingleInstance";
 constexpr ULONG_PTR kCopyDataOpenFiles = 0x4D434E50;  // 'MCNP'
 constexpr UINT kMessageOpenPendingFiles = WM_APP + 1;
+constexpr UINT kMessageCheckExternalChanges = WM_APP + 2;
 constexpr int kToolbarHeight = 28;
 constexpr int kTabHeight = 28;
 constexpr int kTabCloseHitWidth = 22;
@@ -96,7 +98,9 @@ constexpr int kIdSettingsStartup = 1706;
 constexpr int kIdSettingsCloseBehavior = 1707;
 constexpr int kIdSettingsApply = 1708;
 constexpr int kIdSettingsCancel = 1709;
-constexpr int kIdSidebarClose = 1801;
+constexpr int kIdEncodingFirst = 1601;    // 1601..1605
+constexpr int kIdLineEndingFirst = 1611;  // 1611..1613
+constexpr int kIdLanguageFirst = 1621;    // 1621..1630
 
 enum class ThemeKind { Dark = 0, Light = 1, Green = 2, Blue = 3 };
 enum class CloseBehavior { Prompt = 0, Direct = 1, Save = 2 };
@@ -113,7 +117,26 @@ struct TabDocument {
     int64_t anchor = 0;
     int firstVisibleLine = 0;
     int horizontalScroll = 0;
+    int encoding = 0;        // index into kEncodingNames
+    int lineEnding = 0;      // index into kLineEndingNames
+    int language = 0;        // index into kLanguageNames, 0 = detect from extension
+    uint64_t fileTimestamp = 0;  // last write time we know about, 0 = unknown
 };
+
+constexpr const wchar_t* kEncodingNames[] = {L"UTF-8", L"UTF-8 BOM", L"UTF-16 LE", L"UTF-16 BE", L"ANSI"};
+constexpr const wchar_t* kLineEndingNames[] = {L"CRLF", L"LF", L"CR"};
+constexpr const wchar_t* kLineEndingMenuNames[] = {L"Windows (CRLF)", L"Unix (LF)", L"旧式 Mac (CR)"};
+constexpr const wchar_t* kLanguageNames[] = {L"自动检测", L"HTML", L"CSS", L"JavaScript", L"C/C++",
+    L"Python", L"JSON", L"Markdown", L"SQL", L"PowerShell"};
+constexpr int kEncodingCount = 5;
+constexpr int kLineEndingCount = 3;
+constexpr int kLanguageCount = 10;
+constexpr int kEncodingAnsi = 4;
+constexpr int kLanguageAuto = 0;
+constexpr int kLanguageHtml = 1;
+constexpr int kLanguageJson = 6;
+constexpr int kLanguageMarkdown = 7;
+constexpr int kLanguagePlain = -1;
 
 struct AppState {
     HINSTANCE instance = nullptr;
@@ -123,20 +146,11 @@ struct AppState {
     HWND statusBar = nullptr;
     HWND toolbar = nullptr;
     HWND gutter = nullptr;
-    HWND sidebar = nullptr;
-    HWND languageLabel = nullptr;
-    HWND languageCombo = nullptr;
-    HWND encodingLabel = nullptr;
-    HWND encodingCombo = nullptr;
-    HWND lineEndingLabel = nullptr;
-    HWND lineEndingCombo = nullptr;
-    HWND sidebarTitle = nullptr;
-    HWND sidebarClose = nullptr;
+    HWND gotoWindow = nullptr;
+    HWND gotoEdit = nullptr;
     std::vector<HWND> toolbarButtons;
     HFONT editorFont = nullptr;
-    HFONT toolbarIconFont = nullptr;
     HFONT uiFont = nullptr;
-    std::wstring toolbarIconFontPath;
     ULONG_PTR gdiplusToken = 0;
     std::vector<std::unique_ptr<Bitmap>> toolbarIconImages;
     HFONT uiBoldFont = nullptr;
@@ -148,7 +162,6 @@ struct AppState {
     HBRUSH statusBrush = nullptr;
     HMENU themeMenu = nullptr;
     WNDPROC oldTabProc = nullptr;
-    WNDPROC oldSidebarProc = nullptr;
     WNDPROC oldStatusProc = nullptr;
     bool darkTheme = true;
     ThemeKind theme = ThemeKind::Dark;
@@ -164,6 +177,10 @@ struct AppState {
     wchar_t replaceBuffer[256]{};
     std::vector<TabDocument> documents;
     std::vector<std::wstring> pendingOpenFiles;
+    RECT savedWindowRect{};
+    bool savedWindowMaximized = false;
+    bool hasSavedWindow = false;
+    bool checkingExternalChanges = false;
     int activeIndex = -1;
     int nextUntitledNumber = 1;
     bool loading = false;
@@ -191,6 +208,7 @@ struct AppState {
 
 AppState g_app;
 
+
 // RichEdit controls normally handle the standard edit shortcuts themselves,
 // but accelerator translation can be bypassed when focus is inside a child
 // control. Keep a small per-editor subclass so the shortcuts always reach the
@@ -199,7 +217,12 @@ std::unordered_map<HWND, WNDPROC> g_editorProcs;
 
 std::wstring GetWindowTextValue(HWND window);
 void ApplyEditorTheme(HWND editor);
-void ApplySimpleSyntaxHighlight(HWND editor);
+void HighlightDocument(const TabDocument& document);
+int EffectiveLanguage(const TabDocument& document);
+void RefreshGutter();
+void AppendEncodingItems(HMENU menu);
+void CheckDocumentMenuItems(HMENU menu);
+void ApplyWordWrapAll();
 void CloseDocument(int index);
 
 LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lParam);
@@ -297,28 +320,6 @@ const ThemePalette& CurrentPalette() {
     return ThemePaletteFor(g_app.theme);
 }
 
-wchar_t ToolbarIconGlyph(int id) {
-    switch (id) {
-    case kIdToolbarNew: return L'\xF067';
-    case kIdToolbarOpen: return L'\xF07C';
-    case kIdToolbarSave: return L'\xF0C7';
-    case kIdToolbarSaveAs: return L'\xF56F';
-    case kIdToolbarClose: return L'\xF00D';
-    case kIdToolbarUndo: return L'\xF0E2';
-    case kIdToolbarRedo: return L'\xF01E';
-    case kIdToolbarFind: return L'\xF002';
-    case kIdToolbarReplace: return L'\xF021';
-    case kIdToolbarGoto: return L'\xF061';
-    case kIdToolbarFormat: return L'\xF03A';
-    case kIdToolbarRun: return L'\xF04B';
-    case kIdToolbarEncoding: return L'\xF121';
-    case kIdToolbarLineNumbers: return L'\xF0CB';
-    case kIdToolbarWrap: return L'\xF0B5';
-    case kIdToolbarTheme: return L'\xF53F';
-    default: return 0;
-    }
-}
-
 const wchar_t* ToolbarIconFile(int id) {
     switch (id) {
     case kIdToolbarNew: return L"new.png";
@@ -375,39 +376,6 @@ Bitmap* ToolbarIconImage(int id) {
     return nullptr;
 }
 
-bool FontSupportsGlyph(HFONT font, wchar_t glyph) {
-    if (!font || glyph == 0) return false;
-    HDC dc = GetDC(nullptr);
-    if (!dc) return false;
-    HFONT previous = static_cast<HFONT>(SelectObject(dc, font));
-    GLYPHMETRICS metrics{};
-    const DWORD result = GetGlyphOutlineW(dc, glyph, GGO_METRICS, &metrics, 0, nullptr, nullptr);
-    SelectObject(dc, previous);
-    ReleaseDC(nullptr, dc);
-    return result != GDI_ERROR;
-}
-
-bool LoadToolbarIconFont() {
-    wchar_t modulePath[MAX_PATH]{};
-    const DWORD length = GetModuleFileNameW(nullptr, modulePath, std::size(modulePath));
-    if (length == 0 || length >= std::size(modulePath)) return false;
-    fs::path fontPath = fs::path(modulePath).parent_path() / L"resources" / L"fa-solid-900.ttf";
-    if (!fs::exists(fontPath)) return false;
-    if (AddFontResourceExW(fontPath.c_str(), FR_PRIVATE, nullptr) == 0) return false;
-    g_app.toolbarIconFontPath = fontPath.wstring();
-    g_app.toolbarIconFont = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Font Awesome 6 Free");
-    if (!FontSupportsGlyph(g_app.toolbarIconFont, ToolbarIconGlyph(kIdToolbarNew))) {
-        DeleteObject(g_app.toolbarIconFont);
-        g_app.toolbarIconFont = nullptr;
-        RemoveFontResourceExW(g_app.toolbarIconFontPath.c_str(), FR_PRIVATE, nullptr);
-        g_app.toolbarIconFontPath.clear();
-        return false;
-    }
-    return true;
-}
-
 COLORREF EditorBackground() { return CurrentPalette().editorBackground; }
 COLORREF EditorForeground() { return CurrentPalette().editorText; }
 COLORREF GutterBackground() { return CurrentPalette().gutterBackground; }
@@ -435,7 +403,7 @@ void ApplyThemeToEditors(bool rehighlight = true) {
     g_app.statusBrush = CreateSolidBrush(palette.statusBackground);
     for (const TabDocument& document : g_app.documents) {
         ApplyEditorTheme(document.editor);
-        if (rehighlight) ApplySimpleSyntaxHighlight(document.editor);
+        if (rehighlight) HighlightDocument(document);
     }
     if (g_app.tabs) {
         InvalidateRect(g_app.tabs, nullptr, TRUE);
@@ -447,14 +415,7 @@ void ApplyThemeToEditors(bool rehighlight = true) {
         if (button) InvalidateRect(button, nullptr, TRUE);
     }
     if (g_app.newTabButton) InvalidateRect(g_app.newTabButton, nullptr, TRUE);
-    if (g_app.sidebarClose) InvalidateRect(g_app.sidebarClose, nullptr, TRUE);
     if (g_app.settingsThemeCombo) SendMessageW(g_app.settingsThemeCombo, CB_SETCURSEL, static_cast<int>(g_app.theme), 0);
-    if (g_app.sidebar) {
-        InvalidateRect(g_app.sidebar, nullptr, TRUE);
-        for (int id : {kIdThemeDark, kIdThemeLight, kIdThemeGreen, kIdThemeBlue}) {
-            if (HWND button = GetDlgItem(g_app.sidebar, id)) InvalidateRect(button, nullptr, TRUE);
-        }
-    }
     if (g_app.window) {
         InvalidateRect(g_app.window, nullptr, TRUE);
         g_app.stateDirty = true;
@@ -528,7 +489,7 @@ void ShowThemeMenu(HWND anchor) {
 // RichEdit only sends EN_CHANGE / EN_VSCROLL when the event mask asks for it.
 // Formatting changes (theme, highlight, font) must not mark a document as
 // modified, so they temporarily mute notifications with this guard.
-constexpr LPARAM kEditorEventMask = ENM_CHANGE | ENM_SCROLL;
+constexpr LPARAM kEditorEventMask = ENM_CHANGE | ENM_SCROLL | ENM_SELCHANGE;
 
 class EditorEventMute {
 public:
@@ -556,6 +517,9 @@ void ApplyEditorTheme(HWND editor) {
     format.dwMask = CFM_COLOR | CFM_BACKCOLOR;
     format.crTextColor = foreground;
     format.crBackColor = background;
+    // SCF_DEFAULT too, so text inserted later (SetWindowText, typing) starts
+    // in the theme colour without a separate colouring pass.
+    SendMessageW(editor, EM_SETCHARFORMAT, SCF_DEFAULT, reinterpret_cast<LPARAM>(&format));
     SendMessageW(editor, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&format));
     InvalidateRect(editor, nullptr, TRUE);
 }
@@ -574,36 +538,93 @@ void SetSelectionColor(HWND editor, LONG start, LONG end, COLORREF color) {
     SendMessageW(editor, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
 }
 
-void ApplySimpleSyntaxHighlight(HWND editor) {
+// Text exactly as RichEdit stores it (one character per line break), so string
+// offsets match RichEdit character positions.
+std::wstring GetEditorRawText(HWND editor) {
+    GETTEXTLENGTHEX lengthQuery{GTL_NUMCHARS | GTL_PRECISE, 1200};
+    const LRESULT length = SendMessageW(editor, EM_GETTEXTLENGTHEX,
+        reinterpret_cast<WPARAM>(&lengthQuery), 0);
+    if (length <= 0) return {};
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    GETTEXTEX query{};
+    query.cb = static_cast<DWORD>(text.size() * sizeof(wchar_t));
+    query.flags = GT_DEFAULT;
+    query.codepage = 1200;
+    const LRESULT copied = SendMessageW(editor, EM_GETTEXTEX,
+        reinterpret_cast<WPARAM>(&query), reinterpret_cast<LPARAM>(text.data()));
+    text.resize(static_cast<size_t>(std::max<LRESULT>(0, copied)));
+    return text;
+}
+
+// Lightweight colouring: HTML gets tags, comments and attribute strings; code
+// languages get quoted strings (a string never runs past its line); plain text
+// and Markdown are left alone so apostrophes don't colour whole paragraphs.
+void ApplySimpleSyntaxHighlight(HWND editor, int language) {
     if (!editor) return;
-    const std::wstring text = GetWindowTextValue(editor);
+    const std::wstring text = GetEditorRawText(editor);
     if (text.empty()) return;
     EditorEventMute mute(editor);
+    SendMessageW(editor, WM_SETREDRAW, FALSE, 0);
     CHARRANGE saved{};
     SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&saved));
-    SetSelectionColor(editor, 0, static_cast<LONG>(text.size()), EditorForeground());
-    for (size_t i = 0; i < text.size();) {
-        if (text[i] == L'<') {
-            const size_t end = text.find(L'>', i + 1);
-            if (end == std::wstring::npos) break;
-            SetSelectionColor(editor, static_cast<LONG>(i), static_cast<LONG>(end + 1), CurrentPalette().syntaxTag);
-            i = end + 1;
-        } else if (text[i] == L'"' || text[i] == L'\'') {
+    POINT scroll{};
+    SendMessageW(editor, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    SetSelectionColor(editor, 0, -1, EditorForeground());
+    const ThemePalette& palette = CurrentPalette();
+    const auto color = [&](size_t start, size_t end, COLORREF value) {
+        SetSelectionColor(editor, static_cast<LONG>(start), static_cast<LONG>(end), value);
+    };
+    const auto lineEnd = [&](size_t from) {
+        const size_t end = text.find_first_of(L"\r\n", from);
+        return end == std::wstring::npos ? text.size() : end;
+    };
+
+    if (language == kLanguageHtml) {
+        for (size_t i = 0; i < text.size();) {
+            if (text.compare(i, 4, L"<!--") == 0) {
+                const size_t end = text.find(L"-->", i + 4);
+                const size_t finish = end == std::wstring::npos ? text.size() : end + 3;
+                color(i, finish, palette.syntaxComment);
+                i = finish;
+            } else if (text[i] == L'<') {
+                const size_t end = text.find(L'>', i + 1);
+                const size_t finish = end == std::wstring::npos ? text.size() : end + 1;
+                color(i, finish, palette.syntaxTag);
+                // Attribute values inside the tag.
+                for (size_t j = i + 1; j < finish; ++j) {
+                    if (text[j] != L'"' && text[j] != L'\'') continue;
+                    const size_t close = text.find(text[j], j + 1);
+                    if (close == std::wstring::npos || close >= finish) break;
+                    color(j, close + 1, palette.syntaxString);
+                    j = close;
+                }
+                i = finish;
+            } else {
+                ++i;
+            }
+        }
+    } else if (language != kLanguagePlain && language != kLanguageMarkdown) {
+        const bool singleQuotes = language != kLanguageJson;
+        for (size_t i = 0; i < text.size(); ++i) {
             const wchar_t quote = text[i];
-            const size_t end = text.find(quote, i + 1);
-            if (end == std::wstring::npos) break;
-            SetSelectionColor(editor, static_cast<LONG>(i), static_cast<LONG>(end + 1), CurrentPalette().syntaxString);
-            i = end + 1;
-        } else if (i + 3 < text.size() && text.compare(i, 4, L"<!--") == 0) {
-            const size_t end = text.find(L"-->", i + 4);
-            const size_t finish = end == std::wstring::npos ? text.size() : end + 3;
-            SetSelectionColor(editor, static_cast<LONG>(i), static_cast<LONG>(finish), CurrentPalette().syntaxComment);
-            i = finish;
-        } else {
-            ++i;
+            if (quote != L'"' && !(singleQuotes && (quote == L'\'' || quote == L'`'))) continue;
+            const size_t limit = quote == L'`' ? text.size() : lineEnd(i + 1);
+            size_t j = i + 1;
+            while (j < limit && text[j] != quote) j += (text[j] == L'\\') ? 2 : 1;
+            if (j >= limit) continue;  // unterminated: leave it uncoloured
+            color(i, j + 1, palette.syntaxString);
+            i = j;
         }
     }
+
     SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&saved));
+    SendMessageW(editor, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    SendMessageW(editor, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(editor, nullptr, TRUE);
+}
+
+void HighlightDocument(const TabDocument& document) {
+    ApplySimpleSyntaxHighlight(document.editor, EffectiveLanguage(document));
 }
 
 LRESULT CALLBACK StatusProc(HWND status, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -823,7 +844,7 @@ void DrawToolbarItem(const DRAWITEMSTRUCT& item) {
     }
 
     SetBkMode(item.hDC, TRANSPARENT);
-    if (id == kIdNewTabButton || id == kIdSidebarClose) {
+    if (id == kIdNewTabButton) {
         HPEN pen = CreatePen(PS_SOLID, 1, disabled ? palette.toolbarIconDisabled : palette.toolbarIcon);
         HPEN previousPen = static_cast<HPEN>(SelectObject(item.hDC, pen));
         const int cx = (rect.left + rect.right) / 2;
@@ -868,58 +889,6 @@ void DrawToolbarItem(const DRAWITEMSTRUCT& item) {
         InflateRect(&iconRect, -2, -2);
         DrawToolbarIcon(item.hDC, iconRect, id, iconColor);
     }
-}
-
-void DrawThemeItem(const DRAWITEMSTRUCT& item) {
-    const int id = static_cast<int>(item.CtlID);
-    const ThemeKind kind = id == kIdThemeLight ? ThemeKind::Light
-        : id == kIdThemeGreen ? ThemeKind::Green
-        : id == kIdThemeBlue ? ThemeKind::Blue : ThemeKind::Dark;
-    const ThemePalette& theme = ThemePaletteFor(kind);
-    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
-    const bool active = g_app.theme == kind;
-    RECT rect = item.rcItem;
-    InflateRect(&rect, -2, -2);
-    COLORREF background = theme.panelBackground;
-    if (pressed) background = theme.controlHover;
-    HPEN pen = CreatePen(PS_SOLID, active ? 2 : 1, active ? theme.accent : theme.panelBorder);
-    HBRUSH brush = CreateSolidBrush(background);
-    HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(item.hDC, brush));
-    HPEN oldPen = static_cast<HPEN>(SelectObject(item.hDC, pen));
-    RoundRect(item.hDC, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
-    SelectObject(item.hDC, oldBrush);
-    SelectObject(item.hDC, oldPen);
-    DeleteObject(brush);
-    DeleteObject(pen);
-
-    RECT marker{rect.left + 8, rect.top + 8, rect.left + 24, rect.top + 24};
-    HBRUSH markerBrush = CreateSolidBrush(theme.editorBackground);
-    FillRect(item.hDC, &marker, markerBrush);
-    DeleteObject(markerBrush);
-    HBRUSH markerBorder = CreateSolidBrush(theme.accent);
-    FrameRect(item.hDC, &marker, markerBorder);
-    DeleteObject(markerBorder);
-    SetBkMode(item.hDC, TRANSPARENT);
-    SetTextColor(item.hDC, theme.controlText);
-    HFONT font = g_app.uiFont ? g_app.uiFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    HFONT oldFont = static_cast<HFONT>(SelectObject(item.hDC, font));
-    RECT textRect = rect;
-    textRect.left += 30;
-    DrawTextW(item.hDC, ToolbarLabel(id).c_str(), -1, &textRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-    if (active) {
-        HBRUSH checkBrush = CreateSolidBrush(theme.accent);
-        RECT check{rect.right - 20, rect.top + 8, rect.right - 8, rect.top + 20};
-        FillRect(item.hDC, &check, checkBrush);
-        DeleteObject(checkBrush);
-        HPEN checkPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
-        HPEN oldCheckPen = static_cast<HPEN>(SelectObject(item.hDC, checkPen));
-        MoveToEx(item.hDC, check.left + 3, check.top + 6, nullptr);
-        LineTo(item.hDC, check.left + 5, check.bottom - 3);
-        LineTo(item.hDC, check.right - 3, check.top + 3);
-        SelectObject(item.hDC, oldCheckPen);
-        DeleteObject(checkPen);
-    }
-    SelectObject(item.hDC, oldFont);
 }
 
 void DrawTabItem(const DRAWITEMSTRUCT& item) {
@@ -1249,10 +1218,16 @@ bool WriteAtomicFile(const fs::path& path, std::string_view bytes) {
     return false;
 }
 
-std::wstring DecodeTextBytes(const std::vector<char>& bytes) {
+// Decodes file bytes and reports which encoding was found:
+// BOM (UTF-8 / UTF-16 LE / UTF-16 BE) first, then strict UTF-8, otherwise the
+// system ANSI code page.
+std::wstring DecodeTextBytes(const std::vector<char>& bytes, int* detectedEncoding = nullptr) {
+    int ignored = 0;
+    int& encoding = detectedEncoding ? *detectedEncoding : ignored;
     if (bytes.size() >= 2 &&
         static_cast<unsigned char>(bytes[0]) == 0xFF &&
         static_cast<unsigned char>(bytes[1]) == 0xFE) {
+        encoding = 2;
         const int wideBytes = static_cast<int>(bytes.size() - 2);
         return std::wstring(reinterpret_cast<const wchar_t*>(bytes.data() + 2),
             reinterpret_cast<const wchar_t*>(bytes.data() + 2) + wideBytes / 2);
@@ -1261,6 +1236,7 @@ std::wstring DecodeTextBytes(const std::vector<char>& bytes) {
     if (bytes.size() >= 2 &&
         static_cast<unsigned char>(bytes[0]) == 0xFE &&
         static_cast<unsigned char>(bytes[1]) == 0xFF) {
+        encoding = 3;
         std::wstring result;
         result.reserve((bytes.size() - 2) / 2);
         for (size_t index = 2; index + 1 < bytes.size(); index += 2) {
@@ -1281,16 +1257,83 @@ std::wstring DecodeTextBytes(const std::vector<char>& bytes) {
     }
 
     const std::string_view text(bytes.data() + offset, bytes.size() - offset);
-    return Utf8ToWide(text);
+    if (text.empty()) {
+        encoding = offset == 3 ? 1 : g_app.encodingIndex;
+        return {};
+    }
+    const int strictSize = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (strictSize > 0) {
+        encoding = offset == 3 ? 1 : 0;
+        std::wstring result(static_cast<size_t>(strictSize), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+            static_cast<int>(text.size()), result.data(), strictSize);
+        return result;
+    }
+    encoding = offset == 3 ? 1 : kEncodingAnsi;
+    const int fallbackSize = MultiByteToWideChar(offset == 3 ? CP_UTF8 : CP_ACP, 0,
+        text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (fallbackSize <= 0) return {};
+    std::wstring result(static_cast<size_t>(fallbackSize), L'\0');
+    MultiByteToWideChar(offset == 3 ? CP_UTF8 : CP_ACP, 0, text.data(),
+        static_cast<int>(text.size()), result.data(), fallbackSize);
+    return result;
 }
 
-bool ReadTextFile(const fs::path& path, std::wstring& text) {
+// The first line break decides the file's line-ending style.
+int DetectLineEnding(std::wstring_view text, int fallback) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\r') return (i + 1 < text.size() && text[i + 1] == L'\n') ? 0 : 2;
+        if (text[i] == L'\n') return 1;
+    }
+    return fallback;
+}
+
+bool ReadTextFile(const fs::path& path, std::wstring& text,
+    int* encoding = nullptr, int* lineEnding = nullptr) {
     std::vector<char> bytes;
     if (!ReadBinaryFile(path, bytes)) {
         return false;
     }
-    text = DecodeTextBytes(bytes);
+    int detected = 0;
+    text = DecodeTextBytes(bytes, &detected);
+    if (encoding) *encoding = detected;
+    if (lineEnding) *lineEnding = DetectLineEnding(text, g_app.lineEndingIndex);
     return true;
+}
+
+// True when every character survives a round trip through the ANSI code page.
+bool IsAnsiRepresentable(std::wstring_view text) {
+    if (text.empty()) return true;
+    BOOL usedDefault = FALSE;
+    const int size = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, text.data(),
+        static_cast<int>(text.size()), nullptr, 0, nullptr, &usedDefault);
+    return size > 0 && !usedDefault;
+}
+
+int LanguageFromPath(const std::wstring& path) {
+    std::wstring extension = fs::path(path).extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+    if (extension == L".html" || extension == L".htm" || extension == L".xml" ||
+        extension == L".xhtml" || extension == L".svg" || extension == L".vue") return kLanguageHtml;
+    if (extension == L".css" || extension == L".scss" || extension == L".less") return 2;
+    if (extension == L".js" || extension == L".mjs" || extension == L".cjs" ||
+        extension == L".ts" || extension == L".jsx" || extension == L".tsx") return 3;
+    if (extension == L".c" || extension == L".cc" || extension == L".cpp" || extension == L".cxx" ||
+        extension == L".h" || extension == L".hpp" || extension == L".hh") return 4;
+    if (extension == L".py" || extension == L".pyw") return 5;
+    if (extension == L".json" || extension == L".jsonc") return kLanguageJson;
+    if (extension == L".md" || extension == L".markdown") return kLanguageMarkdown;
+    if (extension == L".sql") return 8;
+    if (extension == L".ps1" || extension == L".psm1" || extension == L".psd1") return 9;
+    return kLanguagePlain;
+}
+
+// Language actually used for highlighting/formatting: the user's choice, or the
+// one implied by the file extension when set to "auto".
+int EffectiveLanguage(const TabDocument& document) {
+    if (document.language > kLanguageAuto && document.language < kLanguageCount) return document.language;
+    return LanguageFromPath(document.path);
 }
 
 std::wstring NormalizeLineEndings(std::wstring_view text, int mode) {
@@ -1403,7 +1446,12 @@ void RestoreEditorState(const TabDocument& document) {
     const int start = static_cast<int>(std::clamp(document.anchor, int64_t(0), int64_t(0x7FFFFFFF)));
     const int end = static_cast<int>(std::clamp(document.caret, int64_t(0), int64_t(0x7FFFFFFF)));
     SendMessageW(document.editor, EM_SETSEL, static_cast<WPARAM>(start), static_cast<LPARAM>(end));
-    SendMessageW(document.editor, EM_LINESCROLL, 0, document.firstVisibleLine);
+    // EM_LINESCROLL is relative, and EM_SETSEL may already have scrolled the
+    // caret into view, so scroll by the remaining difference only.
+    const int current = static_cast<int>(SendMessageW(document.editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+    if (current != document.firstVisibleLine) {
+        SendMessageW(document.editor, EM_LINESCROLL, 0, document.firstVisibleLine - current);
+    }
     RefreshGutter();
 }
 
@@ -1414,7 +1462,11 @@ void UpdateStatusBar() {
 
     int line = 1;
     int column = 1;
+    int selected = 0;
     bool modified = false;
+    const wchar_t* encodingName = kEncodingNames[0];
+    const wchar_t* lineEndingName = kLineEndingNames[0];
+    const wchar_t* languageName = L"纯文本";
     if (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size())) {
         const TabDocument& document = g_app.documents[static_cast<size_t>(g_app.activeIndex)];
         DWORD anchor = 0;
@@ -1428,6 +1480,11 @@ void UpdateStatusBar() {
         line = lineIndex + 1;
         column = std::max(1, static_cast<int>(caret) - lineStart + 1);
         modified = document.modified;
+        selected = static_cast<int>(anchor > caret ? anchor - caret : caret - anchor);
+        encodingName = kEncodingNames[std::clamp(document.encoding, 0, kEncodingCount - 1)];
+        lineEndingName = kLineEndingNames[std::clamp(document.lineEnding, 0, kLineEndingCount - 1)];
+        const int language = EffectiveLanguage(document);
+        languageName = language == kLanguagePlain ? L"纯文本" : kLanguageNames[language];
     }
 
     wchar_t position[64]{};
@@ -1437,20 +1494,16 @@ void UpdateStatusBar() {
 
     RECT client{};
     GetClientRect(g_app.window, &client);
-    int parts[] = { 145, 430, client.right - 270, client.right - 140, client.right - 70, -1 };
+    int parts[] = { 90, 260, 380, client.right - 270, client.right - 170, -1 };
     SendMessageW(g_app.statusBar, SB_SETPARTS, 6, reinterpret_cast<LPARAM>(parts));
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(L"就绪"));
+    wchar_t selection[64]{};
+    swprintf_s(selection, L"选中 %d", selected);
+    SendMessageW(g_app.statusBar, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(state));
     SendMessageW(g_app.statusBar, SB_SETTEXTW, 1, reinterpret_cast<LPARAM>(position));
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 2, reinterpret_cast<LPARAM>(L"选中 0"));
-    const wchar_t* encodings[] = {L"UTF-8", L"UTF-8 BOM", L"UTF-16 LE", L"UTF-16 BE", L"ANSI"};
-    const wchar_t* endings[] = {L"CRLF", L"LF", L"CR"};
-    const wchar_t* languages[] = {L"自动", L"HTML", L"CSS", L"JavaScript", L"C/C++", L"Python", L"JSON", L"Markdown", L"SQL", L"PowerShell"};
-    const int encodingIndex = std::clamp(g_app.encodingIndex, 0, 4);
-    const int lineEndingIndex = std::clamp(g_app.lineEndingIndex, 0, 2);
-    const int languageIndex = std::clamp(g_app.languageIndex, 0, 9);
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 3, reinterpret_cast<LPARAM>(encodings[encodingIndex]));
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 4, reinterpret_cast<LPARAM>(endings[lineEndingIndex]));
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 5, reinterpret_cast<LPARAM>(languages[languageIndex]));
+    SendMessageW(g_app.statusBar, SB_SETTEXTW, 2, reinterpret_cast<LPARAM>(selection));
+    SendMessageW(g_app.statusBar, SB_SETTEXTW, 3, reinterpret_cast<LPARAM>(encodingName));
+    SendMessageW(g_app.statusBar, SB_SETTEXTW, 4, reinterpret_cast<LPARAM>(lineEndingName));
+    SendMessageW(g_app.statusBar, SB_SETTEXTW, 5, reinterpret_cast<LPARAM>(languageName));
 }
 
 void LayoutChildren(HWND window) {
@@ -1482,10 +1535,10 @@ void LayoutChildren(HWND window) {
     }
     MoveWindow(g_app.tabs, 0, tabY, tabsWidth, kTabHeight, TRUE);
     MoveWindow(g_app.newTabButton, tabsWidth, tabY, kNewTabButtonWidth, kTabHeight, TRUE);
-    if (g_app.sidebar) {
-        ShowWindow(g_app.sidebar, SW_HIDE);
+    if (g_app.gutter) {
+        MoveWindow(g_app.gutter, 0, contentY, kGutterWidth, contentHeight, TRUE);
+        ShowWindow(g_app.gutter, g_app.showLineNumbers ? SW_SHOW : SW_HIDE);
     }
-    if (g_app.gutter) MoveWindow(g_app.gutter, 0, contentY, kGutterWidth, contentHeight, TRUE);
     for (TabDocument& document : g_app.documents) {
         MoveWindow(document.editor, g_app.showLineNumbers ? kGutterWidth : 0, contentY,
             std::max(0, editorWidth - (g_app.showLineNumbers ? kGutterWidth : 0)), contentHeight, TRUE);
@@ -1513,81 +1566,6 @@ void CreateToolbarControls(HWND window) {
         SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
         g_app.toolbarButtons.push_back(button);
 
-    }
-}
-
-LRESULT CALLBACK SidebarProc(HWND sidebar, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_COMMAND || message == WM_DRAWITEM || message == WM_MEASUREITEM ||
-        message == WM_CTLCOLORSTATIC || message == WM_CTLCOLORBTN ||
-        message == WM_CTLCOLORLISTBOX || message == WM_CTLCOLOREDIT) {
-        if (g_app.window) {
-            SendMessageW(g_app.window, message, wParam, lParam);
-            return 0;
-        }
-    }
-    return g_app.oldSidebarProc
-        ? CallWindowProcW(g_app.oldSidebarProc, sidebar, message, wParam, lParam)
-        : DefWindowProcW(sidebar, message, wParam, lParam);
-}
-
-void CreateSidebarControls(HWND window) {
-    g_app.sidebar = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", nullptr,
-        WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
-    g_app.oldSidebarProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-        g_app.sidebar, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SidebarProc)));
-    g_app.sidebarTitle = CreateWindowExW(0, L"STATIC", L"文档设置", WS_CHILD | WS_VISIBLE,
-        18, 18, 190, 24, g_app.sidebar, nullptr, g_app.instance, nullptr);
-    g_app.sidebarClose = CreateWindowExW(0, L"BUTTON", L"×", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-        226, 12, 24, 24, g_app.sidebar, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdSidebarClose)),
-        g_app.instance, nullptr);
-    g_app.languageLabel = CreateWindowExW(0, L"STATIC", L"语言", WS_CHILD | WS_VISIBLE,
-        18, 52, 214, 20, g_app.sidebar, nullptr, g_app.instance, nullptr);
-    g_app.languageCombo = CreateWindowExW(0, L"COMBOBOX", nullptr,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST, 18, 76, 214, 160,
-        g_app.sidebar, nullptr, g_app.instance, nullptr);
-    for (const wchar_t* value : {L"自动检测", L"HTML", L"CSS", L"JavaScript", L"C/C++", L"Python", L"JSON", L"Markdown", L"SQL", L"PowerShell"}) {
-        SendMessageW(g_app.languageCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
-    }
-    SendMessageW(g_app.languageCombo, CB_SETCURSEL, 1, 0);
-
-    g_app.encodingLabel = CreateWindowExW(0, L"STATIC", L"编码", WS_CHILD | WS_VISIBLE,
-        18, 120, 214, 20, g_app.sidebar, nullptr, g_app.instance, nullptr);
-    g_app.encodingCombo = CreateWindowExW(0, L"COMBOBOX", nullptr,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST, 18, 144, 214, 160,
-        g_app.sidebar, nullptr, g_app.instance, nullptr);
-    for (const wchar_t* value : {L"UTF-8", L"UTF-8 BOM", L"UTF-16 LE", L"UTF-16 BE", L"ANSI"}) {
-        SendMessageW(g_app.encodingCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
-    }
-    SendMessageW(g_app.encodingCombo, CB_SETCURSEL, 0, 0);
-
-    g_app.lineEndingLabel = CreateWindowExW(0, L"STATIC", L"换行", WS_CHILD | WS_VISIBLE,
-        18, 188, 214, 20, g_app.sidebar, nullptr, g_app.instance, nullptr);
-    g_app.lineEndingCombo = CreateWindowExW(0, L"COMBOBOX", nullptr,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST, 18, 212, 214, 160,
-        g_app.sidebar, nullptr, g_app.instance, nullptr);
-    for (const wchar_t* value : {L"Windows (CRLF)", L"Unix (LF)", L"旧式 Mac (CR)"}) {
-        SendMessageW(g_app.lineEndingCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
-    }
-    SendMessageW(g_app.lineEndingCombo, CB_SETCURSEL, 0, 0);
-
-    CreateWindowExW(0, L"STATIC", L"主题", WS_CHILD | WS_VISIBLE,
-        18, 256, 214, 20, g_app.sidebar, nullptr, g_app.instance, nullptr);
-    const struct ThemeButton { int id; const wchar_t* text; } themes[] = {
-        {kIdThemeDark, L"深色（默认）"}, {kIdThemeLight, L"浅色"},
-        {kIdThemeGreen, L"护眼绿"}, {kIdThemeBlue, L"暗夜蓝"}
-    };
-    for (int index = 0; index < 4; ++index) {
-        const auto& theme = themes[index];
-        CreateWindowExW(0, L"BUTTON", theme.text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-            18 + (index % 2) * 110, 282 + (index / 2) * 46, 100, 36, g_app.sidebar,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(theme.id)), g_app.instance, nullptr);
-        if (HWND button = GetDlgItem(g_app.sidebar, theme.id)) {
-            SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
-        }
-    }
-    for (HWND control : {g_app.sidebarTitle, g_app.sidebarClose, g_app.languageLabel, g_app.languageCombo,
-        g_app.encodingLabel, g_app.encodingCombo, g_app.lineEndingLabel, g_app.lineEndingCombo}) {
-        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
     }
 }
 
@@ -1652,8 +1630,11 @@ bool SaveSessionFile() {
     output << "PREFERENCES\t" << (g_app.launchAtStartup ? 1 : 0) << '\t'
            << static_cast<int>(g_app.closeBehavior) << "\n";
 
-    RECT windowRect{};
-    GetWindowRect(g_app.window, &windowRect);
+    // rcNormalPosition is the restored size even while maximized/minimized.
+    WINDOWPLACEMENT placement{};
+    placement.length = sizeof(placement);
+    GetWindowPlacement(g_app.window, &placement);
+    const RECT& windowRect = placement.rcNormalPosition;
     output << "WINDOW\t" << windowRect.left << '\t' << windowRect.top << '\t'
            << windowRect.right - windowRect.left << '\t'
            << windowRect.bottom - windowRect.top << '\t'
@@ -1672,7 +1653,10 @@ bool SaveSessionFile() {
                << document.horizontalScroll << '\t'
                << (document.modified ? 1 : 0) << '\t'
                << (document.untitled ? 1 : 0) << '\t'
-               << FileTimestamp(document.path) << '\n';
+               << document.fileTimestamp << '\t'
+               << document.encoding << '\t'
+               << document.lineEnding << '\t'
+               << document.language << '\n';
     }
 
     return WriteAtomicFile(g_app.sessionPath, output.str());
@@ -1803,9 +1787,34 @@ void RemoveOrphanSnapshots() {
     }
 }
 
+struct DocumentFormat {
+    int encoding = -1;     // -1 = application default
+    int lineEnding = -1;   // -1 = application default
+    int language = kLanguageAuto;
+    uint64_t fileTimestamp = 0;
+};
+
+// RichEdit wraps against the window when the target line width is 0 and never
+// wraps when it is 1; the WS_HSCROLL style alone does not change wrapping.
+void ApplyWordWrap(HWND editor) {
+    if (!editor) return;
+    SendMessageW(editor, EM_SETTARGETDEVICE, 0, g_app.wordWrap ? 0 : 1);
+    const LONG style = GetWindowLongW(editor, GWL_STYLE);
+    const LONG wanted = g_app.wordWrap ? (style & ~WS_HSCROLL) : (style | WS_HSCROLL);
+    if (wanted == style) return;
+    SetWindowLongW(editor, GWL_STYLE, wanted);
+    SetWindowPos(editor, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+void ApplyWordWrapAll() {
+    for (const TabDocument& document : g_app.documents) ApplyWordWrap(document.editor);
+    RefreshGutter();
+}
+
 int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     bool untitled, bool modified, int64_t caret, int64_t anchor, int firstVisibleLine,
-    const fs::path* explicitSnapshot = nullptr) {
+    const fs::path* explicitSnapshot = nullptr, const DocumentFormat& format = {}) {
     TabDocument document;
     document.path = std::move(path);
     document.untitled = untitled;
@@ -1813,12 +1822,18 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     document.caret = caret;
     document.anchor = anchor;
     document.firstVisibleLine = firstVisibleLine;
+    document.encoding = format.encoding >= 0 && format.encoding < kEncodingCount
+        ? format.encoding : std::clamp(g_app.encodingIndex, 0, kEncodingCount - 1);
+    document.lineEnding = format.lineEnding >= 0 && format.lineEnding < kLineEndingCount
+        ? format.lineEnding : std::clamp(g_app.lineEndingIndex, 0, kLineEndingCount - 1);
+    document.language = std::clamp(format.language, 0, kLanguageCount - 1);
+    document.fileTimestamp = format.fileTimestamp;
     document.title = title.empty()
         ? (document.untitled ? std::wstring(L"Untitled-") + std::to_wstring(g_app.nextUntitledNumber++) : FileTitle(document.path))
         : std::move(title);
     if (document.untitled && document.title.rfind(L"Untitled-", 0) == 0) {
         try {
-            const int number = std::stoi(document.title.substr(8));
+            const int number = std::stoi(document.title.substr(9));
             g_app.nextUntitledNumber = std::max(g_app.nextUntitledNumber, number + 1);
         } catch (...) {
         }
@@ -1857,7 +1872,9 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
             ? g_app.editorFont : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     ApplyEditorTheme(document.editor);
     SetWindowTextW(document.editor, text.c_str());
-    ApplySimpleSyntaxHighlight(document.editor);
+    ApplyWordWrap(document.editor);
+    const int language = EffectiveLanguage(document);
+    if (language != kLanguagePlain && language != kLanguageMarkdown) HighlightDocument(document);
     SendMessageW(document.editor, EM_SETMODIFY, modified ? TRUE : FALSE, 0);
     // Enable change/scroll notifications only after the initial text is in,
     // so loading a file does not mark it as modified.
@@ -1867,7 +1884,7 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     g_app.documents.push_back(std::move(document));
     AddTabToControl(g_app.documents.back().title);
     UpdateTabTitle(static_cast<int>(g_app.documents.size() - 1));
-    LayoutChildren(g_app.window);
+    if (!g_app.loading) LayoutChildren(g_app.window);  // session restore lays out once at the end
     return static_cast<int>(g_app.documents.size() - 1);
 }
 
@@ -1888,7 +1905,7 @@ bool SaveDocument(int index, bool saveAs) {
         OPENFILENAMEW dialog{};
         dialog.lStructSize = sizeof(dialog);
         dialog.hwndOwner = g_app.window;
-        dialog.lpstrFilter = L"Text files\0*.txt;*.md;*.log;*.json;*.cpp;*.h\0All files\0*.*\0";
+        dialog.lpstrFilter = L"All files\0*.*\0Text files\0*.txt;*.md;*.log;*.json;*.cpp;*.h\0";
         dialog.lpstrFile = fileName;
         dialog.nMaxFile = MAX_PATH;
         dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
@@ -1900,18 +1917,30 @@ bool SaveDocument(int index, bool saveAs) {
     }
 
     const std::wstring text = GetWindowTextValue(document.editor);
-    if (!WriteTextFile(target, text)) {
+    if (document.encoding == kEncodingAnsi && !IsAnsiRepresentable(text)) {
+        const int choice = MessageBoxW(g_app.window,
+            L"当前内容包含 ANSI 编码无法表示的字符，按 ANSI 保存会变成“?”。\n"
+            L"选择“是”改用 UTF-8 保存，“否”仍按 ANSI 保存。",
+            kWindowTitle, MB_YESNOCANCEL | MB_ICONWARNING);
+        if (choice == IDCANCEL) return false;
+        if (choice == IDYES) document.encoding = 0;
+    }
+    if (!WriteTextFile(target, text, document.encoding, document.lineEnding)) {
         MessageBoxW(g_app.window, L"文件保存失败，请检查路径和权限。", kWindowTitle, MB_ICONERROR);
         return false;
     }
 
+    const bool pathChanged = !SamePath(document.path, target);
     document.path = target.wstring();
     document.title = FileTitle(target);
     document.untitled = false;
     document.modified = false;
     document.recoveryDirty = true;
+    document.fileTimestamp = FileTimestamp(target);
     SendMessageW(document.editor, EM_SETMODIFY, FALSE, 0);
+    if (pathChanged && document.language == kLanguageAuto) HighlightDocument(document);
     UpdateTabTitle(index);
+    UpdateStatusBar();
     g_app.stateDirty = true;
     return PersistAll(false);
 }
@@ -1926,13 +1955,15 @@ bool OpenFileInNewTab(const fs::path& path) {
     }
 
     std::wstring text;
-    if (!ReadTextFile(path, text)) {
+    DocumentFormat format;
+    if (!ReadTextFile(path, text, &format.encoding, &format.lineEnding)) {
         MessageBoxW(g_app.window, L"文件打开失败，请检查路径和权限。", kWindowTitle, MB_ICONERROR);
         return false;
     }
+    format.fileTimestamp = FileTimestamp(path);
 
     const int index = CreateDocument(path.wstring(), FileTitle(path), std::move(text),
-        false, false, 0, 0, 0);
+        false, false, 0, 0, 0, nullptr, format);
     if (index < 0) {
         return false;
     }
@@ -2074,6 +2105,7 @@ void SetMenuState() {
         (g_app.showLineNumbers ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, kIdToolbarWrap, MF_BYCOMMAND |
         (g_app.wordWrap ? MF_CHECKED : MF_UNCHECKED));
+    CheckDocumentMenuItems(menu);
 }
 
 HMENU CreateApplicationMenu() {
@@ -2111,10 +2143,12 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(search, MF_STRING, kIdToolbarGoto, L"跳转\tCtrl+G");
     AppendMenuW(view, MF_STRING, kIdToolbarLineNumbers, L"行号");
     AppendMenuW(view, MF_STRING, kIdToolbarWrap, L"自动换行");
-    AppendMenuW(encoding, MF_STRING, kIdToolbarEncoding, L"UTF-8");
-    AppendMenuW(language, MF_STRING, kIdToolbarFormat, L"自动检测");
-    AppendMenuW(run, MF_STRING, kIdToolbarRun, L"运行");
-    AppendMenuW(tools, MF_STRING, kIdToolbarFormat, L"格式化");
+    AppendEncodingItems(encoding);
+    for (int index = 0; index < kLanguageCount; ++index) {
+        AppendMenuW(language, MF_STRING, kIdLanguageFirst + index, kLanguageNames[index]);
+    }
+    AppendMenuW(run, MF_STRING, kIdToolbarRun, L"运行当前文件\tF5");
+    AppendMenuW(tools, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tCtrl+Shift+F");
     AppendMenuW(theme, MF_STRING, kIdThemeDark, L"深色");
     AppendMenuW(theme, MF_STRING, kIdThemeLight, L"浅色");
     AppendMenuW(theme, MF_STRING, kIdThemeGreen, L"护眼绿");
@@ -2138,9 +2172,23 @@ HMENU CreateApplicationMenu() {
     return menu;
 }
 
+struct SessionEntry {
+    std::wstring path;
+    std::wstring title;
+    fs::path snapshot;
+    int64_t caret = 0;
+    int64_t anchor = 0;
+    int firstLine = 0;
+    int horizontalScroll = 0;
+    bool modified = false;
+    bool untitled = false;
+    DocumentFormat format;
+};
+
 void LoadPersistedSession() {
     std::ifstream input(g_app.sessionPath, std::ios::binary);
     if (!input) {
+        ApplyEditorFont();
         NewDocument();
         return;
     }
@@ -2160,9 +2208,10 @@ void LoadPersistedSession() {
     int persistedStartup = g_app.launchAtStartup ? 1 : 0;
     int persistedCloseBehavior = static_cast<int>(g_app.closeBehavior);
     std::wstring persistedFontFamily = g_app.fontFamily;
-    std::vector<std::tuple<std::wstring, std::wstring, fs::path, int64_t, int64_t, int, int, bool, bool>> entries;
+    std::vector<SessionEntry> entries;
 
     while (std::getline(buffer, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         const std::vector<std::string> parts = SplitTabs(line);
         if (parts.empty()) {
             continue;
@@ -2184,25 +2233,39 @@ void LoadPersistedSession() {
         } else if (parts[0] == "PREFERENCES" && parts.size() >= 3) {
             ParseInt(parts[1], persistedStartup);
             ParseInt(parts[2], persistedCloseBehavior);
+        } else if (parts[0] == "WINDOW" && parts.size() >= 6) {
+            int left = 0, top = 0, width = 0, height = 0, maximized = 0;
+            if (ParseInt(parts[1], left) && ParseInt(parts[2], top) &&
+                ParseInt(parts[3], width) && ParseInt(parts[4], height) && width >= 300 && height >= 200) {
+                ParseInt(parts[5], maximized);
+                g_app.savedWindowRect = RECT{left, top, left + width, top + height};
+                g_app.savedWindowMaximized = maximized != 0;
+                g_app.hasSavedWindow = true;
+            }
         } else if (parts[0] == "TAB" && parts.size() >= 12) {
-            int64_t caret = 0;
-            int64_t anchor = 0;
-            int firstLine = 0;
-            int horizontalScroll = 0;
+            SessionEntry entry;
             int sourceModified = 0;
             int untitled = 0;
-            ParseInt64(parts[5], caret);
-            ParseInt64(parts[6], anchor);
-            ParseInt(parts[7], firstLine);
-            ParseInt(parts[8], horizontalScroll);
+            int64_t timestamp = 0;
+            ParseInt64(parts[5], entry.caret);
+            ParseInt64(parts[6], entry.anchor);
+            ParseInt(parts[7], entry.firstLine);
+            ParseInt(parts[8], entry.horizontalScroll);
             ParseInt(parts[9], sourceModified);
             ParseInt(parts[10], untitled);
-
-            const std::wstring path = Utf8ToWide(HexDecode(parts[2]));
-            const std::wstring title = Utf8ToWide(HexDecode(parts[3]));
-            const fs::path snapshot = fs::path(Utf8ToWide(HexDecode(parts[4])));
-            entries.emplace_back(path, title, snapshot, caret, anchor, firstLine,
-                horizontalScroll, sourceModified != 0, untitled != 0);
+            ParseInt64(parts[11], timestamp);
+            entry.modified = sourceModified != 0;
+            entry.untitled = untitled != 0;
+            entry.format.fileTimestamp = static_cast<uint64_t>(timestamp);
+            if (parts.size() >= 15) {  // per-tab format, added after 0.1.0
+                ParseInt(parts[12], entry.format.encoding);
+                ParseInt(parts[13], entry.format.lineEnding);
+                ParseInt(parts[14], entry.format.language);
+            }
+            entry.path = Utf8ToWide(HexDecode(parts[2]));
+            entry.title = Utf8ToWide(HexDecode(parts[3]));
+            entry.snapshot = fs::path(Utf8ToWide(HexDecode(parts[4])));
+            entries.push_back(std::move(entry));
         }
     }
 
@@ -2212,51 +2275,76 @@ void LoadPersistedSession() {
     g_app.sidebarVisible = false;
     g_app.fontSize = std::clamp(persistedFontSize, 10, 32);
     if (!persistedFontFamily.empty()) g_app.fontFamily = persistedFontFamily;
-    g_app.languageIndex = std::clamp(persistedLanguage, 0, 9);
-    g_app.encodingIndex = std::clamp(persistedEncoding, 0, 4);
-    g_app.lineEndingIndex = std::clamp(persistedLineEnding, 0, 2);
+    g_app.languageIndex = std::clamp(persistedLanguage, 0, kLanguageCount - 1);
+    g_app.encodingIndex = std::clamp(persistedEncoding, 0, kEncodingCount - 1);
+    g_app.lineEndingIndex = std::clamp(persistedLineEnding, 0, kLineEndingCount - 1);
     g_app.launchAtStartup = persistedStartup != 0;
     g_app.closeBehavior = static_cast<CloseBehavior>(std::clamp(persistedCloseBehavior, 0, 2));
 
-    if (entries.empty()) {
-        NewDocument();
-        return;
-    }
+    // Font and theme first, so every editor below is created with them.
+    ApplyEditorFont();
+    ApplyThemeToEditors(false);
 
     g_app.loading = true;
-    for (const auto& entry : entries) {
-        const auto& [path, title, snapshot, caret, anchor, firstLine, horizontalScroll, modified, untitled] = entry;
+    for (SessionEntry& entry : entries) {
         std::wstring text;
-        if (!snapshot.empty() && fs::exists(snapshot)) {
-            ReadTextFile(snapshot, text);
+        bool haveText = false;
+        std::error_code error;
+        const bool hasFile = !entry.untitled && !entry.path.empty() && fs::exists(entry.path, error);
+        if (!entry.modified && hasFile) {
+            // Nothing unsaved: the file on disk is the truth (it may have been
+            // edited elsewhere since last time). Re-detect its format too.
+            int encoding = 0;
+            int lineEnding = 0;
+            if (ReadTextFile(entry.path, text, &encoding, &lineEnding)) {
+                haveText = true;
+                entry.format.encoding = encoding;
+                entry.format.lineEnding = lineEnding;
+                entry.format.fileTimestamp = FileTimestamp(entry.path);
+            }
         }
-        if (text.empty() && !untitled && !path.empty()) {
-            ReadTextFile(path, text);
+        if (!haveText && !entry.snapshot.empty() && fs::exists(entry.snapshot, error)) {
+            haveText = ReadTextFile(entry.snapshot, text);
+        }
+        if (!haveText && hasFile) {
+            int encoding = 0;
+            int lineEnding = 0;
+            if (ReadTextFile(entry.path, text, &encoding, &lineEnding)) {
+                if (entry.format.encoding < 0) entry.format.encoding = encoding;
+                if (entry.format.lineEnding < 0) entry.format.lineEnding = lineEnding;
+                entry.format.fileTimestamp = FileTimestamp(entry.path);
+            }
+        }
+        // Old sessions have no per-tab format: guess it from the file itself.
+        if ((entry.format.encoding < 0 || entry.format.lineEnding < 0) && hasFile) {
+            std::wstring ignored;
+            int encoding = 0;
+            int lineEnding = 0;
+            if (ReadTextFile(entry.path, ignored, &encoding, &lineEnding)) {
+                if (entry.format.encoding < 0) entry.format.encoding = encoding;
+                if (entry.format.lineEnding < 0) entry.format.lineEnding = lineEnding;
+            }
         }
 
-        const int index = CreateDocument(path, title, std::move(text), untitled,
-            modified, caret, anchor, firstLine, &snapshot);
+        const int index = CreateDocument(entry.path, entry.title, std::move(text), entry.untitled,
+            entry.modified, entry.caret, entry.anchor, entry.firstLine, &entry.snapshot, entry.format);
         if (index >= 0) {
             TabDocument& created = g_app.documents[static_cast<size_t>(index)];
-            created.horizontalScroll = horizontalScroll;
+            created.horizontalScroll = entry.horizontalScroll;
             // A tab that had to get a fresh snapshot (missing or shared by an
             // earlier tab in an old session) must write it on the next autosave.
-            created.recoveryDirty = !SamePath(created.snapshotPath, snapshot);
+            created.recoveryDirty = !SamePath(created.snapshotPath, entry.snapshot);
         }
     }
     g_app.loading = false;
     RemoveOrphanSnapshots();
+    LayoutChildren(g_app.window);
 
     if (g_app.documents.empty()) {
         NewDocument();
         return;
     }
 
-    ApplyEditorFont();
-    ApplyThemeToEditors(false);
-    if (g_app.languageCombo) SendMessageW(g_app.languageCombo, CB_SETCURSEL, g_app.languageIndex, 0);
-    if (g_app.encodingCombo) SendMessageW(g_app.encodingCombo, CB_SETCURSEL, g_app.encodingIndex, 0);
-    if (g_app.lineEndingCombo) SendMessageW(g_app.lineEndingCombo, CB_SETCURSEL, g_app.lineEndingIndex, 0);
     SelectTab(std::clamp(activeIndex, 0, static_cast<int>(g_app.documents.size()) - 1));
     g_app.stateDirty = false;
 }
@@ -2387,6 +2475,8 @@ HACCEL CreateAccelerators() {
         { FCONTROL | FVIRTKEY, 'F', kIdToolbarFind },
         { FCONTROL | FVIRTKEY, 'H', kIdToolbarReplace },
         { FCONTROL | FVIRTKEY, 'G', kIdToolbarGoto },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'F', kIdToolbarFormat },
+        { FVIRTKEY, VK_F5, kIdToolbarRun },
         { FCONTROL | FVIRTKEY, VK_OEM_COMMA, kIdToolbarSettings }
     };
     return CreateAcceleratorTableW(accelerators, static_cast<int>(std::size(accelerators)));
@@ -2478,7 +2568,11 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             kIdSettingsFont, 160, 16, 260, 180);
         for (const wchar_t* value : {L"Consolas", L"Cascadia Mono", L"Microsoft YaHei Mono", L"Courier New"})
             SendMessageW(g_app.settingsFontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
-        SendMessageW(g_app.settingsFontCombo, CB_SETCURSEL, g_app.fontFamily == L"Consolas" ? 0 : 1, 0);
+        {
+            const LRESULT fontIndex = SendMessageW(g_app.settingsFontCombo, CB_FINDSTRINGEXACT,
+                static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(g_app.fontFamily.c_str()));
+            SendMessageW(g_app.settingsFontCombo, CB_SETCURSEL, fontIndex == CB_ERR ? 0 : fontIndex, 0);
+        }
         addLabel(L"字号", 26, 58, 120, 24);
         CreateSettingsControl(window, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP,
             kIdSettingsSize, 160, 54, 120, 180);
@@ -2518,7 +2612,7 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         return 0;
     }
     case WM_COMMAND:
-        if (LOWORD(wParam) == kIdSettingsApply) {
+        if (LOWORD(wParam) == kIdSettingsApply || LOWORD(wParam) == IDOK) {
             const int fontIndex = static_cast<int>(SendMessageW(g_app.settingsFontCombo, CB_GETCURSEL, 0, 0));
             const wchar_t* fonts[] = {L"Consolas", L"Cascadia Mono", L"Microsoft YaHei Mono", L"Courier New"};
             if (fontIndex >= 0 && fontIndex < 4) g_app.fontFamily = fonts[fontIndex];
@@ -2541,19 +2635,17 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             } else {
                 g_app.launchAtStartup = startupEnabled;
             }
-            for (const TabDocument& document : g_app.documents) {
-                LONG style = GetWindowLongW(document.editor, GWL_STYLE);
-                style = g_app.wordWrap ? (style & ~WS_HSCROLL) : (style | WS_HSCROLL);
-                SetWindowLongW(document.editor, GWL_STYLE, style);
-            }
+            ApplyWordWrapAll();
             ApplyEditorFont();
             LayoutChildren(g_app.window);
             g_app.stateDirty = true;
             PersistAll(false);
+            EnableWindow(g_app.window, TRUE);
             DestroyWindow(window);
             return 0;
         }
-        if (LOWORD(wParam) == kIdSettingsCancel) {
+        if (LOWORD(wParam) == kIdSettingsCancel || LOWORD(wParam) == IDCANCEL) {
+            EnableWindow(g_app.window, TRUE);
             DestroyWindow(window);
             return 0;
         }
@@ -2625,6 +2717,442 @@ void OpenSettingsDialog() {
     UpdateWindow(g_app.settingsWindow);
 }
 
+TabDocument* ActiveDocument() {
+    if (g_app.activeIndex < 0 || g_app.activeIndex >= static_cast<int>(g_app.documents.size())) return nullptr;
+    return &g_app.documents[static_cast<size_t>(g_app.activeIndex)];
+}
+
+void MarkActiveModified() {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    const bool wasModified = document->modified;
+    document->modified = true;
+    MarkRecoveryDirty(g_app.activeIndex);
+    if (!wasModified) UpdateTabTitle(g_app.activeIndex);
+}
+
+// Changing the encoding or line ending changes the bytes that will be written,
+// so the tab becomes modified until it is saved again.
+void SetActiveEncoding(int encoding) {
+    TabDocument* document = ActiveDocument();
+    if (!document || encoding < 0 || encoding >= kEncodingCount || document->encoding == encoding) return;
+    document->encoding = encoding;
+    MarkActiveModified();
+    UpdateStatusBar();
+}
+
+void SetActiveLineEnding(int lineEnding) {
+    TabDocument* document = ActiveDocument();
+    if (!document || lineEnding < 0 || lineEnding >= kLineEndingCount || document->lineEnding == lineEnding) return;
+    document->lineEnding = lineEnding;
+    MarkActiveModified();
+    UpdateStatusBar();
+}
+
+void SetActiveLanguage(int language) {
+    TabDocument* document = ActiveDocument();
+    if (!document || language < 0 || language >= kLanguageCount) return;
+    document->language = language;
+    HighlightDocument(*document);
+    g_app.stateDirty = true;
+    UpdateStatusBar();
+}
+
+void AppendEncodingItems(HMENU menu) {
+    for (int index = 0; index < kEncodingCount; ++index) {
+        AppendMenuW(menu, MF_STRING, kIdEncodingFirst + index, kEncodingNames[index]);
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    for (int index = 0; index < kLineEndingCount; ++index) {
+        AppendMenuW(menu, MF_STRING, kIdLineEndingFirst + index, kLineEndingMenuNames[index]);
+    }
+}
+
+void CheckDocumentMenuItems(HMENU menu) {
+    const TabDocument* document = ActiveDocument();
+    if (!menu || !document) return;
+    CheckMenuRadioItem(menu, kIdEncodingFirst, kIdEncodingFirst + kEncodingCount - 1,
+        kIdEncodingFirst + document->encoding, MF_BYCOMMAND);
+    CheckMenuRadioItem(menu, kIdLineEndingFirst, kIdLineEndingFirst + kLineEndingCount - 1,
+        kIdLineEndingFirst + document->lineEnding, MF_BYCOMMAND);
+    CheckMenuRadioItem(menu, kIdLanguageFirst, kIdLanguageFirst + kLanguageCount - 1,
+        kIdLanguageFirst + document->language, MF_BYCOMMAND);
+}
+
+void ShowEncodingMenu(HWND anchor) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendEncodingItems(menu);
+    CheckDocumentMenuItems(menu);
+    RECT rect{};
+    GetWindowRect(anchor ? anchor : g_app.toolbar, &rect);
+    const int command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
+        rect.left, rect.bottom, g_app.window, nullptr);
+    DestroyMenu(menu);
+    if (command != 0) SendMessageW(g_app.window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+}
+
+void ReloadDocumentFromDisk(int index) {
+    if (index < 0 || index >= static_cast<int>(g_app.documents.size())) return;
+    TabDocument& document = g_app.documents[static_cast<size_t>(index)];
+    std::wstring text;
+    int encoding = 0;
+    int lineEnding = 0;
+    if (!ReadTextFile(document.path, text, &encoding, &lineEnding)) {
+        MessageBoxW(g_app.window, L"重新加载失败，请检查文件权限。", kWindowTitle, MB_ICONERROR);
+        return;
+    }
+    CHARRANGE selection{};
+    SendMessageW(document.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    {
+        EditorEventMute mute(document.editor);
+        SetWindowTextW(document.editor, text.c_str());
+        SendMessageW(document.editor, EM_SETMODIFY, FALSE, 0);
+    }
+    document.encoding = encoding;
+    document.lineEnding = lineEnding;
+    document.modified = false;
+    document.fileTimestamp = FileTimestamp(document.path);
+    MarkRecoveryDirty(index);
+    HighlightDocument(document);
+    const LONG length = GetWindowTextLengthW(document.editor);
+    selection.cpMin = std::min(selection.cpMin, length);
+    selection.cpMax = std::min(selection.cpMax, length);
+    SendMessageW(document.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    UpdateTabTitle(index);
+    UpdateStatusBar();
+    RefreshGutter();
+}
+
+// Compares each file's last write time with the one we loaded/saved. Runs when
+// the app is activated, so edits made in other programs are noticed.
+void CheckExternalChanges() {
+    if (g_app.checkingExternalChanges || g_app.closing) return;
+    g_app.checkingExternalChanges = true;
+    for (size_t index = 0; index < g_app.documents.size(); ++index) {
+        TabDocument& document = g_app.documents[index];
+        if (document.untitled || document.path.empty()) continue;
+        std::error_code error;
+        const std::wstring path = document.path;
+        if (!fs::exists(path, error)) {
+            if (document.fileTimestamp == 0) continue;  // already reported
+            document.fileTimestamp = 0;
+            if (!document.modified) {
+                document.modified = true;
+                MarkRecoveryDirty(static_cast<int>(index));
+                UpdateTabTitle(static_cast<int>(index));
+            }
+            SelectTab(static_cast<int>(index));
+            const std::wstring message = L"文件已被删除或移动：\n" + path +
+                L"\n\n内容仍保留在当前标签中，保存即可重新写回磁盘。";
+            MessageBoxW(g_app.window, message.c_str(), kWindowTitle, MB_ICONWARNING);
+            continue;
+        }
+        const uint64_t timestamp = FileTimestamp(path);
+        if (timestamp == 0 || timestamp == document.fileTimestamp) continue;
+        if (document.fileTimestamp == 0) {  // unknown before (old session, re-created file)
+            document.fileTimestamp = timestamp;
+            continue;
+        }
+        const bool modified = document.modified;
+        document.fileTimestamp = timestamp;  // ask only once per external change
+        SelectTab(static_cast<int>(index));
+        const std::wstring message = modified
+            ? L"文件已在其他程序中被修改：\n" + path +
+              L"\n\n当前标签也有未保存的修改，重新加载会丢弃这些修改。是否重新加载？"
+            : L"文件已在其他程序中被修改：\n" + path + L"\n\n是否重新加载？";
+        const int choice = MessageBoxW(g_app.window, message.c_str(), kWindowTitle,
+            MB_YESNO | MB_ICONQUESTION | (modified ? MB_DEFBUTTON2 : 0));
+        if (choice == IDYES) ReloadDocumentFromDisk(static_cast<int>(index));
+    }
+    g_app.checkingExternalChanges = false;
+    SetMenuState();
+}
+
+// ---- Go to line -----------------------------------------------------------
+
+constexpr int kIdGotoEdit = 1901;
+
+void CloseGotoDialog() {
+    if (!g_app.gotoWindow) return;
+    EnableWindow(g_app.window, TRUE);  // before destroying, so focus returns here
+    DestroyWindow(g_app.gotoWindow);
+}
+
+LRESULT CALLBACK GotoProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        const TabDocument* document = ActiveDocument();
+        const int lineCount = document
+            ? static_cast<int>(SendMessageW(document->editor, EM_GETLINECOUNT, 0, 0)) : 1;
+        int currentLine = 1;
+        if (document) {
+            CHARRANGE selection{};
+            SendMessageW(document->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+            currentLine = static_cast<int>(SendMessageW(document->editor, EM_EXLINEFROMCHAR, 0, selection.cpMax)) + 1;
+        }
+        wchar_t label[64]{};
+        swprintf_s(label, L"行号（1 - %d）：", lineCount);
+        HWND text = CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE,
+            16, 18, 260, 20, window, nullptr, g_app.instance, nullptr);
+        g_app.gotoEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", std::to_wstring(currentLine).c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL,
+            16, 42, 280, 26, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdGotoEdit)),
+            g_app.instance, nullptr);
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"跳转", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            126, 82, 82, 28, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_app.instance, nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            214, 82, 82, 28, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
+        for (HWND control : {text, g_app.gotoEdit, ok, cancel}) {
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        }
+        SendMessageW(g_app.gotoEdit, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK) {
+            TabDocument* document = ActiveDocument();
+            wchar_t buffer[32]{};
+            GetWindowTextW(g_app.gotoEdit, buffer, static_cast<int>(std::size(buffer)));
+            const int requested = _wtoi(buffer);
+            if (document && requested > 0) {
+                const int lineCount = static_cast<int>(SendMessageW(document->editor, EM_GETLINECOUNT, 0, 0));
+                const int line = std::clamp(requested, 1, std::max(1, lineCount));
+                const LRESULT position = SendMessageW(document->editor, EM_LINEINDEX, line - 1, 0);
+                if (position >= 0) {
+                    SendMessageW(document->editor, EM_SETSEL, position, position);
+                    SendMessageW(document->editor, EM_SCROLLCARET, 0, 0);
+                }
+                CloseGotoDialog();
+                SetFocus(document->editor);
+                RefreshGutter();
+                UpdateStatusBar();
+            } else {
+                MessageBeep(MB_ICONWARNING);
+            }
+            return 0;
+        }
+        if (LOWORD(wParam) == IDCANCEL) {
+            CloseGotoDialog();
+            if (TabDocument* document = ActiveDocument()) SetFocus(document->editor);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        CloseGotoDialog();
+        return 0;
+    case WM_DESTROY:
+        g_app.gotoWindow = nullptr;
+        g_app.gotoEdit = nullptr;
+        EnableWindow(g_app.window, TRUE);
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.windowBrush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, CurrentPalette().controlText);
+        SetBkColor(dc, CurrentPalette().windowBackground);
+        return reinterpret_cast<LRESULT>(g_app.windowBrush);
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void OpenGotoDialog() {
+    if (g_app.gotoWindow) {
+        SetForegroundWindow(g_app.gotoWindow);
+        return;
+    }
+    if (!ActiveDocument()) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{};
+        klass.hInstance = g_app.instance;
+        klass.lpfnWndProc = GotoProc;
+        klass.lpszClassName = L"MCnotepadGoto";
+        klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        registered = RegisterClassW(&klass) != 0;
+    }
+    RECT owner{};
+    GetWindowRect(g_app.window, &owner);
+    const int width = 330;
+    const int height = 170;
+    g_app.gotoWindow = CreateWindowExW(WS_EX_DLGMODALFRAME, L"MCnotepadGoto", L"跳转到行",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        owner.left + (owner.right - owner.left - width) / 2, owner.top + 120, width, height,
+        g_app.window, nullptr, g_app.instance, nullptr);
+    if (!g_app.gotoWindow) return;
+    EnableWindow(g_app.window, FALSE);
+    ShowWindow(g_app.gotoWindow, SW_SHOW);
+    SetFocus(g_app.gotoEdit);
+}
+
+// ---- Format ---------------------------------------------------------------
+
+int LineOfOffset(std::wstring_view text, size_t offset) {
+    int line = 1;
+    for (size_t i = 0; i < offset && i < text.size(); ++i) {
+        if (text[i] == L'\n' || (text[i] == L'\r' && (i + 1 >= text.size() || text[i + 1] != L'\n'))) ++line;
+    }
+    return line;
+}
+
+// Re-indents JSON with 4 spaces. Only brackets and strings are checked; it is a
+// pretty-printer, not a full validator.
+bool FormatJson(std::wstring_view input, std::wstring& output, std::wstring& error) {
+    output.clear();
+    output.reserve(input.size() * 2);
+    std::vector<wchar_t> stack;
+    int indent = 0;
+    bool inString = false;
+    const auto newline = [&] {
+        output += L"\r\n";
+        output.append(static_cast<size_t>(std::max(0, indent)) * 4, L' ');
+    };
+    const auto fail = [&](size_t offset, const wchar_t* what) {
+        error = L"第 " + std::to_wstring(LineOfOffset(input, offset)) + L" 行：" + what;
+        return false;
+    };
+    for (size_t i = 0; i < input.size(); ++i) {
+        const wchar_t c = input[i];
+        if (inString) {
+            output += c;
+            if (c == L'\\' && i + 1 < input.size()) output += input[++i];
+            else if (c == L'"') inString = false;
+            else if (c == L'\r' || c == L'\n') return fail(i, L"字符串中不能换行");
+            continue;
+        }
+        switch (c) {
+        case L' ': case L'\t': case L'\r': case L'\n': case 0xFEFF:
+            break;
+        case L'"':
+            inString = true;
+            output += c;
+            break;
+        case L'{':
+        case L'[': {
+            const wchar_t close = c == L'{' ? L'}' : L']';
+            size_t next = i + 1;
+            while (next < input.size() && std::iswspace(input[next])) ++next;
+            output += c;
+            if (next < input.size() && input[next] == close) {
+                output += close;
+                i = next;
+            } else {
+                stack.push_back(c);
+                ++indent;
+                newline();
+            }
+            break;
+        }
+        case L'}':
+        case L']': {
+            const wchar_t open = c == L'}' ? L'{' : L'[';
+            if (stack.empty() || stack.back() != open) return fail(i, L"括号不匹配");
+            stack.pop_back();
+            --indent;
+            newline();
+            output += c;
+            break;
+        }
+        case L',':
+            if (stack.empty()) return fail(i, L"多余的逗号");
+            output += c;
+            newline();
+            break;
+        case L':':
+            output += L": ";
+            break;
+        default:
+            output += c;
+            break;
+        }
+    }
+    if (inString) return fail(input.size(), L"字符串没有闭合");
+    if (!stack.empty()) return fail(input.size(), L"括号没有闭合");
+    return true;
+}
+
+void FormatActiveDocument() {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    const std::wstring text = GetWindowTextValue(document->editor);
+    const size_t first = text.find_first_not_of(L" \t\r\n\xFEFF");
+    if (first == std::wstring::npos) return;
+    const int language = EffectiveLanguage(*document);
+    const bool looksLikeJson = text[first] == L'{' || text[first] == L'[';
+    if (language != kLanguageJson && !(language == kLanguagePlain && looksLikeJson)) {
+        MessageBoxW(g_app.window, L"目前“格式化”只支持 JSON 文档。\n可以在“语言”菜单中把当前标签设为 JSON。",
+            kWindowTitle, MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring formatted;
+    std::wstring error;
+    if (!FormatJson(text, formatted, error)) {
+        MessageBoxW(g_app.window, (L"JSON 格式化失败。\n" + error).c_str(), kWindowTitle, MB_ICONWARNING);
+        return;
+    }
+    // Replace through the selection so the change can be undone with Ctrl+Z.
+    SendMessageW(document->editor, EM_SETSEL, 0, -1);
+    SendMessageW(document->editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(formatted.c_str()));
+    SendMessageW(document->editor, EM_SETSEL, 0, 0);
+    HighlightDocument(*document);
+    RefreshGutter();
+}
+
+// ---- Run ------------------------------------------------------------------
+
+void RunActiveDocument() {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    const int index = g_app.activeIndex;
+    if (document->untitled || document->modified) {
+        if (!SaveDocument(index, false)) return;
+        document = &g_app.documents[static_cast<size_t>(index)];
+    }
+    const fs::path path = document->path;
+    const std::wstring directory = path.parent_path().wstring();
+    std::wstring extension = path.extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+
+    if (extension == L".html" || extension == L".htm" || extension == L".svg") {
+        const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(g_app.window, L"open",
+            path.c_str(), nullptr, directory.c_str(), SW_SHOWNORMAL));
+        if (result <= 32) MessageBoxW(g_app.window, L"无法用默认程序打开该文件。", kWindowTitle, MB_ICONWARNING);
+        return;
+    }
+
+    const std::wstring quoted = L"\"" + path.wstring() + L"\"";
+    std::wstring command;
+    if (extension == L".bat" || extension == L".cmd") command = L"cmd.exe /k call " + quoted;
+    else if (extension == L".ps1") command = L"powershell.exe -NoLogo -NoExit -File " + quoted;
+    else if (extension == L".py" || extension == L".pyw") command = L"cmd.exe /k python " + quoted;
+    else if (extension == L".js" || extension == L".mjs" || extension == L".cjs") command = L"cmd.exe /k node " + quoted;
+    if (command.empty()) {
+        MessageBoxW(g_app.window,
+            L"暂不支持运行这种类型的文件。\n支持：.bat .cmd .ps1 .py .js，以及在浏览器中打开 .html。",
+            kWindowTitle, MB_ICONINFORMATION);
+        return;
+    }
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE,
+            nullptr, directory.empty() ? nullptr : directory.c_str(), &startup, &process)) {
+        MessageBoxW(g_app.window, L"启动失败，请确认对应的解释器已安装并在 PATH 中。", kWindowTitle, MB_ICONERROR);
+        return;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (g_app.findReplaceMessage != 0 && message == g_app.findReplaceMessage) {
         HandleFindReplaceMessage(lParam);
@@ -2646,7 +3174,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         GdiplusStartupInput gdiplusInput;
         GdiplusStartup(&g_app.gdiplusToken, &gdiplusInput, nullptr);
         LoadToolbarIconImages();
-        LoadToolbarIconFont();
         g_app.editorBrush = CreateSolidBrush(CurrentPalette().editorBackground);
         g_app.toolbarBrush = CreateSolidBrush(CurrentPalette().toolbarBackground);
         g_app.sidebarBrush = CreateSolidBrush(CurrentPalette().panelBackground);
@@ -2725,26 +3252,20 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             UpdateStatusBar();
             return 0;
         }
-        if (notification == CBN_SELCHANGE) {
-            if (source == g_app.languageCombo) {
-                g_app.languageIndex = static_cast<int>(SendMessageW(source, CB_GETCURSEL, 0, 0));
-                for (const TabDocument& document : g_app.documents) ApplySimpleSyntaxHighlight(document.editor);
-                UpdateStatusBar();
-                g_app.stateDirty = true;
-                return 0;
-            }
-            if (source == g_app.encodingCombo) {
-                g_app.encodingIndex = static_cast<int>(SendMessageW(source, CB_GETCURSEL, 0, 0));
-                UpdateStatusBar();
-                g_app.stateDirty = true;
-                return 0;
-            }
-            if (source == g_app.lineEndingCombo) {
-                g_app.lineEndingIndex = static_cast<int>(SendMessageW(source, CB_GETCURSEL, 0, 0));
-                UpdateStatusBar();
-                g_app.stateDirty = true;
-                return 0;
-            }
+        if (command >= kIdEncodingFirst && command < kIdEncodingFirst + kEncodingCount) {
+            SetActiveEncoding(command - kIdEncodingFirst);
+            SetMenuState();
+            return 0;
+        }
+        if (command >= kIdLineEndingFirst && command < kIdLineEndingFirst + kLineEndingCount) {
+            SetActiveLineEnding(command - kIdLineEndingFirst);
+            SetMenuState();
+            return 0;
+        }
+        if (command >= kIdLanguageFirst && command < kIdLanguageFirst + kLanguageCount) {
+            SetActiveLanguage(command - kIdLanguageFirst);
+            SetMenuState();
+            return 0;
         }
 
         switch (command) {
@@ -2758,27 +3279,25 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToolbarRedo: HandleEditCommand(kIdEditRedo); break;
         case kIdToolbarFind: OpenFindDialog(false); break;
         case kIdToolbarReplace: OpenFindDialog(true); break;
-        case kIdToolbarGoto: OpenFindDialog(false); break;
+        case kIdToolbarGoto: OpenGotoDialog(); break;
+        case kIdToolbarFormat: FormatActiveDocument(); break;
+        case kIdToolbarRun: RunActiveDocument(); break;
+        case kIdToolbarEncoding:
+            ShowEncodingMenu(source ? source : g_app.toolbar);
+            break;
         case kIdToolbarLineNumbers:
             g_app.showLineNumbers = !g_app.showLineNumbers;
+            g_app.stateDirty = true;
             LayoutChildren(window);
             break;
         case kIdToolbarWrap:
             g_app.wordWrap = !g_app.wordWrap;
-            for (const TabDocument& document : g_app.documents) {
-                LONG style = GetWindowLongW(document.editor, GWL_STYLE);
-                style = g_app.wordWrap ? (style & ~WS_HSCROLL) : (style | WS_HSCROLL);
-                SetWindowLongW(document.editor, GWL_STYLE, style);
-            }
+            g_app.stateDirty = true;
+            ApplyWordWrapAll();
             LayoutChildren(window);
             break;
         case kIdToolbarTheme:
             ShowThemeMenu(source ? source : g_app.toolbar);
-            break;
-        case kIdSidebarClose:
-            g_app.sidebarVisible = false;
-            g_app.stateDirty = true;
-            LayoutChildren(window);
             break;
         case kIdToolbarSettings:
             OpenSettingsDialog();
@@ -2825,7 +3344,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (item != nullptr) {
             if (item->CtlType == ODT_TAB) DrawTabItem(*item);
             else if (item->CtlType == ODT_COMBOBOX) DrawComboItem(*item);
-            else if (item->CtlID >= kIdThemeDark && item->CtlID <= kIdThemeBlue) DrawThemeItem(*item);
             else DrawToolbarItem(*item);
         }
         return TRUE;
@@ -2863,11 +3381,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             SetBkColor(dc, palette.toolbarBackground);
             return reinterpret_cast<LRESULT>(g_app.toolbarBrush);
         }
-        if (control == g_app.sidebar || GetParent(control) == g_app.sidebar) {
-            SetTextColor(dc, palette.controlText);
-            SetBkColor(dc, palette.panelBackground);
-            return reinterpret_cast<LRESULT>(g_app.sidebarBrush);
-        }
         if (control == g_app.statusBar) {
             SetTextColor(dc, palette.statusText);
             SetBkColor(dc, palette.statusBackground);
@@ -2879,6 +3392,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     case WM_NOTIFY: {
         const NMHDR* header = reinterpret_cast<const NMHDR*>(lParam);
+        if (header != nullptr && header->code == EN_SELCHANGE) {
+            UpdateStatusBar();
+            return 0;
+        }
         if (header != nullptr && header->hwndFrom == g_app.tabs && header->code == TCN_SELCHANGE) {
             SelectTab(TabCtrl_GetCurSel(g_app.tabs));
             SetMenuState();
@@ -2920,6 +3437,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         PostMessageW(window, kMessageOpenPendingFiles, 0, 0);
         return TRUE;
     }
+    case WM_ACTIVATEAPP:
+        if (wParam) PostMessageW(window, kMessageCheckExternalChanges, 0, 0);
+        return 0;
+    case kMessageCheckExternalChanges:
+        CheckExternalChanges();
+        return 0;
     case kMessageOpenPendingFiles: {
         std::vector<std::wstring> files;
         files.swap(g_app.pendingOpenFiles);
@@ -2943,10 +3466,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_DESTROY:
         DeleteObject(g_app.editorBrush);
         g_app.toolbarIconImages.clear();
-        DeleteObject(g_app.toolbarIconFont);
-        if (!g_app.toolbarIconFontPath.empty()) {
-            RemoveFontResourceExW(g_app.toolbarIconFontPath.c_str(), FR_PRIVATE, nullptr);
-        }
         DeleteObject(g_app.toolbarBrush);
         DeleteObject(g_app.sidebarBrush);
         DeleteObject(g_app.windowBrush);
@@ -3070,13 +3589,35 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
         return 1;
     }
 
-    ShowWindow(window, showCommand);
+    // Restore the previous size/position, but only if it is still on a monitor.
+    if (g_app.hasSavedWindow && MonitorFromRect(&g_app.savedWindowRect, MONITOR_DEFAULTTONULL) != nullptr) {
+        WINDOWPLACEMENT placement{};
+        placement.length = sizeof(placement);
+        GetWindowPlacement(window, &placement);
+        placement.rcNormalPosition = g_app.savedWindowRect;
+        placement.showCmd = g_app.savedWindowMaximized ? SW_SHOWMAXIMIZED
+            : (showCommand == SW_SHOWMINIMIZED || showCommand == SW_MINIMIZE ? showCommand : SW_SHOWNORMAL);
+        SetWindowPlacement(window, &placement);
+    } else {
+        ShowWindow(window, showCommand);
+    }
     UpdateWindow(window);
     OpenCommandLineFiles();
+    PostMessageW(window, kMessageCheckExternalChanges, 0, 0);
 
     HACCEL accelerators = CreateAccelerators();
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        // Modeless dialogs first: gives them Tab/Enter/Esc handling and keeps the
+        // main window's Ctrl+C/V/Z accelerators from hijacking their text boxes.
+        bool handled = false;
+        for (HWND dialog : {g_app.findDialog, g_app.gotoWindow, g_app.settingsWindow}) {
+            if (dialog && IsWindow(dialog) && IsDialogMessageW(dialog, &message)) {
+                handled = true;
+                break;
+            }
+        }
+        if (handled) continue;
         if (!TranslateAcceleratorW(window, accelerators, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
