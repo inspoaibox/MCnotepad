@@ -113,6 +113,8 @@ constexpr int kIdCompareFiles = 1230;
 constexpr int kIdCompareWithFile = 1231;
 constexpr int kIdCompareFolders = 1232;
 constexpr int kIdCompareStructure = 1233;
+constexpr int kIdOpenLogViewer = 1234;
+constexpr int kIdToggleToolbox = 1235;
 constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
@@ -291,6 +293,11 @@ struct AppState {
     std::vector<std::wstring> pendingOpenFiles;
     std::wstring statusNotice;
     int searchPanelHeight = 340;
+    HWND toolboxPanel = nullptr;
+    bool toolboxVisible = false;
+    int toolboxWidth = 380;           // at 96 DPI
+    unsigned toolboxMask = 0x3FF;     // tools shown in the toolbox
+    int toolboxTool = 0;
     HWND searchPanel = nullptr;
     bool searchPanelVisible = false;
     HMENU searchHistoryMenu = nullptr;
@@ -365,6 +372,7 @@ void ShowNotice(const std::wstring& text);
 void ApplyToolResult(TabDocument& document, CHARRANGE range, const std::wstring& result, int mode,
     const std::wstring& toolName, std::wstring notice);
 void ApplySearchPanelTheme();
+void ApplyToolboxTheme();
 void HideSearchPanel();
 bool EncodeTextBytes(std::wstring_view text, int encoding, std::string& bytes);
 void ShowEditorContextMenu(HWND editor, POINT screen);
@@ -2809,7 +2817,9 @@ void LayoutChildren(HWND window) {
         MoveWindow(g_app.searchPanel, 0, contentY + contentHeight, width, panelHeight, TRUE);
         ShowWindow(g_app.searchPanel, panelHeight > 0 ? SW_SHOW : SW_HIDE);
     }
-    const int editorWidth = width;
+    const int toolboxWidth = g_app.toolboxVisible && g_app.toolboxPanel ? std::min(Scale(g_app.toolboxWidth), std::max(0, width - Scale(320))) : 0;
+    if (g_app.toolboxPanel) MoveWindow(g_app.toolboxPanel, width - toolboxWidth, contentY, toolboxWidth, contentHeight, TRUE);
+    const int editorWidth = width - toolboxWidth;
     HWND activeEditor = (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size()))
         ? g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor : nullptr;
     g_app.gutterWidth = GutterWidthFor(activeEditor);
@@ -2891,6 +2901,7 @@ bool SaveSessionFile() {
            << g_app.languageIndex << '\t'
            << g_app.encodingIndex << '\t'
            << g_app.lineEndingIndex << "\n";
+    output << "TOOLBOX\t" << (g_app.toolboxVisible ? 1 : 0) << '\t' << g_app.toolboxWidth << '\t' << g_app.toolboxMask << '\t' << g_app.toolboxTool << "\n";
     output << "PREFERENCES\t" << (g_app.launchAtStartup ? 1 : 0) << '\t'
            << static_cast<int>(g_app.closeBehavior) << '\t'
            << (g_app.previewTextTools ? 1 : 0) << '\t'
@@ -3261,6 +3272,8 @@ bool SaveDocument(int index, bool saveAs) {
     return PersistAll(false);
 }
 
+bool OpenLogViewer(const std::wstring& path);
+
 bool OpenFileInNewTab(const fs::path& path) {
     for (size_t index = 0; index < g_app.documents.size(); ++index) {
         const TabDocument& existing = g_app.documents[index];
@@ -3268,6 +3281,16 @@ bool OpenFileInNewTab(const fs::path& path) {
             SelectTab(static_cast<int>(index));
             return true;
         }
+    }
+
+    std::error_code sizeError;
+    const uintmax_t bytes = fs::file_size(path, sizeError);
+    if (!sizeError && bytes > (100ull << 20)) {
+        const std::wstring question = L"“" + path.filename().wstring() + L"”有 " + std::to_wstring(bytes >> 20) +
+            L" MB。\n\n是：用日志查看器打开（只读，不整体载入内存，支持筛选和实时跟踪）\n否：仍在编辑器中打开（可能很慢、占用大量内存）";
+        const int choice = MessageBoxW(g_app.window, question.c_str(), kWindowTitle, MB_YESNOCANCEL | MB_ICONQUESTION);
+        if (choice == IDCANCEL) return false;
+        if (choice == IDYES) return OpenLogViewer(path.wstring());
     }
 
     std::wstring text;
@@ -3494,12 +3517,15 @@ HMENU CreateApplicationMenu() {
         AppendMenuW(language, MF_STRING, kIdLanguageFirst + index, kLanguageNames[index]);
     }
     AppendMenuW(run, MF_STRING, kIdToolbarRun, L"运行当前文件\tF5");
+    AppendMenuW(tools, MF_STRING, kIdToggleToolbox, L"开发者工具箱\tCtrl+Shift+D");
     AppendMenuW(tools, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tShift+Alt+F");
     AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(tools, MF_STRING, kIdCompareWithFile, L"比较当前文件与...");
     AppendMenuW(tools, MF_STRING, kIdCompareFiles, L"比较两个文件...");
     AppendMenuW(tools, MF_STRING, kIdCompareStructure, L"结构化比较 (JSON/CSV/YAML)...");
     AppendMenuW(tools, MF_STRING, kIdCompareFolders, L"比较文件夹...");
+    AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(tools, MF_STRING, kIdOpenLogViewer, L"日志查看器（大文件）...");
     AppendMenuW(theme, MF_STRING, kIdThemeDark, L"深色");
     AppendMenuW(theme, MF_STRING, kIdThemeLight, L"浅色");
     AppendMenuW(theme, MF_STRING, kIdThemeGreen, L"护眼绿");
@@ -3581,6 +3607,17 @@ void LoadPersistedSession() {
             ParseInt(parts[6], persistedLanguage);
             ParseInt(parts[7], persistedEncoding);
             ParseInt(parts[8], persistedLineEnding);
+        } else if (parts[0] == "TOOLBOX" && parts.size() >= 5) {
+            int visible = 0, width = 380, mask = 0x3FF, tool = 0;
+            ParseInt(parts[1], visible);
+            ParseInt(parts[2], width);
+            ParseInt(parts[3], mask);
+            ParseInt(parts[4], tool);
+            g_app.toolboxVisible = visible != 0;
+            g_app.toolboxWidth = std::clamp(width, 260, 900);
+            g_app.toolboxMask = static_cast<unsigned>(mask) & 0x3FF;
+            if (!g_app.toolboxMask) g_app.toolboxMask = 0x3FF;
+            g_app.toolboxTool = std::clamp(tool, 0, 9);
         } else if (parts[0] == "PREFERENCES" && parts.size() >= 3) {
             ParseInt(parts[1], persistedStartup);
             ParseInt(parts[2], persistedCloseBehavior);
@@ -3719,6 +3756,7 @@ void InitializeStorage() {
 
 void CompareFiles(const std::wstring& leftPath, const std::wstring& rightPath, bool structure = false);
 void CompareFolderPaths(const std::wstring& left, const std::wstring& right);
+bool OpenLogViewer(const std::wstring& path);
 
 void OpenCommandLineFiles() {
     int argumentCount = 0;
@@ -3730,6 +3768,10 @@ void OpenCommandLineFiles() {
     for (int index = 1; index < argumentCount; ++index) {
         const std::wstring argument = arguments[index];
         if (argument == L"--new-instance" || argument == L"--portable") {
+            continue;
+        }
+        if (argument == L"--log" && index + 1 < argumentCount) {
+            OpenLogViewer(fs::absolute(fs::path(arguments[++index])).wstring());
             continue;
         }
         if ((argument == L"--diff" || argument == L"--diff-struct") && index + 2 < argumentCount) {
@@ -3947,6 +3989,7 @@ HACCEL CreateAccelerators() {
         { FALT | FSHIFT | FVIRTKEY, 'F', kIdToolbarFormat },
         { FCONTROL | FSHIFT | FVIRTKEY, 'F', kIdSearchInFolder },
         { FCONTROL | FSHIFT | FVIRTKEY, 'H', kIdReplaceInFolder },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'D', kIdToggleToolbox },
         { FVIRTKEY, VK_F5, kIdToolbarRun },
         { FVIRTKEY, VK_F2, kIdFileRename },
         { FCONTROL | FVIRTKEY, VK_OEM_COMMA, kIdToolbarSettings },
@@ -3958,7 +4001,7 @@ HACCEL CreateAccelerators() {
 
 void HandleEditCommand(int command) {
     HWND focus = GetFocus();
-    if (focus && g_app.searchPanel && IsChild(g_app.searchPanel, focus)) {
+    if (focus && ((g_app.searchPanel && IsChild(g_app.searchPanel, focus)) || (g_app.toolboxPanel && IsChild(g_app.toolboxPanel, focus)))) {
         wchar_t className[32]{};
         GetClassNameW(focus, className, 32);
         if (_wcsicmp(className, L"Edit") == 0) {
@@ -5820,6 +5863,7 @@ void CreateChrome(HWND window) {
 
 void RefreshChrome() {
     ApplySearchPanelTheme();
+    ApplyToolboxTheme();
     for (HWND window : {g_app.menuBar, g_app.toolbar, g_app.tabs, g_app.statusBar}) {
         if (window) InvalidateRect(window, nullptr, FALSE);
     }
@@ -9101,6 +9145,7 @@ LRESULT CALLBACK SearchPanelProc(HWND panel, UINT message, WPARAM wParam, LPARAM
         g_app.searchPanel = panel;
         CreateSearchPanelControls();
         ApplySearchPanelTheme();
+        ApplyToolboxTheme();
         return 0;
     case WM_SIZE:
         LayoutSearchPanel();
@@ -9725,6 +9770,983 @@ void UndoLastReplaceInFiles() {
         for (size_t i = 0; i < failures.size() && i < 12; ++i) message += L"• " + failures[i] + L"\n";
     }
     MessageBoxW(g_app.window, message.c_str(), kWindowTitle, failures.empty() ? MB_ICONINFORMATION : MB_ICONWARNING);
+}
+
+// ===========================================================================
+// Developer toolbox: a sidebar that works on the editor's selection.
+// ===========================================================================
+
+enum ToolboxTool : int {
+    kToolJson = 0, kToolBase64, kToolUrl, kToolJwt, kToolTimestamp, kToolHash, kToolRegex, kToolUnicode, kToolHtml, kToolUuid, kToolCount
+};
+
+const wchar_t* const kToolboxNames[kToolCount] = {
+    L"JSON", L"Base64", L"URL", L"JWT 解码", L"时间戳", L"哈希 (MD5/SHA)", L"正则测试", L"Unicode 转义", L"HTML 实体", L"UUID 生成"};
+
+std::vector<std::wstring> ToolboxActions(int tool) {
+    switch (tool) {
+    case kToolJson: return {L"格式化", L"压缩为一行", L"校验"};
+    case kToolBase64: return {L"编码", L"解码"};
+    case kToolUrl: return {L"编码", L"解码", L"解析 URL"};
+    case kToolUnicode: return {L"转义 (\\uXXXX)", L"还原"};
+    case kToolHtml: return {L"编码", L"解码"};
+    default: return {};
+    }
+}
+
+enum ToolboxControl : int {
+    kTbTool = 4401, kTbAction, kTbPattern, kTbReplace, kTbIgnoreCase, kTbFollow, kTbTake, kTbInput, kTbOutput, kTbCopy, kTbApply,
+    kTbStatus, kTbClose, kTbCustomize, kTbPatternLabel, kTbReplaceLabel, kTbInputLabel, kTbOutputLabel, kTbTitle,
+};
+
+struct ToolboxState {
+    HWND panel = nullptr;
+    HWND tool = nullptr, action = nullptr, pattern = nullptr, replace = nullptr, ignoreCase = nullptr, follow = nullptr;
+    HWND input = nullptr, output = nullptr, status = nullptr;
+    std::vector<int> shown;      // tools in the dropdown
+    bool dragging = false;
+    int dragStartX = 0, dragStartWidth = 0;
+    bool settingInput = false;
+} g_toolbox;
+
+constexpr UINT_PTR kTimerToolboxRun = 1;
+void ToggleToolbox(bool show);
+constexpr UINT_PTR kTimerToolboxSelection = 2;
+
+std::wstring TrimSpace(std::wstring_view text) {
+    size_t first = 0, last = text.size();
+    while (first < last && (iswspace(text[first]) || text[first] == 0x3000)) ++first;
+    while (last > first && (iswspace(text[last - 1]) || text[last - 1] == 0x3000)) --last;
+    return std::wstring(text.substr(first, last - first));
+}
+
+std::wstring ToCrLf(std::wstring_view text) {
+    std::wstring out;
+    out.reserve(text.size() + text.size() / 16);
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\r') { out += L"\r\n"; if (i + 1 < text.size() && text[i + 1] == L'\n') ++i; }
+        else if (text[i] == L'\n') out += L"\r\n";
+        else out += text[i];
+    }
+    return out;
+}
+
+// ---- The tools ---------------------------------------------------------------------------
+
+std::wstring HashHex(const std::string& bytes, ALG_ID algorithm) {
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
+    std::wstring result;
+    if (!CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) return L"（不可用）";
+    if (CryptCreateHash(provider, algorithm, 0, 0, &hash)) {
+        bool ok = true;
+        for (size_t offset = 0; offset < bytes.size() && ok; offset += 1u << 30) {
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(bytes.size() - offset, 1u << 30));
+            ok = CryptHashData(hash, reinterpret_cast<const BYTE*>(bytes.data() + offset), chunk, 0) != FALSE;
+        }
+        DWORD size = 0, sizeLength = sizeof(size);
+        if (ok && CryptGetHashParam(hash, HP_HASHSIZE, reinterpret_cast<BYTE*>(&size), &sizeLength, 0)) {
+            std::vector<BYTE> value(size);
+            if (CryptGetHashParam(hash, HP_HASHVAL, value.data(), &size, 0)) {
+                static const wchar_t hex[] = L"0123456789abcdef";
+                for (const BYTE b : value) { result += hex[b >> 4]; result += hex[b & 15]; }
+            }
+        }
+        CryptDestroyHash(hash);
+    }
+    CryptReleaseContext(provider, 0);
+    return result;
+}
+
+// Strict JSON (RFC 8259) check with a line/column message.
+class JsonValidator {
+public:
+    explicit JsonValidator(std::wstring_view text) : text_(text) {}
+    bool Run(std::wstring& error) {
+        Space();
+        if (position_ < text_.size() && text_[position_] == 0xFEFF) { ++position_; Space(); }
+        if (!Value(0)) { error = Where() + message_; return false; }
+        Space();
+        if (position_ < text_.size()) { error = Where() + L"JSON 结束后还有多余的内容"; return false; }
+        return true;
+    }
+
+private:
+    std::wstring Where() const {
+        size_t line = 1, column = 1;
+        for (size_t i = 0; i < position_ && i < text_.size(); ++i) {
+            if (text_[i] == L'\n') { ++line; column = 1; } else if (text_[i] != L'\r') ++column;
+        }
+        return L"第 " + std::to_wstring(line) + L" 行第 " + std::to_wstring(column) + L" 列：";
+    }
+    void Space() { while (position_ < text_.size() && (text_[position_] == L' ' || text_[position_] == L'\t' || text_[position_] == L'\n' || text_[position_] == L'\r')) ++position_; }
+    bool Fail(const wchar_t* message) { message_ = message; return false; }
+    bool Literal(const wchar_t* word) {
+        const size_t n = wcslen(word);
+        if (text_.substr(position_, n) != word) return Fail(L"无法识别的值");
+        position_ += n;
+        return true;
+    }
+    bool String() {
+        ++position_;
+        while (position_ < text_.size()) {
+            const wchar_t c = text_[position_];
+            if (c == L'"') { ++position_; return true; }
+            if (c < 0x20) return Fail(L"字符串中不能直接包含换行或控制字符");
+            if (c == L'\\') {
+                if (++position_ >= text_.size()) break;
+                const wchar_t e = text_[position_];
+                if (e == L'u') {
+                    for (int k = 1; k <= 4; ++k) if (position_ + k >= text_.size() || !iswxdigit(text_[position_ + k])) return Fail(L"\\u 后应为 4 位十六进制数");
+                    position_ += 4;
+                } else if (!wcschr(L"\"\\/bfnrt", e)) {
+                    return Fail(L"无效的转义字符");
+                }
+            }
+            ++position_;
+        }
+        return Fail(L"字符串没有结束");
+    }
+    bool Number() {
+        const size_t start = position_;
+        if (text_[position_] == L'-') ++position_;
+        if (position_ >= text_.size() || !iswdigit(text_[position_])) return Fail(L"无效的数字");
+        if (text_[position_] == L'0' && position_ + 1 < text_.size() && iswdigit(text_[position_ + 1])) return Fail(L"数字不能以 0 开头");
+        while (position_ < text_.size() && iswdigit(text_[position_])) ++position_;
+        if (position_ < text_.size() && text_[position_] == L'.') {
+            ++position_;
+            if (position_ >= text_.size() || !iswdigit(text_[position_])) return Fail(L"小数点后应有数字");
+            while (position_ < text_.size() && iswdigit(text_[position_])) ++position_;
+        }
+        if (position_ < text_.size() && (text_[position_] == L'e' || text_[position_] == L'E')) {
+            ++position_;
+            if (position_ < text_.size() && (text_[position_] == L'+' || text_[position_] == L'-')) ++position_;
+            if (position_ >= text_.size() || !iswdigit(text_[position_])) return Fail(L"指数部分应有数字");
+            while (position_ < text_.size() && iswdigit(text_[position_])) ++position_;
+        }
+        return position_ > start;
+    }
+    bool Value(int depth) {
+        if (depth > 512) return Fail(L"嵌套层数太深");
+        Space();
+        if (position_ >= text_.size()) return Fail(L"内容不完整");
+        const wchar_t c = text_[position_];
+        if (c == L'{' || c == L'[') {
+            const bool object = c == L'{';
+            ++position_;
+            Space();
+            if (position_ < text_.size() && text_[position_] == (object ? L'}' : L']')) { ++position_; return true; }
+            while (true) {
+                Space();
+                if (object) {
+                    if (position_ < text_.size() && text_[position_] == L'/') return Fail(L"标准 JSON 不支持注释");
+                    if (position_ >= text_.size() || text_[position_] != L'"') return Fail(L"应为用双引号括起来的键名");
+                    if (!String()) return false;
+                    Space();
+                    if (position_ >= text_.size() || text_[position_] != L':') return Fail(L"键名后缺少冒号");
+                    ++position_;
+                }
+                if (!Value(depth + 1)) return false;
+                Space();
+                if (position_ < text_.size() && text_[position_] == L',') {
+                    ++position_;
+                    Space();
+                    if (position_ < text_.size() && text_[position_] == (object ? L'}' : L']')) return Fail(L"末尾多了一个逗号");
+                    continue;
+                }
+                if (position_ < text_.size() && text_[position_] == (object ? L'}' : L']')) { ++position_; return true; }
+                return Fail(object ? L"缺少逗号或 }" : L"缺少逗号或 ]");
+            }
+        }
+        if (c == L'"') return String();
+        if (c == L'-' || iswdigit(c)) return Number();
+        if (c == L't') return Literal(L"true");
+        if (c == L'f') return Literal(L"false");
+        if (c == L'n') return Literal(L"null");
+        if (c == L'/') return Fail(L"标准 JSON 不支持注释");
+        return Fail(L"无法识别的值（字符串必须用双引号）");
+    }
+
+    std::wstring_view text_;
+    size_t position_ = 0;
+    std::wstring message_;
+};
+
+std::wstring CompactJson(std::wstring_view input, std::wstring& error) {
+    std::wstring formatted;
+    if (!FormatJson(input, formatted, error)) return {};
+    std::wstring out;
+    bool inString = false;
+    for (size_t i = 0; i < formatted.size(); ++i) {
+        const wchar_t c = formatted[i];
+        if (inString) {
+            out += c;
+            if (c == L'\\' && i + 1 < formatted.size()) out += formatted[++i];
+            else if (c == L'"') inString = false;
+            continue;
+        }
+        if (c == L'"') { inString = true; out += c; continue; }
+        if (!iswspace(c)) out += c;
+    }
+    return out;
+}
+
+std::wstring FormatUnixTime(int64_t seconds, int milliseconds) {
+    const int64_t ticks = (seconds + 11644473600LL) * 10000000LL + milliseconds * 10000LL;
+    if (ticks < 0) return L"（超出范围）";
+    FILETIME utc{static_cast<DWORD>(ticks), static_cast<DWORD>(ticks >> 32)};
+    SYSTEMTIME u{}, l{};
+    if (!FileTimeToSystemTime(&utc, &u)) return L"（超出范围）";
+    SystemTimeToTzSpecificLocalTime(nullptr, &u, &l);
+    // Local offset from the two clocks.
+    FILETIME localFile{};
+    SystemTimeToFileTime(&l, &localFile);
+    const int64_t localTicks = (static_cast<int64_t>(localFile.dwHighDateTime) << 32) | localFile.dwLowDateTime;
+    const int offsetMinutes = static_cast<int>((localTicks - ticks) / 600000000LL);
+    wchar_t text[256]{};
+    swprintf_s(text, L"本地时间：%04u-%02u-%02u %02u:%02u:%02u.%03u\r\nUTC：%04u-%02u-%02u %02u:%02u:%02u.%03u\r\nISO 8601：%04u-%02u-%02uT%02u:%02u:%02u%c%02d:%02d",
+        l.wYear, l.wMonth, l.wDay, l.wHour, l.wMinute, l.wSecond, l.wMilliseconds,
+        u.wYear, u.wMonth, u.wDay, u.wHour, u.wMinute, u.wSecond, u.wMilliseconds,
+        l.wYear, l.wMonth, l.wDay, l.wHour, l.wMinute, l.wSecond, offsetMinutes < 0 ? L'-' : L'+', std::abs(offsetMinutes) / 60, std::abs(offsetMinutes) % 60);
+    // Relative to now.
+    FILETIME nowFile{};
+    GetSystemTimeAsFileTime(&nowFile);
+    const int64_t now = (((static_cast<int64_t>(nowFile.dwHighDateTime) << 32) | nowFile.dwLowDateTime) / 10000000LL) - 11644473600LL;
+    const int64_t delta = now - seconds;
+    const int64_t magnitude = std::abs(delta);
+    std::wstring relative = magnitude < 60 ? std::to_wstring(magnitude) + L" 秒" : magnitude < 3600 ? std::to_wstring(magnitude / 60) + L" 分钟"
+        : magnitude < 86400 ? std::to_wstring(magnitude / 3600) + L" 小时" : std::to_wstring(magnitude / 86400) + L" 天";
+    return std::wstring(text) + L"\r\n相对现在：" + relative + (delta >= 0 ? L"前" : L"后");
+}
+
+int64_t UnixNow() {
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    return (((static_cast<int64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime) / 10000000LL) - 11644473600LL;
+}
+
+// Number → dates; date text → numbers; empty → now.
+bool RunTimestamp(const std::wstring& rawInput, std::wstring& output, std::wstring& status) {
+    const std::wstring input = TrimSpace(rawInput);
+    if (input.empty()) {
+        const int64_t now = UnixNow();
+        output = L"当前时间\r\n秒：" + std::to_wstring(now) + L"\r\n毫秒：" + std::to_wstring(now * 1000) + L"\r\n" + FormatUnixTime(now, 0);
+        status = L"输入时间戳或日期即可转换";
+        return true;
+    }
+    if (std::all_of(input.begin(), input.end(), [](wchar_t c) { return iswdigit(c) || c == L'-'; }) && input.find(L'-', 1) == std::wstring::npos) {
+        int64_t value = _wtoi64(input.c_str());
+        std::wstring unit = L"秒";
+        int64_t seconds = value, millis = 0;
+        const int64_t magnitude = std::abs(value);
+        if (magnitude >= 100000000000000000LL) { unit = L"纳秒"; seconds = value / 1000000000; millis = (value / 1000000) % 1000; }
+        else if (magnitude >= 100000000000000LL) { unit = L"微秒"; seconds = value / 1000000; millis = (value / 1000) % 1000; }
+        else if (magnitude >= 100000000000LL) { unit = L"毫秒"; seconds = value / 1000; millis = value % 1000; }
+        if (millis < 0) { millis += 1000; --seconds; }
+        output = L"按" + unit + L"解析\r\n" + FormatUnixTime(seconds, static_cast<int>(millis));
+        status.clear();
+        return true;
+    }
+    // Date text: YYYY-MM-DD[ T]HH:MM[:SS[.mmm]][Z|±HH:MM]
+    static const std::wregex datePattern(
+        LR"(^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,9}))?)?)?\s*(Z|z|[+-]\d{2}:?\d{2})?$)");
+    std::wsmatch parts;
+    if (!std::regex_match(input, parts, datePattern)) {
+        status = L"无法识别：请输入 Unix 时间戳或 2026-11-23 10:30:00 这样的日期";
+        return false;
+    }
+    const auto number = [&](int group) { return parts[group].matched ? static_cast<unsigned>(std::wcstoul(parts[group].str().c_str(), nullptr, 10)) : 0u; };
+    const unsigned year = number(1), month = number(2), day = number(3), hour = number(4), minute = number(5), second = number(6);
+    const unsigned millisecond = parts[7].matched ? static_cast<unsigned>(std::wcstoul((parts[7].str() + L"00").substr(0, 3).c_str(), nullptr, 10)) : 0u;
+    if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60) {
+        status = L"日期或时间超出范围";
+        return false;
+    }
+    SYSTEMTIME given{static_cast<WORD>(year), static_cast<WORD>(month), 0, static_cast<WORD>(day), static_cast<WORD>(hour),
+        static_cast<WORD>(minute), static_cast<WORD>(second), static_cast<WORD>(millisecond)};
+    SYSTEMTIME utc{};
+    const bool explicitZone = parts[8].matched;
+    int offsetMinutes = 0;
+    if (explicitZone && parts[8].str() != L"Z" && parts[8].str() != L"z") {
+        std::wstring zone = parts[8].str();
+        zone.erase(std::remove(zone.begin(), zone.end(), L':'), zone.end());
+        offsetMinutes = static_cast<int>(std::wcstoul(zone.substr(1, 2).c_str(), nullptr, 10) * 60 + std::wcstoul(zone.substr(3, 2).c_str(), nullptr, 10));
+        if (zone[0] == L'-') offsetMinutes = -offsetMinutes;
+    }
+    FILETIME file{};
+    if (explicitZone) {
+        if (!SystemTimeToFileTime(&given, &file)) { status = L"日期无效"; return false; }
+    } else {
+        if (!TzSpecificLocalTimeToSystemTime(nullptr, &given, &utc) || !SystemTimeToFileTime(&utc, &file)) { status = L"日期无效"; return false; }
+    }
+    const int64_t ticks = (static_cast<int64_t>(file.dwHighDateTime) << 32) | file.dwLowDateTime;
+    const int64_t millis = ticks / 10000LL - 11644473600000LL - static_cast<int64_t>(offsetMinutes) * 60000LL;
+    const int64_t seconds = millis >= 0 ? millis / 1000 : (millis - 999) / 1000;
+    output = std::wstring(explicitZone ? L"按输入的时区解析" : L"按本地时间解析") + L"\r\n秒：" + std::to_wstring(seconds) + L"\r\n毫秒：" +
+        std::to_wstring(millis) + L"\r\n" + FormatUnixTime(seconds, static_cast<int>(((millis % 1000) + 1000) % 1000));
+    status.clear();
+    return true;
+}
+
+bool Base64UrlDecodeBytes(std::wstring_view text, std::string& bytes) {
+    std::wstring clean;
+    for (wchar_t c : text) {
+        if (c == L'-') c = L'+';
+        else if (c == L'_') c = L'/';
+        if (!iswspace(c)) clean += c;
+    }
+    while (clean.size() % 4) clean += L'=';
+    DWORD size = 0;
+    if (clean.empty() || !CryptStringToBinaryW(clean.c_str(), static_cast<DWORD>(clean.size()), CRYPT_STRING_BASE64, nullptr, &size, nullptr, nullptr)) return false;
+    bytes.assign(size, '\0');
+    return CryptStringToBinaryW(clean.c_str(), static_cast<DWORD>(clean.size()), CRYPT_STRING_BASE64, reinterpret_cast<BYTE*>(bytes.data()), &size, nullptr, nullptr) != FALSE;
+}
+
+bool RunJwt(const std::wstring& rawInput, std::wstring& output, std::wstring& status) {
+    std::wstring token = TrimSpace(rawInput);
+    if (token.compare(0, 7, L"Bearer ") == 0) token = TrimSpace(token.substr(7));
+    const size_t first = token.find(L'.');
+    const size_t second = first == std::wstring::npos ? std::wstring::npos : token.find(L'.', first + 1);
+    if (second == std::wstring::npos) { status = L"不是 JWT：应为 header.payload.signature 三段"; return false; }
+    std::string headerBytes, payloadBytes;
+    if (!Base64UrlDecodeBytes(token.substr(0, first), headerBytes) || !Base64UrlDecodeBytes(token.substr(first + 1, second - first - 1), payloadBytes)) {
+        status = L"JWT 的 Base64URL 部分无法解码";
+        return false;
+    }
+    std::wstring header, payload, error;
+    const std::wstring headerText = Utf8ToWide(headerBytes), payloadText = Utf8ToWide(payloadBytes);
+    if (!FormatJson(headerText, header, error)) header = headerText;
+    if (!FormatJson(payloadText, payload, error)) payload = payloadText;
+    output = L"// Header\r\n" + ToCrLf(header) + L"\r\n\r\n// Payload\r\n" + ToCrLf(payload) + L"\r\n";
+    // Well-known time claims.
+    std::wstring times;
+    for (const wchar_t* claim : {L"exp", L"iat", L"nbf"}) {
+        const std::wregex pattern(std::wstring(L"\"") + claim + L"\"\\s*:\\s*(\\d+)");
+        std::wsmatch match;
+        if (std::regex_search(payloadText, match, pattern)) {
+            const int64_t value = _wtoi64(match[1].str().c_str());
+            std::wstring when = FormatUnixTime(value, 0);
+            when = when.substr(0, when.find(L"\r\n"));
+            times += std::wstring(L"\r\n") + claim + L"：" + when.substr(when.find(L'：') + 1);
+            if (wcscmp(claim, L"exp") == 0) times += value < UnixNow() ? L"（已过期）" : L"（未过期）";
+        }
+    }
+    if (!times.empty()) output += L"\r\n// 时间" + times + L"\r\n";
+    output += L"\r\n// 签名（未验证）\r\n" + token.substr(second + 1);
+    status = L"仅解码，未校验签名";
+    return true;
+}
+
+bool RunUrlParse(const std::wstring& rawInput, std::wstring& output, std::wstring& status) {
+    const std::wstring url = TrimSpace(rawInput);
+    const std::wregex pattern(LR"(^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(?:([^@\/?#]*)@)?([^:\/?#]*)(?::(\d+))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$)");
+    std::wsmatch match;
+    if (!std::regex_match(url, match, pattern)) { status = L"不是完整的 URL（需要 scheme://host）"; return false; }
+    const wchar_t* names[] = {L"", L"协议", L"用户信息", L"主机", L"端口", L"路径", L"查询", L"片段"};
+    output.clear();
+    for (int g = 1; g <= 7; ++g) {
+        if (match[g].matched && match[g].length() > 0) output += std::wstring(names[g]) + L"：" + match[g].str() + L"\r\n";
+    }
+    if (match[6].matched && match[6].length() > 0) {
+        output += L"\r\n查询参数：\r\n";
+        const std::wstring query = match[6].str();
+        size_t start = 0;
+        while (start <= query.size()) {
+            size_t end = query.find(L'&', start);
+            if (end == std::wstring::npos) end = query.size();
+            const std::wstring pair = query.substr(start, end - start);
+            if (!pair.empty()) {
+                const size_t equals = pair.find(L'=');
+                std::wstring key = pair.substr(0, equals), value = equals == std::wstring::npos ? L"" : pair.substr(equals + 1);
+                for (std::wstring* part : {&key, &value}) std::replace(part->begin(), part->end(), L'+', L' ');
+                int decoded = 0;
+                output += L"  " + UrlDecode(key, decoded) + L" = " + UrlDecode(value, decoded) + L"\r\n";
+            }
+            start = end + 1;
+        }
+    }
+    status.clear();
+    return true;
+}
+
+bool RunRegexTest(const std::wstring& input, const std::wstring& pattern, const std::wstring& replacement, bool ignoreCase,
+    std::wstring& output, std::wstring& status) {
+    if (pattern.empty()) { output.clear(); status = L"在上方输入正则表达式，下方输入测试文本"; return true; }
+    try {
+        const std::wregex expression(pattern, ignoreCase ? std::regex::ECMAScript | std::regex::icase : std::regex::ECMAScript);
+        const std::wstring text = input.size() > (1u << 20) ? input.substr(0, 1u << 20) : input;
+        size_t count = 0;
+        std::wstring list;
+        for (auto it = std::wsregex_iterator(text.begin(), text.end(), expression); it != std::wsregex_iterator(); ++it) {
+            const std::wsmatch& match = *it;
+            ++count;
+            if (count <= 500) {
+                const size_t position = static_cast<size_t>(match.position(0));
+                const size_t line = 1 + static_cast<size_t>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(position), L'\n'));
+                const size_t lineStart = text.rfind(L'\n', position == 0 ? 0 : position - 1);
+                const size_t column = position - (lineStart == std::wstring::npos || position == 0 ? 0 : lineStart + 1) + 1;
+                list += L"#" + std::to_wstring(count) + L"  行 " + std::to_wstring(line) + L" 列 " + std::to_wstring(column) + L"：" + match.str(0) + L"\r\n";
+                for (size_t g = 1; g < match.size(); ++g) {
+                    list += L"      $" + std::to_wstring(g) + L" = " + (match[g].matched ? match.str(g) : L"（未匹配）") + L"\r\n";
+                }
+            }
+            if (match.length(0) == 0 && count > 100000) break;
+        }
+        output = L"共 " + std::to_wstring(count) + L" 处匹配" + (count > 500 ? L"（只列出前 500 处）" : L"") + L"\r\n\r\n" + list;
+        if (!replacement.empty()) output += L"\r\n// 替换结果\r\n" + ToCrLf(std::regex_replace(text, expression, replacement));
+        status = count ? L"" : L"没有匹配";
+        return true;
+    } catch (const std::regex_error&) {
+        status = L"正则表达式有语法错误";
+        output.clear();
+        return false;
+    }
+}
+
+std::wstring UnicodeEscape(std::wstring_view text) {
+    std::wstring out;
+    for (const wchar_t c : text) {
+        if (c < 0x80) { out += c; continue; }
+        wchar_t buffer[8]{};
+        swprintf_s(buffer, L"\\u%04x", static_cast<unsigned>(c));
+        out += buffer;
+    }
+    return out;
+}
+
+std::wstring UnicodeUnescape(std::wstring_view text, int& count) {
+    std::wstring out;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\\' && i + 5 < text.size() + 0 && (text[i + 1] == L'u' || text[i + 1] == L'U')) {
+            if (text[i + 2] == L'{') {
+                const size_t close = text.find(L'}', i + 3);
+                if (close != std::wstring_view::npos) {
+                    const unsigned long value = std::wcstoul(std::wstring(text.substr(i + 3, close - i - 3)).c_str(), nullptr, 16);
+                    if (value >= 0x10000) { out += static_cast<wchar_t>(0xD800 + ((value - 0x10000) >> 10)); out += static_cast<wchar_t>(0xDC00 + ((value - 0x10000) & 0x3FF)); }
+                    else out += static_cast<wchar_t>(value);
+                    i = close;
+                    ++count;
+                    continue;
+                }
+            }
+            bool hex = true;
+            for (size_t k = 2; k < 6; ++k) hex = hex && iswxdigit(text[i + k]);
+            if (hex) {
+                out += static_cast<wchar_t>(std::wcstoul(std::wstring(text.substr(i + 2, 4)).c_str(), nullptr, 16));
+                i += 5;
+                ++count;
+                continue;
+            }
+        }
+        out += text[i];
+    }
+    return out;
+}
+
+std::wstring HtmlEncode(std::wstring_view text) {
+    std::wstring out;
+    for (const wchar_t c : text) {
+        switch (c) {
+        case L'&': out += L"&amp;"; break;
+        case L'<': out += L"&lt;"; break;
+        case L'>': out += L"&gt;"; break;
+        case L'"': out += L"&quot;"; break;
+        case L'\'': out += L"&#39;"; break;
+        default: out += c; break;
+        }
+    }
+    return out;
+}
+
+std::wstring HtmlDecode(std::wstring_view text, int& count) {
+    static const std::pair<const wchar_t*, wchar_t> named[] = {{L"amp", L'&'}, {L"lt", L'<'}, {L"gt", L'>'}, {L"quot", L'"'}, {L"apos", L'\''},
+        {L"nbsp", static_cast<wchar_t>(0xA0)}, {L"copy", static_cast<wchar_t>(0xA9)}, {L"reg", static_cast<wchar_t>(0xAE)}, {L"hellip", static_cast<wchar_t>(0x2026)}, {L"mdash", static_cast<wchar_t>(0x2014)}, {L"ndash", static_cast<wchar_t>(0x2013)}, {L"yen", static_cast<wchar_t>(0xA5)}};
+    std::wstring out;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'&') {
+            const size_t semicolon = text.find(L';', i + 1);
+            if (semicolon != std::wstring_view::npos && semicolon - i <= 10) {
+                const std::wstring name(text.substr(i + 1, semicolon - i - 1));
+                unsigned long code = 0;
+                bool ok = false;
+                if (!name.empty() && name[0] == L'#') {
+                    code = name.size() > 1 && (name[1] == L'x' || name[1] == L'X') ? std::wcstoul(name.c_str() + 2, nullptr, 16) : std::wcstoul(name.c_str() + 1, nullptr, 10);
+                    ok = code > 0;
+                } else {
+                    for (const auto& [entity, value] : named) if (name == entity) { code = value; ok = true; break; }
+                }
+                if (ok) {
+                    if (code >= 0x10000) { out += static_cast<wchar_t>(0xD800 + ((code - 0x10000) >> 10)); out += static_cast<wchar_t>(0xDC00 + ((code - 0x10000) & 0x3FF)); }
+                    else out += static_cast<wchar_t>(code);
+                    i = semicolon;
+                    ++count;
+                    continue;
+                }
+            }
+        }
+        out += text[i];
+    }
+    return out;
+}
+
+int ToolboxCurrentTool() {
+    const LRESULT index = SendMessageW(g_toolbox.tool, CB_GETCURSEL, 0, 0);
+    return index >= 0 && index < static_cast<LRESULT>(g_toolbox.shown.size()) ? g_toolbox.shown[static_cast<size_t>(index)] : kToolJson;
+}
+
+void RunToolbox() {
+    if (!g_toolbox.panel) return;
+    const int tool = ToolboxCurrentTool();
+    const int action = static_cast<int>(std::max<LRESULT>(0, SendMessageW(g_toolbox.action, CB_GETCURSEL, 0, 0)));
+    std::wstring input = GetWindowTextValue(g_toolbox.input);
+    std::wstring output, status, error;
+    switch (tool) {
+    case kToolJson:
+        if (TrimSpace(input).empty()) { status = L"输入或选中 JSON"; break; }
+        if (!JsonValidator(input).Run(error)) { status = L"✗ " + error; break; }
+        if (action == 1) {
+            output = CompactJson(input, error);
+            status = error.empty() ? L"已压缩为 " + std::to_wstring(output.size()) + L" 个字符" : error;
+        } else {
+            std::wstring formatted;
+            if (FormatJson(input, formatted, error)) {
+                if (action == 0) output = ToCrLf(formatted);
+                status = L"✓ JSON 格式正确";
+            } else {
+                status = L"✗ " + error;
+            }
+        }
+        break;
+    case kToolBase64:
+        if (action == 0) output = Base64Encode(input);
+        else if (!input.empty() && !Base64Decode(input, output)) status = L"不是有效的 Base64（或解码后不是 UTF-8 文本）";
+        else output = ToCrLf(output);
+        break;
+    case kToolUrl:
+        if (action == 0) output = UrlEncode(input);
+        else if (action == 1) {
+            int decoded = 0;
+            output = ToCrLf(UrlDecode(input, decoded));
+            status = L"解码了 " + std::to_wstring(decoded) + L" 处";
+        } else if (!TrimSpace(input).empty()) RunUrlParse(input, output, status);
+        break;
+    case kToolJwt:
+        if (TrimSpace(input).empty()) status = L"输入或选中一个 JWT（可带 Bearer 前缀）";
+        else RunJwt(input, output, status);
+        break;
+    case kToolTimestamp:
+        RunTimestamp(input, output, status);
+        break;
+    case kToolHash: {
+        const std::string bytes = WideToUtf8(input);
+        output = L"MD5：\r\n" + HashHex(bytes, CALG_MD5) + L"\r\n\r\nSHA-1：\r\n" + HashHex(bytes, CALG_SHA1) + L"\r\n\r\nSHA-256：\r\n" +
+            HashHex(bytes, CALG_SHA_256) + L"\r\n\r\nSHA-512：\r\n" + HashHex(bytes, CALG_SHA_512);
+        status = L"按 UTF-8 计算，" + std::to_wstring(bytes.size()) + L" 字节";
+        break;
+    }
+    case kToolRegex: {
+        std::wstring text = input;
+        text.erase(std::remove(text.begin(), text.end(), L'\r'), text.end());
+        RunRegexTest(text, GetWindowTextValue(g_toolbox.pattern), GetWindowTextValue(g_toolbox.replace),
+            SendMessageW(g_toolbox.ignoreCase, BM_GETCHECK, 0, 0) == BST_CHECKED, output, status);
+        break;
+    }
+    case kToolUnicode: {
+        int count = 0;
+        output = action == 0 ? UnicodeEscape(input) : UnicodeUnescape(input, count);
+        if (action == 1) status = L"还原了 " + std::to_wstring(count) + L" 处";
+        break;
+    }
+    case kToolHtml: {
+        int count = 0;
+        output = action == 0 ? HtmlEncode(input) : HtmlDecode(input, count);
+        if (action == 1) status = L"解码了 " + std::to_wstring(count) + L" 处";
+        break;
+    }
+    case kToolUuid: {
+        const int count = std::clamp(_wtoi(TrimSpace(input).c_str()), 1, 1000);
+        for (int i = 0; i < count; ++i) {
+            GUID guid{};
+            CoCreateGuid(&guid);
+            wchar_t text[64]{};
+            swprintf_s(text, L"%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x\r\n", guid.Data1, guid.Data2, guid.Data3, guid.Data4[0], guid.Data4[1],
+                guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+            output += text;
+        }
+        if (!output.empty()) output.erase(output.size() - 2);
+        status = L"输入数字可一次生成多个（最多 1000）";
+        break;
+    }
+    default:
+        break;
+    }
+    SetWindowTextW(g_toolbox.output, output.c_str());
+    SetWindowTextW(g_toolbox.status, status.c_str());
+}
+
+// ---- Selection ---------------------------------------------------------------------------
+
+std::wstring ActiveSelectionText() {
+    HWND editor = ActiveEditor();
+    if (!editor) return {};
+    CHARRANGE selection{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const LONG length = selection.cpMax - selection.cpMin;
+    if (length <= 0 || length > (4 << 20)) return {};
+    std::wstring selected(static_cast<size_t>(length) + 1, L'\0');
+    selected.resize(static_cast<size_t>(std::max<LRESULT>(0, SendMessageW(editor, EM_GETSELTEXT, 0, reinterpret_cast<LPARAM>(selected.data())))));
+    return selected;
+}
+
+void ToolboxTakeSelection(bool force) {
+    if (!g_toolbox.panel || !IsWindowVisible(g_toolbox.panel)) return;
+    const std::wstring selected = ActiveSelectionText();
+    if (selected.empty() && !force) return;
+    g_toolbox.settingInput = true;
+    SetWindowTextW(g_toolbox.input, ToCrLf(selected).c_str());
+    g_toolbox.settingInput = false;
+    RunToolbox();
+}
+
+// Called on every caret / selection change in the editor.
+void ToolboxOnSelectionChanged() {
+    if (g_toolbox.panel && IsWindowVisible(g_toolbox.panel) && SendMessageW(g_toolbox.follow, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        SetTimer(g_toolbox.panel, kTimerToolboxSelection, 150, nullptr);
+    }
+}
+
+// Output replaces the editor's selection (or goes in at the caret); one undo step.
+void ToolboxApplyToEditor() {
+    HWND editor = ActiveEditor();
+    if (!editor) return;
+    std::wstring output = GetWindowTextValue(g_toolbox.output);
+    if (output.empty()) { MessageBeep(MB_ICONWARNING); return; }
+    std::wstring text;
+    for (size_t i = 0; i < output.size(); ++i) {
+        if (output[i] == L'\r' && i + 1 < output.size() && output[i + 1] == L'\n') ++i;
+        text += output[i] == L'\n' ? L'\r' : output[i];
+    }
+    SendMessageW(g_toolbox.follow, BM_SETCHECK, BST_UNCHECKED, 0);  // keep the result from replacing the input
+    SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(text.c_str()));
+    SetFocus(editor);
+    ShowNotice(L"已替换选中内容（可用 Ctrl+Z 撤销）；“跟随选中”已暂停");
+}
+
+// ---- Panel -------------------------------------------------------------------------------
+
+void FillToolboxActions() {
+    const int tool = ToolboxCurrentTool();
+    SendMessageW(g_toolbox.action, CB_RESETCONTENT, 0, 0);
+    const std::vector<std::wstring> actions = ToolboxActions(tool);
+    for (const std::wstring& action : actions) SendMessageW(g_toolbox.action, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(action.c_str()));
+    SendMessageW(g_toolbox.action, CB_SETCURSEL, 0, 0);
+    ShowWindow(g_toolbox.action, actions.empty() ? SW_HIDE : SW_SHOW);
+    const bool regex = tool == kToolRegex;
+    for (const int id : {kTbPattern, kTbReplace, kTbIgnoreCase, kTbPatternLabel, kTbReplaceLabel}) ShowWindow(GetDlgItem(g_toolbox.panel, id), regex ? SW_SHOW : SW_HIDE);
+    SetWindowTextW(GetDlgItem(g_toolbox.panel, kTbInputLabel), regex ? L"测试文本" : tool == kToolUuid ? L"生成数量" : L"输入");
+    SendMessageW(g_toolbox.input, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(tool == kToolTimestamp ? L"Unix 时间戳或日期；留空显示当前时间" : L""));
+    g_app.toolboxTool = tool;
+}
+
+void FillToolboxTools() {
+    SendMessageW(g_toolbox.tool, CB_RESETCONTENT, 0, 0);
+    g_toolbox.shown.clear();
+    int select = 0;
+    for (int tool = 0; tool < kToolCount; ++tool) {
+        if (!(g_app.toolboxMask & (1u << tool))) continue;
+        if (tool == g_app.toolboxTool) select = static_cast<int>(g_toolbox.shown.size());
+        g_toolbox.shown.push_back(tool);
+        SendMessageW(g_toolbox.tool, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(kToolboxNames[tool]));
+    }
+    SendMessageW(g_toolbox.tool, CB_SETCURSEL, select, 0);
+    FillToolboxActions();
+}
+
+void LayoutToolbox() {
+    RECT client{};
+    GetClientRect(g_toolbox.panel, &client);
+    const int left = Scale(10), width = std::max(0, static_cast<int>(client.right) - Scale(18));
+    const int rowH = Scale(26);
+    int y = Scale(8);
+    HWND panel = g_toolbox.panel;
+    MoveWindow(GetDlgItem(panel, kTbTitle), left, y + Scale(3), width - Scale(64), Scale(20), TRUE);
+    MoveWindow(GetDlgItem(panel, kTbCustomize), left + width - Scale(56), y, Scale(26), rowH, TRUE);
+    MoveWindow(GetDlgItem(panel, kTbClose), left + width - Scale(26), y, Scale(26), rowH, TRUE);
+    y += rowH + Scale(8);
+    const bool hasActions = IsWindowVisible(g_toolbox.action) != FALSE;
+    const int toolWidth = hasActions ? (width - Scale(6)) * 55 / 100 : width;
+    MoveWindow(g_toolbox.tool, left, y, toolWidth, Scale(300), TRUE);
+    MoveWindow(g_toolbox.action, left + toolWidth + Scale(6), y, width - toolWidth - Scale(6), Scale(300), TRUE);
+    y += rowH + Scale(8);
+    if (ToolboxCurrentTool() == kToolRegex) {
+        MoveWindow(GetDlgItem(panel, kTbPatternLabel), left, y + Scale(4), Scale(44), Scale(20), TRUE);
+        MoveWindow(g_toolbox.pattern, left + Scale(48), y, width - Scale(48), rowH, TRUE);
+        y += rowH + Scale(6);
+        MoveWindow(GetDlgItem(panel, kTbReplaceLabel), left, y + Scale(4), Scale(44), Scale(20), TRUE);
+        MoveWindow(g_toolbox.replace, left + Scale(48), y, width - Scale(48), rowH, TRUE);
+        y += rowH + Scale(6);
+        MoveWindow(g_toolbox.ignoreCase, left, y, width, Scale(22), TRUE);
+        y += Scale(28);
+    }
+    MoveWindow(GetDlgItem(panel, kTbInputLabel), left, y + Scale(3), Scale(70), Scale(20), TRUE);
+    MoveWindow(g_toolbox.follow, left + Scale(72), y, width - Scale(72) - Scale(70), Scale(24), TRUE);
+    MoveWindow(GetDlgItem(panel, kTbTake), left + width - Scale(64), y, Scale(64), Scale(24), TRUE);
+    y += Scale(28);
+    // Input and output share what is left above the buttons and status line.
+    const int buttonsY = std::max(y + Scale(120), static_cast<int>(client.bottom) - Scale(10) - Scale(20) - Scale(6) - rowH);
+    const int available = std::max(Scale(80), buttonsY - Scale(8) - y - Scale(8) - Scale(22));
+    const int inputHeight = available * 2 / 5;
+    MoveWindow(g_toolbox.input, left, y, width, inputHeight, TRUE);
+    y += inputHeight + Scale(8);
+    MoveWindow(GetDlgItem(panel, kTbOutputLabel), left, y, width, Scale(20), TRUE);
+    y += Scale(22);
+    MoveWindow(g_toolbox.output, left, y, width, available - inputHeight, TRUE);
+    y = buttonsY;
+    const int half = (width - Scale(6)) / 2;
+    MoveWindow(GetDlgItem(panel, kTbCopy), left, y, half, rowH, TRUE);
+    MoveWindow(GetDlgItem(panel, kTbApply), left + half + Scale(6), y, width - half - Scale(6), rowH, TRUE);
+    y += rowH + Scale(6);
+    MoveWindow(g_toolbox.status, left, y, width, Scale(20), TRUE);
+}
+
+void CustomizeToolbox() {
+    std::vector<std::pair<std::wstring, bool>> checks;
+    for (int tool = 0; tool < kToolCount; ++tool) checks.emplace_back(kToolboxNames[tool], (g_app.toolboxMask & (1u << tool)) != 0);
+    std::vector<std::wstring> values;
+    if (!PromptForText(L"自定义开发者工具箱：选择要显示的工具", {}, values, &checks)) return;
+    unsigned mask = 0;
+    for (int tool = 0; tool < kToolCount; ++tool) if (checks[static_cast<size_t>(tool)].second) mask |= 1u << tool;
+    g_app.toolboxMask = mask ? mask : (1u << kToolJson);
+    g_app.stateDirty = true;
+    FillToolboxTools();
+    LayoutToolbox();
+    RunToolbox();
+}
+
+HBRUSH ToolboxEditBrush() {
+    static HBRUSH brush = nullptr;
+    static COLORREF color = CLR_INVALID;
+    if (color != CurrentPalette().controlBackground) {
+        if (brush) DeleteObject(brush);
+        color = CurrentPalette().controlBackground;
+        brush = CreateSolidBrush(color);
+    }
+    return brush;
+}
+
+LRESULT CALLBACK ToolboxProc(HWND panel, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        g_toolbox.panel = panel;
+        const auto make = [&](const wchar_t* klass, const wchar_t* text, DWORD style, int id, DWORD exStyle = 0) {
+            HWND control = CreateWindowExW(exStyle, klass, text, WS_CHILD | style, 0, 0, 0, 0, panel,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            return control;
+        };
+        HWND title = make(L"STATIC", L"开发者工具箱", WS_VISIBLE | SS_NOPREFIX, kTbTitle);
+        (void)title;
+        make(L"BUTTON", L"⚙", WS_VISIBLE | WS_TABSTOP, kTbCustomize);
+        make(L"BUTTON", L"✕", WS_VISIBLE | WS_TABSTOP, kTbClose);
+        g_toolbox.tool = make(L"COMBOBOX", nullptr, WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, kTbTool);
+        g_toolbox.action = make(L"COMBOBOX", nullptr, WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, kTbAction);
+        make(L"STATIC", L"正则", SS_NOPREFIX, kTbPatternLabel);
+        g_toolbox.pattern = make(L"EDIT", nullptr, WS_TABSTOP | ES_AUTOHSCROLL, kTbPattern, WS_EX_CLIENTEDGE);
+        make(L"STATIC", L"替换为", SS_NOPREFIX, kTbReplaceLabel);
+        g_toolbox.replace = make(L"EDIT", nullptr, WS_TABSTOP | ES_AUTOHSCROLL, kTbReplace, WS_EX_CLIENTEDGE);
+        SendMessageW(g_toolbox.pattern, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"例如 (\\d+)-(\\w+)"));
+        SendMessageW(g_toolbox.replace, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"可选，支持 $1 $2"));
+        g_toolbox.ignoreCase = make(L"BUTTON", L"忽略大小写", WS_TABSTOP | BS_AUTOCHECKBOX, kTbIgnoreCase);
+        make(L"STATIC", L"输入", WS_VISIBLE | SS_NOPREFIX, kTbInputLabel);
+        g_toolbox.follow = make(L"BUTTON", L"跟随编辑器选中", WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, kTbFollow);
+        SendMessageW(g_toolbox.follow, BM_SETCHECK, BST_CHECKED, 0);
+        make(L"BUTTON", L"取选中", WS_VISIBLE | WS_TABSTOP, kTbTake);
+        g_toolbox.input = make(L"EDIT", nullptr, WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN, kTbInput, WS_EX_CLIENTEDGE);
+        make(L"STATIC", L"结果", WS_VISIBLE | SS_NOPREFIX, kTbOutputLabel);
+        g_toolbox.output = make(L"EDIT", nullptr, WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, kTbOutput, WS_EX_CLIENTEDGE);
+        make(L"BUTTON", L"复制结果", WS_VISIBLE | WS_TABSTOP, kTbCopy);
+        make(L"BUTTON", L"替换选中内容", WS_VISIBLE | WS_TABSTOP, kTbApply);
+        g_toolbox.status = make(L"STATIC", nullptr, WS_VISIBLE | SS_NOPREFIX | SS_ENDELLIPSIS, kTbStatus);
+        for (HWND box : {g_toolbox.input, g_toolbox.output, g_toolbox.pattern, g_toolbox.replace}) {
+            SendMessageW(box, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+            SendMessageW(box, EM_SETLIMITTEXT, 0, 0);
+        }
+        ThemeCheckbox(g_toolbox.follow);
+        ThemeCheckbox(g_toolbox.ignoreCase);
+        if (g_app.darkTheme) {
+            for (HWND control : {g_toolbox.input, g_toolbox.output, g_toolbox.pattern, g_toolbox.replace, g_toolbox.tool, g_toolbox.action}) SetWindowTheme(control, L"DarkMode_CFD", nullptr);
+            for (const int id : {kTbCustomize, kTbClose, kTbTake, kTbCopy, kTbApply}) SetWindowTheme(GetDlgItem(panel, id), L"DarkMode_Explorer", nullptr);
+        }
+        FillToolboxTools();
+        return 0;
+    }
+    case WM_SIZE:
+        LayoutToolbox();
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(panel, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.toolbarBrush);
+        // Divider on the left edge.
+        RECT divider{0, 0, Scale(1), client.bottom};
+        HBRUSH brush = CreateSolidBrush(CurrentPalette().panelBorder);
+        FillRect(reinterpret_cast<HDC>(wParam), &divider, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        HWND control = reinterpret_cast<HWND>(lParam);
+        if (control == g_toolbox.output) {
+            SetTextColor(dc, CurrentPalette().editorText);
+            SetBkColor(dc, CurrentPalette().controlBackground);
+            return reinterpret_cast<LRESULT>(ToolboxEditBrush());
+        }
+        const std::wstring status = control == g_toolbox.status ? GetWindowTextValue(control) : L"";
+        SetTextColor(dc, control == g_toolbox.status ? (status.rfind(L"✗", 0) == 0 || status.find(L"错误") != std::wstring::npos || status.find(L"无") == 0 || status.find(L"不是") == 0
+            ? (g_app.darkTheme ? RGB(244, 112, 103) : RGB(190, 30, 30)) : CurrentPalette().statusText) : CurrentPalette().toolbarText);
+        SetBkColor(dc, CurrentPalette().toolbarBackground);
+        return reinterpret_cast<LRESULT>(g_app.toolbarBrush);
+    }
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, CurrentPalette().toolbarText);
+        SetBkColor(dc, CurrentPalette().toolbarBackground);
+        return reinterpret_cast<LRESULT>(g_app.toolbarBrush);
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, CurrentPalette().editorText);
+        SetBkColor(dc, CurrentPalette().controlBackground);
+        return reinterpret_cast<LRESULT>(ToolboxEditBrush());
+    }
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT) {
+            POINT point{};
+            GetCursorPos(&point);
+            ScreenToClient(panel, &point);
+            if (point.x < Scale(5)) { SetCursor(LoadCursorW(nullptr, IDC_SIZEWE)); return TRUE; }
+        }
+        break;
+    case WM_LBUTTONDOWN:
+        if (GET_X_LPARAM(lParam) < Scale(5)) {
+            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(panel, &point);
+            g_toolbox.dragging = true;
+            g_toolbox.dragStartX = point.x;
+            g_toolbox.dragStartWidth = Scale(g_app.toolboxWidth);
+            SetCapture(panel);
+            return 0;
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (g_toolbox.dragging) {
+            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(panel, &point);
+            const int pixels = std::clamp(g_toolbox.dragStartWidth + (g_toolbox.dragStartX - static_cast<int>(point.x)), Scale(260), Scale(900));
+            g_app.toolboxWidth = MulDiv(pixels, 96, static_cast<int>(g_app.dpi));
+            LayoutChildren(g_app.window);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (g_toolbox.dragging) {
+            g_toolbox.dragging = false;
+            ReleaseCapture();
+            g_app.stateDirty = true;
+            return 0;
+        }
+        break;
+    case WM_TIMER:
+        KillTimer(panel, wParam);
+        if (wParam == kTimerToolboxRun) RunToolbox();
+        else if (wParam == kTimerToolboxSelection) ToolboxTakeSelection(false);
+        return 0;
+    case WM_COMMAND: {
+        const int id = LOWORD(wParam), code = HIWORD(wParam);
+        switch (id) {
+        case kTbTool:
+            if (code == CBN_SELCHANGE) { FillToolboxActions(); LayoutToolbox(); InvalidateRect(panel, nullptr, TRUE); RunToolbox(); g_app.stateDirty = true; }
+            return 0;
+        case kTbAction:
+            if (code == CBN_SELCHANGE) RunToolbox();
+            return 0;
+        case kTbInput: case kTbPattern: case kTbReplace:
+            if (code == EN_CHANGE && !g_toolbox.settingInput) SetTimer(panel, kTimerToolboxRun, 200, nullptr);
+            return 0;
+        case kTbIgnoreCase: RunToolbox(); return 0;
+        case kTbFollow:
+            if (SendMessageW(g_toolbox.follow, BM_GETCHECK, 0, 0) == BST_CHECKED) ToolboxTakeSelection(false);
+            return 0;
+        case kTbTake: ToolboxTakeSelection(true); return 0;
+        case kTbCopy: {
+            const std::wstring output = GetWindowTextValue(g_toolbox.output);
+            if (!output.empty()) { CopyTextToClipboard(output); SetWindowTextW(g_toolbox.status, L"已复制到剪贴板"); }
+            return 0;
+        }
+        case kTbApply: ToolboxApplyToEditor(); return 0;
+        case kTbCustomize: CustomizeToolbox(); return 0;
+        case kTbClose: ToggleToolbox(false); return 0;
+        default: break;
+        }
+        break;
+    }
+    case WM_DESTROY:
+        g_toolbox = ToolboxState{};
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcW(panel, message, wParam, lParam);
+}
+
+// Theme or font changed: re-theme the toolbox controls.
+void ApplyToolboxTheme() {
+    if (!g_toolbox.panel) return;
+    EnumChildWindows(g_toolbox.panel, [](HWND control, LPARAM) -> BOOL {
+        wchar_t className[32]{};
+        GetClassNameW(control, className, 32);
+        const bool box = control == g_toolbox.input || control == g_toolbox.output || control == g_toolbox.pattern || control == g_toolbox.replace;
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(box ? g_app.editorFont : g_app.uiFont), TRUE);
+        if (_wcsicmp(className, L"ComboBox") == 0 || _wcsicmp(className, L"Edit") == 0) {
+            SetWindowTheme(control, g_app.darkTheme ? L"DarkMode_CFD" : nullptr, nullptr);
+        } else if (_wcsicmp(className, L"Button") == 0) {
+            if ((GetWindowLongW(control, GWL_STYLE) & BS_TYPEMASK) == BS_AUTOCHECKBOX) ThemeCheckbox(control);
+            else SetWindowTheme(control, g_app.darkTheme ? L"DarkMode_Explorer" : nullptr, nullptr);
+        }
+        return TRUE;
+    }, 0);
+    LayoutToolbox();
+    RedrawWindow(g_toolbox.panel, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME);
+}
+
+void ToggleToolbox(bool show) {
+    if (show && !g_toolbox.panel) {
+        static bool registered = false;
+        if (!registered) {
+            WNDCLASSW klass{};
+            klass.hInstance = g_app.instance;
+            klass.lpfnWndProc = ToolboxProc;
+            klass.lpszClassName = L"MCnotepadToolbox";
+            klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            registered = RegisterClassW(&klass) != 0;
+        }
+        g_app.toolboxPanel = CreateWindowExW(WS_EX_CONTROLPARENT, L"MCnotepadToolbox", nullptr, WS_CHILD | WS_CLIPCHILDREN, 0, 0, 0, 0,
+            g_app.window, nullptr, g_app.instance, nullptr);
+    }
+    g_app.toolboxVisible = show && g_app.toolboxPanel;
+    if (g_app.toolboxPanel) ShowWindow(g_app.toolboxPanel, g_app.toolboxVisible ? SW_SHOW : SW_HIDE);
+    LayoutChildren(g_app.window);
+    g_app.stateDirty = true;
+    if (g_app.toolboxVisible) {
+        LayoutToolbox();
+        if (!ActiveSelectionText().empty()) ToolboxTakeSelection(false);
+        else RunToolbox();
+        SetFocus(g_toolbox.input);
+    } else if (HWND editor = ActiveEditor()) {
+        SetFocus(editor);
+    }
 }
 
 // ===========================================================================
@@ -11782,6 +12804,910 @@ void CompareFolderPaths(const std::wstring& left, const std::wstring& right) {
     StartFolderCompare(*folder);
 }
 
+// ===========================================================================
+// Large log viewer: the file is memory-mapped and indexed, never loaded
+// whole into memory. Filters run on the raw bytes on a worker thread.
+// ===========================================================================
+
+constexpr uint64_t kLogCheckpointEvery = 64;  // one saved line offset per 64 lines
+constexpr UINT kMessageLogIndexed = WM_APP + 40;
+constexpr UINT kMessageLogFiltered = WM_APP + 41;
+constexpr UINT kMessageLogProgress = WM_APP + 42;
+constexpr UINT_PTR kTimerLogTail = 1;
+
+enum LogLevel : int { kLevelNone = 0, kLevelError, kLevelWarn, kLevelInfo, kLevelDebug };
+
+// Line k starts at checkpoints[k / 64] plus (k % 64) more line breaks.
+struct LogIndex {
+    std::vector<uint64_t> checkpoints{0};
+    uint64_t complete = 0;    // lines ending in '\n'
+    uint64_t indexedEnd = 0;  // offset just after the last '\n'
+    uint64_t Lines(uint64_t size) const { return complete + (size > indexedEnd ? 1 : 0); }
+};
+
+// Indexes the bytes after index.indexedEnd; call again when the file grows.
+bool IndexLogBytes(const char* data, uint64_t size, LogIndex& index, const std::atomic<bool>* cancel = nullptr,
+    HWND progress = nullptr, int generation = 0) {
+    uint64_t position = index.indexedEnd;
+    uint64_t nextReport = position + (64ull << 20);
+    while (position < size) {
+        const void* hit = memchr(data + position, '\n', static_cast<size_t>(std::min<uint64_t>(size - position, 1ull << 30)));
+        if (!hit) {
+            if (size - position > (1ull << 30)) { position += 1ull << 30; continue; }
+            break;
+        }
+        position = static_cast<uint64_t>(static_cast<const char*>(hit) - data) + 1;
+        ++index.complete;
+        index.indexedEnd = position;
+        if (index.complete % kLogCheckpointEvery == 0) index.checkpoints.push_back(position);
+        if (position >= nextReport) {
+            nextReport = position + (64ull << 20);
+            if (cancel && *cancel) return false;
+            if (progress) PostMessageW(progress, kMessageLogProgress, generation, static_cast<LPARAM>(position * 1000 / size));
+        }
+    }
+    return true;
+}
+
+std::pair<uint64_t, uint64_t> LogLineRange(const char* data, uint64_t size, const LogIndex& index, uint64_t line) {
+    uint64_t start = index.checkpoints[static_cast<size_t>(line / kLogCheckpointEvery)];
+    for (uint64_t skip = line % kLogCheckpointEvery; skip > 0 && start < size; --skip) {
+        const void* hit = memchr(data + start, '\n', static_cast<size_t>(size - start));
+        start = hit ? static_cast<uint64_t>(static_cast<const char*>(hit) - data) + 1 : size;
+    }
+    const void* hit = start < size ? memchr(data + start, '\n', static_cast<size_t>(size - start)) : nullptr;
+    uint64_t end = hit ? static_cast<uint64_t>(static_cast<const char*>(hit) - data) : size;
+    if (end > start && data[end - 1] == '\r') --end;
+    return {start, end};
+}
+
+// ---- Line classification on raw bytes ---------------------------------------------------
+
+inline char AsciiLower(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; }
+inline bool AsciiWordChar(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+
+// Case-insensitive (ASCII) search; other bytes must match exactly.
+bool ContainsNoCase(const char* text, size_t length, const std::string& lowerNeedle) {
+    const size_t n = lowerNeedle.size();
+    if (n == 0) return true;
+    if (n > length) return false;
+    const char first = lowerNeedle[0];
+    for (size_t i = 0; i + n <= length; ++i) {
+        if (AsciiLower(text[i]) != first) continue;
+        size_t k = 1;
+        while (k < n && AsciiLower(text[i + k]) == lowerNeedle[k]) ++k;
+        if (k == n) return true;
+    }
+    return false;
+}
+
+// Level from the first 160 bytes: ERROR / WARN / INFO / DEBUG and friends, as whole words.
+int DetectLogLevel(const char* text, size_t length) {
+    length = std::min<size_t>(length, 160);
+    static const std::pair<const char*, int> words[] = {
+        {"fatal", kLevelError}, {"critical", kLevelError}, {"crit", kLevelError}, {"error", kLevelError}, {"err", kLevelError}, {"severe", kLevelError},
+        {"warning", kLevelWarn}, {"warn", kLevelWarn}, {"info", kLevelInfo}, {"notice", kLevelInfo},
+        {"debug", kLevelDebug}, {"trace", kLevelDebug}, {"verbose", kLevelDebug}, {"fine", kLevelDebug}};
+    for (size_t i = 0; i < length; ++i) {
+        if (!AsciiWordChar(text[i]) || (i > 0 && AsciiWordChar(text[i - 1]))) continue;
+        size_t end = i;
+        while (end < length && AsciiWordChar(text[end])) ++end;
+        const size_t wordLength = end - i;
+        if (wordLength >= 3 && wordLength <= 8) {
+            char word[9]{};
+            for (size_t k = 0; k < wordLength; ++k) word[k] = AsciiLower(text[i + k]);
+            for (const auto& [name, level] : words) {
+                if (strcmp(word, name) == 0) return level;
+            }
+        }
+        i = end;
+    }
+    return kLevelNone;
+}
+
+// First "YYYY-MM-DD HH:MM[:SS]" (also with 'T' or '/'), normalized to
+// "YYYY-MM-DD HH:MM:SS"; empty when the line has none.
+std::string DetectLogTime(const char* text, size_t length) {
+    length = std::min<size_t>(length, 120);
+    const auto digit = [&](size_t i) { return i < length && text[i] >= '0' && text[i] <= '9'; };
+    for (size_t i = 0; i + 16 <= length; ++i) {
+        if (!(digit(i) && digit(i + 1) && digit(i + 2) && digit(i + 3))) continue;
+        if ((text[i + 4] != '-' && text[i + 4] != '/') || !digit(i + 5) || !digit(i + 6) || text[i + 7] != text[i + 4] || !digit(i + 8) || !digit(i + 9)) continue;
+        if ((text[i + 10] != ' ' && text[i + 10] != 'T') || !digit(i + 11) || !digit(i + 12) || text[i + 13] != ':' || !digit(i + 14) || !digit(i + 15)) continue;
+        std::string result(text + i, 16);
+        result[4] = result[7] = '-';
+        result[10] = ' ';
+        if (i + 18 < length + 1 && i + 16 < length && text[i + 16] == ':' && digit(i + 17) && digit(i + 18)) result += std::string(text + i + 16, 3);
+        else result += ":00";
+        return result;
+    }
+    return {};
+}
+
+// "2026-11-23 10:5" style input to a comparable prefix; empty when blank.
+std::string NormalizeTimeInput(const std::wstring& input, bool upper) {
+    std::string text = WideToUtf8(TrimCopy(input));
+    if (text.empty()) return {};
+    for (char& c : text) if (c == '/' || c == '.') c = '-'; else if (c == 'T') c = ' ';
+    // A bare time means today.
+    if (text.size() <= 8 && text.find(':') != std::string::npos) {
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        char date[16]{};
+        sprintf_s(date, "%04u-%02u-%02u ", now.wYear, now.wMonth, now.wDay);
+        text = date + text;
+    }
+    const std::string full = upper ? "9999-12-31 23:59:59" : "0000-01-01 00:00:00";
+    if (text.size() < full.size()) text += full.substr(text.size());
+    return text.substr(0, full.size());
+}
+
+struct LogFilter {
+    std::vector<std::string> keywords;  // lower-case UTF-8 alternatives
+    bool levels[5] = {true, true, true, true, true};
+    std::string timeFrom, timeTo;
+    bool Active() const {
+        return !keywords.empty() || !timeFrom.empty() || !timeTo.empty() || !(levels[0] && levels[1] && levels[2] && levels[3] && levels[4]);
+    }
+};
+
+// Continuation lines (stack traces etc.) take the level and time of the
+// line they belong to.
+struct LogLineState {
+    int level = kLevelNone;
+    std::string time;
+};
+
+bool LogLineMatches(const char* text, size_t length, const LogFilter& filter, LogLineState& state) {
+    const int level = DetectLogLevel(text, length);
+    std::string time = DetectLogTime(text, length);
+    const bool continuation = level == kLevelNone && time.empty();
+    if (!continuation) {
+        state.level = level;
+        if (!time.empty()) state.time = std::move(time);
+    }
+    if (!filter.levels[state.level]) return false;
+    if (!filter.timeFrom.empty() || !filter.timeTo.empty()) {
+        if (state.time.empty()) return false;
+        if (!filter.timeFrom.empty() && state.time < filter.timeFrom) return false;
+        if (!filter.timeTo.empty() && state.time > filter.timeTo) return false;
+    }
+    if (!filter.keywords.empty()) {
+        bool any = false;
+        for (const std::string& keyword : filter.keywords) {
+            if (ContainsNoCase(text, length, keyword)) { any = true; break; }
+        }
+        if (!any) return false;
+    }
+    return true;
+}
+
+// ---- Viewer state -----------------------------------------------------------------------
+
+struct LogViewer {
+    HWND window = nullptr, list = nullptr, keyword = nullptr, highlight = nullptr, from = nullptr, to = nullptr, status = nullptr, tail = nullptr;
+    HWND levelBoxes[5]{};
+    std::wstring path;
+    HANDLE file = INVALID_HANDLE_VALUE, mapping = nullptr;
+    const char* data = nullptr;
+    uint64_t size = 0;
+    UINT codePage = CP_UTF8;
+    LogIndex index;
+    bool indexed = false;
+    bool filtered = false;
+    std::vector<uint32_t> view;          // matching line numbers while filtered
+    LogFilter filter;
+    LogLineState tailState;              // classification state at the end of the file
+    std::vector<std::wstring> highlights; // lower-case words to mark in the text
+    std::atomic<bool> busy{false};
+    std::atomic<bool> cancel{false};
+    int generation = 0;
+    DWORD started = 0;
+    int lineHeight = 16;
+    int numberWidth = 60;
+};
+
+bool MapLogFile(LogViewer& log) {
+    if (log.data) UnmapViewOfFile(log.data);
+    if (log.mapping) CloseHandle(log.mapping);
+    log.data = nullptr;
+    log.mapping = nullptr;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(log.file, &size)) return false;
+    log.size = static_cast<uint64_t>(size.QuadPart);
+    if (log.size == 0) return true;
+    log.mapping = CreateFileMappingW(log.file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!log.mapping) return false;
+    log.data = static_cast<const char*>(MapViewOfFile(log.mapping, FILE_MAP_READ, 0, 0, 0));
+    return log.data != nullptr;
+}
+
+void CloseLogFile(LogViewer& log) {
+    if (log.data) UnmapViewOfFile(log.data);
+    if (log.mapping) CloseHandle(log.mapping);
+    if (log.file != INVALID_HANDLE_VALUE) CloseHandle(log.file);
+    log.data = nullptr;
+    log.mapping = nullptr;
+    log.file = INVALID_HANDLE_VALUE;
+}
+
+uint64_t LogRowCount(const LogViewer& log) {
+    return log.filtered ? log.view.size() : log.index.Lines(log.size);
+}
+
+uint64_t LogLineOfRow(const LogViewer& log, uint64_t row) {
+    return log.filtered ? log.view[static_cast<size_t>(row)] : row;
+}
+
+std::wstring LogLineText(const LogViewer& log, uint64_t line, size_t maxBytes = 8192) {
+    if (!log.data) return {};
+    auto [start, end] = LogLineRange(log.data, log.size, log.index, line);
+    const size_t length = static_cast<size_t>(std::min<uint64_t>(end - start, maxBytes));
+    if (length == 0) return {};
+    const int chars = MultiByteToWideChar(log.codePage, 0, log.data + start, static_cast<int>(length), nullptr, 0);
+    std::wstring text(static_cast<size_t>(chars), L'\0');
+    MultiByteToWideChar(log.codePage, 0, log.data + start, static_cast<int>(length), text.data(), chars);
+    if (end - start > maxBytes) text += L" …";
+    for (wchar_t& c : text) if (c == L'\t') c = L' ';
+    return text;
+}
+
+void UpdateLogStatus(LogViewer& log, const std::wstring& extra = {}) {
+    std::wstring text = L"共 " + std::to_wstring(log.index.Lines(log.size)) + L" 行";
+    if (log.filtered) text += L" · 筛选出 " + std::to_wstring(log.view.size()) + L" 行";
+    text += L" · " + FormatSize(log.size) + (log.codePage == CP_UTF8 ? L" · UTF-8" : L" · ANSI");
+    if (!extra.empty()) text += L" · " + extra;
+    SetWindowTextW(log.status, text.c_str());
+}
+
+void SetLogRowCount(LogViewer& log, bool keepPosition) {
+    const uint64_t rows = LogRowCount(log);
+    ListView_SetItemCountEx(log.list, static_cast<int>(std::min<uint64_t>(rows, INT_MAX)), keepPosition ? LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL : 0);
+    InvalidateRect(log.list, nullptr, FALSE);
+    // Line-number column fits the largest number.
+    HDC dc = GetDC(log.list);
+    HGDIOBJ previous = SelectObject(dc, g_app.editorFont);
+    SIZE extent{};
+    const std::wstring sample(std::to_wstring(std::max<uint64_t>(log.index.Lines(log.size), 1)).size(), L'9');
+    GetTextExtentPoint32W(dc, sample.c_str(), static_cast<int>(sample.size()), &extent);
+    SelectObject(dc, previous);
+    ReleaseDC(log.list, dc);
+    log.numberWidth = extent.cx + Scale(18);
+    ListView_SetColumnWidth(log.list, 0, log.numberWidth);
+}
+
+// ---- Indexing and filtering on a worker thread ----------------------------------------------
+
+struct LogIndexResult { int generation; LogIndex index; bool ok; };
+struct LogFilterResult { int generation; std::vector<uint32_t> view; LogLineState endState; bool ok; };
+
+void StartLogIndex(LogViewer& log) {
+    log.cancel = true;
+    while (log.busy) Sleep(5);
+    log.cancel = false;
+    log.busy = true;
+    log.indexed = false;
+    const int generation = ++log.generation;
+    log.started = GetTickCount();
+    const char* data = log.data;
+    const uint64_t size = log.size;
+    HWND window = log.window;
+    std::atomic<bool>* cancel = &log.cancel;
+    std::atomic<bool>* busy = &log.busy;
+    HANDLE thread = StartSearchThread([=] {
+        auto* result = new LogIndexResult{generation, {}, true};
+        result->ok = IndexLogBytes(data, size, result->index, cancel, window, generation);
+        busy->store(false);
+        if (!PostMessageW(window, kMessageLogIndexed, 0, reinterpret_cast<LPARAM>(result))) delete result;
+    });
+    if (thread) CloseHandle(thread);
+    else log.busy = false;
+    SetWindowTextW(log.status, L"正在建立行索引…");
+}
+
+void StartLogFilter(LogViewer& log) {
+    if (!log.indexed) return;
+    log.cancel = true;
+    while (log.busy) Sleep(5);
+    log.cancel = false;
+    if (!log.filter.Active()) {
+        log.filtered = false;
+        log.view.clear();
+        log.view.shrink_to_fit();
+        SetLogRowCount(log, false);
+        UpdateLogStatus(log);
+        return;
+    }
+    log.busy = true;
+    const int generation = ++log.generation;
+    log.started = GetTickCount();
+    const char* data = log.data;
+    const uint64_t size = log.size;
+    const LogIndex* index = &log.index;
+    const LogFilter filter = log.filter;
+    HWND window = log.window;
+    std::atomic<bool>* cancel = &log.cancel;
+    std::atomic<bool>* busy = &log.busy;
+    HANDLE thread = StartSearchThread([=] {
+        auto* result = new LogFilterResult{generation, {}, {}, true};
+        const uint64_t lines = index->Lines(size);
+        uint64_t start = 0;
+        for (uint64_t line = 0; line < lines; ++line) {
+            const void* hit = start < size ? memchr(data + start, '\n', static_cast<size_t>(size - start)) : nullptr;
+            const uint64_t next = hit ? static_cast<uint64_t>(static_cast<const char*>(hit) - data) + 1 : size;
+            uint64_t end = hit ? next - 1 : size;
+            if (end > start && data[end - 1] == '\r') --end;
+            if (LogLineMatches(data + start, static_cast<size_t>(end - start), filter, result->endState)) result->view.push_back(static_cast<uint32_t>(line));
+            start = next;
+            if ((line & 0x3FFFF) == 0 && line) {
+                if (*cancel) { result->ok = false; break; }
+                PostMessageW(window, kMessageLogProgress, generation, static_cast<LPARAM>(start * 1000 / std::max<uint64_t>(size, 1)));
+            }
+        }
+        busy->store(false);
+        if (!PostMessageW(window, kMessageLogFiltered, 0, reinterpret_cast<LPARAM>(result))) delete result;
+    });
+    if (thread) CloseHandle(thread);
+    else log.busy = false;
+    SetWindowTextW(log.status, L"正在筛选…");
+}
+
+std::vector<std::string> SplitKeywords(const std::wstring& text) {
+    std::vector<std::string> words;
+    std::wstring current;
+    for (size_t i = 0; i <= text.size(); ++i) {
+        if (i == text.size() || text[i] == L'|' || text[i] == L';') {
+            const std::wstring word = TrimCopy(current);
+            if (!word.empty()) {
+                std::string utf8 = WideToUtf8(word);
+                for (char& c : utf8) c = AsciiLower(c);
+                words.push_back(utf8);
+            }
+            current.clear();
+        } else {
+            current += text[i];
+        }
+    }
+    return words;
+}
+
+void ApplyLogFilterFromControls(LogViewer& log) {
+    log.filter.keywords = SplitKeywords(GetWindowTextValue(log.keyword));
+    for (int l = 0; l < 5; ++l) log.filter.levels[l] = SendMessageW(log.levelBoxes[l], BM_GETCHECK, 0, 0) == BST_CHECKED;
+    log.filter.timeFrom = NormalizeTimeInput(GetWindowTextValue(log.from), false);
+    log.filter.timeTo = NormalizeTimeInput(GetWindowTextValue(log.to), true);
+    log.highlights.clear();
+    for (const std::wstring& source : {GetWindowTextValue(log.highlight), GetWindowTextValue(log.keyword)}) {
+        std::wstring current;
+        for (size_t i = 0; i <= source.size(); ++i) {
+            if (i == source.size() || source[i] == L'|' || source[i] == L';') {
+                std::wstring word = TrimCopy(current);
+                if (!word.empty()) {
+                    for (wchar_t& c : word) c = towlower(c);
+                    log.highlights.push_back(word);
+                }
+                current.clear();
+            } else {
+                current += source[i];
+            }
+        }
+    }
+    StartLogFilter(log);
+}
+
+// ---- Live tail ---------------------------------------------------------------------------
+
+void PollLogTail(LogViewer& log) {
+    if (log.busy || !log.indexed) return;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(log.file, &size)) return;
+    const uint64_t newSize = static_cast<uint64_t>(size.QuadPart);
+    if (newSize == log.size) return;
+    if (newSize < log.size) {  // truncated or rotated: start over
+        MapLogFile(log);
+        log.index = LogIndex{};
+        StartLogIndex(log);
+        return;
+    }
+    const uint64_t oldLines = log.index.Lines(log.size);
+    const uint64_t firstChanged = oldLines > 0 && log.size > log.index.indexedEnd ? oldLines - 1 : oldLines;  // a partial line may have grown
+    if (!MapLogFile(log)) return;
+    IndexLogBytes(log.data, log.size, log.index);
+    if (log.filtered) {
+        if (!log.view.empty() && log.view.back() >= firstChanged) log.view.pop_back();
+        const uint64_t lines = log.index.Lines(log.size);
+        for (uint64_t line = firstChanged; line < lines; ++line) {
+            auto [start, end] = LogLineRange(log.data, log.size, log.index, line);
+            if (LogLineMatches(log.data + start, static_cast<size_t>(end - start), log.filter, log.tailState)) log.view.push_back(static_cast<uint32_t>(line));
+        }
+    }
+    SetLogRowCount(log, true);
+    const int rows = ListView_GetItemCount(log.list);
+    if (rows > 0) ListView_EnsureVisible(log.list, rows - 1, FALSE);
+    UpdateLogStatus(log, L"实时跟踪中");
+}
+
+// ---- Drawing ----------------------------------------------------------------------------
+
+COLORREF LogLevelColor(int level) {
+    const bool dark = g_app.darkTheme;
+    switch (level) {
+    case kLevelError: return dark ? RGB(244, 112, 103) : RGB(200, 30, 30);
+    case kLevelWarn: return dark ? RGB(229, 192, 123) : RGB(170, 105, 0);
+    case kLevelDebug: return CurrentPalette().gutterText;
+    default: return CurrentPalette().editorText;
+    }
+}
+
+void DrawLogRow(LogViewer& log, const DRAWITEMSTRUCT& item) {
+    HDC dc = item.hDC;
+    const ThemePalette& palette = CurrentPalette();
+    const bool selected = (item.itemState & ODS_SELECTED) != 0;
+    const COLORREF background = selected ? Blend(palette.editorBackground, palette.accent, g_app.darkTheme ? 30 : 22) : palette.editorBackground;
+    HBRUSH brush = CreateSolidBrush(background);
+    FillRect(dc, &item.rcItem, brush);
+    DeleteObject(brush);
+    const uint64_t row = item.itemID;
+    if (row >= LogRowCount(log) || !log.data) return;
+    const uint64_t line = LogLineOfRow(log, row);
+    HGDIOBJ previous = SelectObject(dc, g_app.editorFont);
+    SetBkMode(dc, TRANSPARENT);
+
+    RECT number = item.rcItem;
+    number.right = number.left + log.numberWidth - Scale(8);
+    SetTextColor(dc, palette.gutterText);
+    const std::wstring lineNumber = std::to_wstring(line + 1);
+    DrawTextW(dc, lineNumber.c_str(), static_cast<int>(lineNumber.size()), &number, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    auto [start, end] = LogLineRange(log.data, log.size, log.index, line);
+    int level = DetectLogLevel(log.data + start, static_cast<size_t>(end - start));
+    // Continuation lines (stack traces) take the colour of the line they belong to.
+    if (level == kLevelNone && DetectLogTime(log.data + start, static_cast<size_t>(end - start)).empty()) {
+        for (uint64_t back = 1; back <= 50 && back <= line; ++back) {
+            auto [s0, e0] = LogLineRange(log.data, log.size, log.index, line - back);
+            const int found = DetectLogLevel(log.data + s0, static_cast<size_t>(e0 - s0));
+            if (found != kLevelNone || !DetectLogTime(log.data + s0, static_cast<size_t>(e0 - s0)).empty()) {
+                level = found;
+                break;
+            }
+        }
+    }
+    const std::wstring text = LogLineText(log, line);
+    int x = item.rcItem.left + log.numberWidth;
+    const int y = item.rcItem.top + (item.rcItem.bottom - item.rcItem.top - log.lineHeight) / 2 + Scale(1);
+
+    // Highlight ranges (case-insensitive).
+    std::vector<std::pair<size_t, size_t>> marks;
+    if (!log.highlights.empty()) {
+        std::wstring lower = text;
+        for (wchar_t& c : lower) c = towlower(c);
+        for (const std::wstring& word : log.highlights) {
+            for (size_t at = lower.find(word); at != std::wstring::npos; at = lower.find(word, at + word.size())) marks.emplace_back(at, at + word.size());
+        }
+        std::sort(marks.begin(), marks.end());
+    }
+    const COLORREF textColor = LogLevelColor(level);
+    const COLORREF markBack = g_app.darkTheme ? RGB(110, 60, 40) : RGB(255, 214, 170);
+    size_t position = 0;
+    const auto drawRun = [&](size_t from, size_t to, bool marked) {
+        if (to <= from) return;
+        SIZE extent{};
+        GetTextExtentPoint32W(dc, text.c_str() + from, static_cast<int>(to - from), &extent);
+        if (marked) {
+            RECT back{x, item.rcItem.top + Scale(1), x + extent.cx, item.rcItem.bottom - Scale(1)};
+            HBRUSH markBrush = CreateSolidBrush(markBack);
+            FillRect(dc, &back, markBrush);
+            DeleteObject(markBrush);
+        }
+        SetTextColor(dc, marked ? (g_app.darkTheme ? RGB(255, 236, 200) : RGB(120, 30, 0)) : textColor);
+        ExtTextOutW(dc, x, y, 0, nullptr, text.c_str() + from, static_cast<UINT>(to - from), nullptr);
+        x += extent.cx;
+    };
+    for (const auto& [from, to] : marks) {
+        if (from < position) continue;
+        drawRun(position, from, false);
+        drawRun(from, to, true);
+        position = to;
+        if (x > item.rcItem.right) break;
+    }
+    if (x <= item.rcItem.right) drawRun(position, text.size(), false);
+    SelectObject(dc, previous);
+}
+
+// ---- Commands ---------------------------------------------------------------------------
+
+std::wstring LogSelectedText(LogViewer& log, size_t maxLines) {
+    std::wstring text;
+    size_t count = 0;
+    for (int row = -1; (row = ListView_GetNextItem(log.list, row, LVNI_SELECTED)) >= 0 && count < maxLines; ++count) {
+        text += LogLineText(log, LogLineOfRow(log, static_cast<uint64_t>(row)), 1 << 20) + L"\r\n";
+    }
+    return text;
+}
+
+void CopyLogSelection(LogViewer& log) {
+    const std::wstring text = LogSelectedText(log, 200000);
+    if (!text.empty()) CopyTextToClipboard(text);
+}
+
+// Filtered lines (or the selection) into a new editor tab.
+void ExportLogToTab(LogViewer& log) {
+    const bool selection = ListView_GetSelectedCount(log.list) > 1;
+    std::wstring text;
+    if (selection) {
+        text = LogSelectedText(log, 200000);
+    } else {
+        const uint64_t rows = std::min<uint64_t>(LogRowCount(log), 200000);
+        for (uint64_t row = 0; row < rows && text.size() < (64u << 20); ++row) text += LogLineText(log, LogLineOfRow(log, row), 1 << 20) + L"\r\n";
+        if (LogRowCount(log) > rows) text += L"…（只导出了前 200000 行）\r\n";
+    }
+    const std::wstring title = fs::path(log.path).filename().wstring() + (selection ? L" - 选中行" : log.filtered ? L" - 筛选结果" : L" - 前 200000 行");
+    const int index = CreateDocument({}, title, text, true, true, 0, 0, 0);
+    if (index >= 0) {
+        SelectTab(index);
+        SetForegroundWindow(g_app.window);
+    }
+}
+
+enum LogControl : int {
+    kLogKeyword = 4201, kLogHighlight, kLogFrom, kLogTo, kLogApply, kLogClear, kLogTail, kLogExport, kLogEnd, kLogList,
+    kLogLevelFirst = 4220,  // ..4224
+};
+
+void LayoutLogViewer(LogViewer& log) {
+    RECT client{};
+    GetClientRect(log.window, &client);
+    const int width = client.right, height = client.bottom;
+    const int rowH = Scale(26), gap = Scale(6);
+    int y = Scale(8);
+    int x = Scale(10);
+    const auto place = [&](HWND control, int w, int h = 0) {
+        MoveWindow(control, x, y + (h ? (rowH - h) / 2 : 0), w, h ? h : rowH, TRUE);
+        x += w + gap;
+    };
+    place(GetDlgItem(log.window, 4301), Scale(40), Scale(20));
+    place(log.keyword, Scale(220));
+    place(GetDlgItem(log.window, 4302), Scale(40), Scale(20));
+    place(log.highlight, Scale(220));
+    place(GetDlgItem(log.window, kLogApply), Scale(64));
+    place(GetDlgItem(log.window, kLogClear), Scale(64));
+    y += rowH + gap;
+    x = Scale(10);
+    place(GetDlgItem(log.window, 4303), Scale(40), Scale(20));
+    place(log.from, Scale(150));
+    place(GetDlgItem(log.window, 4304), Scale(16), Scale(20));
+    place(log.to, Scale(150));
+    x += gap;
+    const std::pair<int, int> levelOrder[] = {{1, 64}, {2, 60}, {3, 56}, {4, 68}, {0, 56}};
+    for (const auto& [l, w] : levelOrder) place(log.levelBoxes[l], Scale(w), Scale(22));
+    x += gap;
+    place(log.tail, Scale(84), Scale(22));
+    place(GetDlgItem(log.window, kLogEnd), Scale(64));
+    place(GetDlgItem(log.window, kLogExport), Scale(108));
+    y += rowH + gap;
+    MoveWindow(log.status, Scale(10), y, width - Scale(20), Scale(20), TRUE);
+    y += Scale(24);
+    MoveWindow(log.list, Scale(10), y, std::max(0, width - Scale(20)), std::max(0, height - y - Scale(10)), TRUE);
+    RECT listClient{};
+    GetClientRect(log.list, &listClient);
+    ListView_SetColumnWidth(log.list, 1, std::max<int>(listClient.right - log.numberWidth, Scale(2400)));
+}
+
+LRESULT CALLBACK LogViewerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* log = reinterpret_cast<LogViewer*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE: {
+        log = static_cast<LogViewer*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(log));
+        log->window = window;
+        HDC dc = GetDC(window);
+        HGDIOBJ previous = SelectObject(dc, g_app.editorFont);
+        TEXTMETRICW metrics{};
+        GetTextMetricsW(dc, &metrics);
+        SelectObject(dc, previous);
+        ReleaseDC(window, dc);
+        log->lineHeight = metrics.tmHeight;
+        const auto makeLabel = [&](int id, const wchar_t* text) {
+            HWND label = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+            SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        };
+        const auto makeEdit = [&](int id, const wchar_t* text, const wchar_t* cue) {
+            HWND edit = CreateWindowExW(0, L"EDIT", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+            SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            SendMessageW(edit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(cue));
+            if (g_app.darkTheme) SetWindowTheme(edit, L"DarkMode_CFD", nullptr);
+            return edit;
+        };
+        const auto makeButton = [&](int id, const wchar_t* text, DWORD style = 0) {
+            HWND button = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | style, 0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+            SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            if (style & BS_AUTOCHECKBOX) ThemeCheckbox(button);
+            else if (g_app.darkTheme) SetWindowTheme(button, L"DarkMode_Explorer", nullptr);
+            return button;
+        };
+        makeLabel(4301, L"筛选");
+        log->keyword = makeEdit(kLogKeyword, L"", L"包含关键词，多个用 | 分隔");
+        makeLabel(4302, L"高亮");
+        log->highlight = makeEdit(kLogHighlight, L"error|exception|fail|fatal|timeout", L"高亮关键词，多个用 | 分隔");
+        makeButton(kLogApply, L"应用");
+        makeButton(kLogClear, L"清除");
+        makeLabel(4303, L"时间");
+        log->from = makeEdit(kLogFrom, L"", L"从 2026-11-23 10:00");
+        makeLabel(4304, L"至");
+        log->to = makeEdit(kLogTo, L"", L"到 2026-11-23 12:00");
+        const wchar_t* levels[5] = {L"其他", L"ERROR", L"WARN", L"INFO", L"DEBUG"};
+        // Shown in the order ERROR, WARN, INFO, DEBUG, 其他.
+        for (const int l : {1, 2, 3, 4, 0}) {
+            log->levelBoxes[l] = makeButton(kLogLevelFirst + l, levels[l], BS_AUTOCHECKBOX);
+            SendMessageW(log->levelBoxes[l], BM_SETCHECK, BST_CHECKED, 0);
+        }
+        log->tail = makeButton(kLogTail, L"实时跟踪", BS_AUTOCHECKBOX);
+        makeButton(kLogEnd, L"到末尾");
+        makeButton(kLogExport, L"导出到新标签");
+        log->status = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
+        SendMessageW(log->status, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        log->list = CreateWindowExW(0, WC_LISTVIEWW, nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_OWNERDRAWFIXED | LVS_NOCOLUMNHEADER | LVS_SHOWSELALWAYS,
+            0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogList)), g_app.instance, nullptr);
+        ListView_SetExtendedListViewStyle(log->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        SendMessageW(log->list, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+        SetWindowTheme(log->list, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        ListView_SetBkColor(log->list, CurrentPalette().editorBackground);
+        for (int c = 0; c < 2; ++c) {
+            LVCOLUMNW column{};
+            column.mask = LVCF_WIDTH;
+            column.cx = Scale(c == 0 ? 60 : 2400);
+            ListView_InsertColumn(log->list, c, &column);
+        }
+        return 0;
+    }
+    case WM_MEASUREITEM: {
+        auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if (measure->CtlType == ODT_LISTVIEW) {
+            measure->itemHeight = static_cast<UINT>((log ? log->lineHeight : 16) + Scale(3));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_DRAWITEM: {
+        auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (log && draw->CtlType == ODT_LISTVIEW) {
+            DrawLogRow(*log, *draw);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_SIZE:
+        if (log && log->list) LayoutLogViewer(*log);
+        return 0;
+    case WM_GETMINMAXINFO:
+        reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = POINT{Scale(900), Scale(400)};
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.toolbarBrush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, reinterpret_cast<HWND>(lParam) == (log ? log->status : nullptr) ? CurrentPalette().statusText : CurrentPalette().toolbarText);
+        SetBkColor(dc, CurrentPalette().toolbarBackground);
+        return reinterpret_cast<LRESULT>(g_app.toolbarBrush);
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, CurrentPalette().editorText);
+        SetBkColor(dc, CurrentPalette().controlBackground);
+        static HBRUSH brush = nullptr;
+        static COLORREF brushColor = 0;
+        if (!brush || brushColor != CurrentPalette().controlBackground) {
+            if (brush) DeleteObject(brush);
+            brushColor = CurrentPalette().controlBackground;
+            brush = CreateSolidBrush(brushColor);
+        }
+        return reinterpret_cast<LRESULT>(brush);
+    }
+    case kMessageLogProgress:
+        if (log && static_cast<int>(wParam) == log->generation) {
+            wchar_t text[64]{};
+            swprintf_s(text, L"%s %.1f%%", log->indexed ? L"正在筛选…" : L"正在建立行索引…", lParam / 10.0);
+            SetWindowTextW(log->status, text);
+        }
+        return 0;
+    case kMessageLogIndexed: {
+        std::unique_ptr<LogIndexResult> result(reinterpret_cast<LogIndexResult*>(lParam));
+        if (!log || result->generation != log->generation || !result->ok) return 0;
+        log->index = std::move(result->index);
+        log->indexed = true;
+        const DWORD elapsed = GetTickCount() - log->started;
+        log->filtered = false;
+        SetLogRowCount(*log, false);
+        ApplyLogFilterFromControls(*log);
+        if (!log->busy) UpdateLogStatus(*log, L"索引用时 " + std::to_wstring(elapsed) + L" ms");
+        if (SendMessageW(log->tail, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            const int rows = ListView_GetItemCount(log->list);
+            if (rows > 0) ListView_EnsureVisible(log->list, rows - 1, FALSE);
+        }
+        return 0;
+    }
+    case kMessageLogFiltered: {
+        std::unique_ptr<LogFilterResult> result(reinterpret_cast<LogFilterResult*>(lParam));
+        if (!log || result->generation != log->generation || !result->ok) return 0;
+        log->view = std::move(result->view);
+        log->tailState = result->endState;
+        log->filtered = true;
+        SetLogRowCount(*log, false);
+        UpdateLogStatus(*log, L"筛选用时 " + std::to_wstring(GetTickCount() - log->started) + L" ms");
+        if (ListView_GetItemCount(log->list) > 0) ListView_SetItemState(log->list, 0, LVIS_FOCUSED, LVIS_FOCUSED);
+        return 0;
+    }
+    case WM_TIMER:
+        if (log && wParam == kTimerLogTail) PollLogTail(*log);
+        return 0;
+    case WM_NOTIFY: {
+        auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (log && header->hwndFrom == log->list && header->code == NM_DBLCLK) {
+            // The clicked line and its neighbourhood into the editor.
+            const int row = ListView_GetNextItem(log->list, -1, LVNI_FOCUSED);
+            if (row >= 0) {
+                const uint64_t line = LogLineOfRow(*log, static_cast<uint64_t>(row));
+                const uint64_t first = line > 200 ? line - 200 : 0;
+                const uint64_t last = std::min<uint64_t>(log->index.Lines(log->size), line + 200);
+                std::wstring text;
+                for (uint64_t l = first; l < last; ++l) text += LogLineText(*log, l, 1 << 20) + L"\r\n";
+                const int index = CreateDocument({}, fs::path(log->path).filename().wstring() + L" - 第 " + std::to_wstring(first + 1) + L"-" +
+                    std::to_wstring(last) + L" 行", text, true, true, 0, 0, 0);
+                if (index >= 0) {
+                    SelectTab(index);
+                    if (HWND editor = ActiveEditor()) {
+                        const LRESULT position = SendMessageW(editor, EM_LINEINDEX, static_cast<WPARAM>(line - first), 0);
+                        SendMessageW(editor, EM_SETSEL, position, position);
+                        SendMessageW(editor, EM_SCROLLCARET, 0, 0);
+                    }
+                    SetForegroundWindow(g_app.window);
+                }
+            }
+            return 0;
+        }
+        break;
+    }
+    case WM_COMMAND:
+        if (!log) break;
+        switch (LOWORD(wParam)) {
+        case kLogApply: case IDOK: ApplyLogFilterFromControls(*log); return 0;
+        case kLogClear:
+            SetWindowTextW(log->keyword, L"");
+            SetWindowTextW(log->from, L"");
+            SetWindowTextW(log->to, L"");
+            for (HWND box : log->levelBoxes) SendMessageW(box, BM_SETCHECK, BST_CHECKED, 0);
+            ApplyLogFilterFromControls(*log);
+            return 0;
+        case kLogTail:
+            if (SendMessageW(log->tail, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+                SetTimer(window, kTimerLogTail, 500, nullptr);
+                PollLogTail(*log);
+                const int rows = ListView_GetItemCount(log->list);
+                if (rows > 0) ListView_EnsureVisible(log->list, rows - 1, FALSE);
+            } else {
+                KillTimer(window, kTimerLogTail);
+                UpdateLogStatus(*log);
+            }
+            return 0;
+        case kLogEnd: {
+            const int rows = ListView_GetItemCount(log->list);
+            if (rows > 0) {
+                ListView_SetItemState(log->list, -1, 0, LVIS_SELECTED);
+                ListView_SetItemState(log->list, rows - 1, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                ListView_EnsureVisible(log->list, rows - 1, FALSE);
+            }
+            return 0;
+        }
+        case kLogExport: ExportLogToTab(*log); return 0;
+        case IDCANCEL: DestroyWindow(window); return 0;
+        default:
+            if (LOWORD(wParam) >= kLogLevelFirst && LOWORD(wParam) < kLogLevelFirst + 5 && HIWORD(wParam) == BN_CLICKED) {
+                ApplyLogFilterFromControls(*log);
+                return 0;
+            }
+            break;
+        }
+        break;
+    case WM_DESTROY:
+        if (log) {
+            KillTimer(window, kTimerLogTail);
+            log->cancel = true;
+            while (log->busy) Sleep(5);
+            CloseLogFile(*log);
+        }
+        break;
+    case WM_NCDESTROY:
+        delete log;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+bool OpenLogViewer(const std::wstring& path) {
+    auto log = std::make_unique<LogViewer>();
+    log->path = path;
+    log->file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (log->file == INVALID_HANDLE_VALUE || !MapLogFile(*log)) {
+        CloseLogFile(*log);
+        MessageBoxW(g_app.window, (L"无法打开：" + path).c_str(), kWindowTitle, MB_ICONERROR);
+        return false;
+    }
+    if (log->size >= 2 && ((static_cast<unsigned char>(log->data[0]) == 0xFF && static_cast<unsigned char>(log->data[1]) == 0xFE) ||
+                           (static_cast<unsigned char>(log->data[0]) == 0xFE && static_cast<unsigned char>(log->data[1]) == 0xFF))) {
+        CloseLogFile(*log);
+        MessageBoxW(g_app.window, L"日志查看器暂不支持 UTF-16 编码的文件，请在编辑器中打开。", kWindowTitle, MB_ICONINFORMATION);
+        return false;
+    }
+    // UTF-8 unless the start of the file is not valid UTF-8.
+    if (log->size > 0) {
+        int sample = static_cast<int>(std::min<uint64_t>(log->size, 1 << 20));
+        while (sample > 0 && sample < static_cast<int>(log->size) && (static_cast<unsigned char>(log->data[sample]) & 0xC0) == 0x80) --sample;
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, log->data, sample, nullptr, 0) == 0) log->codePage = CP_ACP;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{};
+        klass.hInstance = g_app.instance;
+        klass.lpfnWndProc = LogViewerProc;
+        klass.lpszClassName = L"MCnotepadLog";
+        klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        klass.hIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_MCNOTEPAD));
+        registered = RegisterClassW(&klass) != 0;
+    }
+    RECT owner{};
+    GetWindowRect(g_app.window, &owner);
+    LogViewer* raw = log.release();
+    const std::wstring title = L"日志 - " + path;
+    HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, L"MCnotepadLog", title.c_str(), WS_OVERLAPPEDWINDOW,
+        owner.left + Scale(30), owner.top + Scale(30), std::max(Scale(1100), static_cast<int>(owner.right - owner.left) - Scale(60)),
+        std::max(Scale(640), static_cast<int>(owner.bottom - owner.top) - Scale(60)), nullptr, nullptr, g_app.instance, raw);
+    if (!window) {
+        CloseLogFile(*raw);
+        delete raw;
+        return false;
+    }
+    ApplyWindowFrameTheme(window);
+    g_toolWindows.push_back(window);
+    LayoutLogViewer(*raw);
+    ShowWindow(window, SW_SHOW);
+    StartLogIndex(*raw);
+    return true;
+}
+
+void OpenLogViewerCommand() {
+    const std::wstring path = PickFile(L"选择日志文件（支持数 GB 的大文件）");
+    if (!path.empty()) OpenLogViewer(path);
+}
+
+bool LogViewerKey(HWND root, WPARAM key) {
+    auto* log = reinterpret_cast<LogViewer*>(GetWindowLongPtrW(root, GWLP_USERDATA));
+    if (!log) return false;
+    const bool control = GetKeyState(VK_CONTROL) < 0;
+    if (control && key == 'C' && GetFocus() == log->list) { CopyLogSelection(*log); return true; }
+    if (control && key == 'F') { SetFocus(log->keyword); SendMessageW(log->keyword, EM_SETSEL, 0, -1); return true; }
+    if (key == VK_F5) {
+        log->index = LogIndex{};
+        MapLogFile(*log);
+        StartLogIndex(*log);
+        return true;
+    }
+    if (key == VK_RETURN && GetFocus() != log->list) { ApplyLogFilterFromControls(*log); return true; }
+    return false;
+}
+
 // Keys for the compare window: F8 / Shift+F8 next/previous difference,
 // Ctrl+S saves the changed sides, F5 refreshes.
 bool ToolWindowKey(HWND root, WPARAM key) {
@@ -11798,6 +13724,7 @@ bool ToolWindowKey(HWND root, WPARAM key) {
             return true;
         }
     }
+    if (wcscmp(klass, L"MCnotepadLog") == 0) return LogViewerKey(root, key);
     if (wcscmp(klass, L"MCnotepadFolderCompare") == 0 && key == VK_F5) {
         SendMessageW(root, WM_COMMAND, kFolderRefresh, 0);
         return true;
@@ -11957,6 +13884,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdCompareStructure: CompareTwoFilesCommand(true); break;
         case kIdCompareWithFile: CompareActiveWithFileCommand(); break;
         case kIdCompareFolders: CompareFoldersCommand(); break;
+        case kIdOpenLogViewer: OpenLogViewerCommand(); break;
+        case kIdToggleToolbox: ToggleToolbox(!g_app.toolboxVisible); break;
         case kIdToolbarRun: RunActiveDocument(); break;
         case kIdToolbarEncoding:
             ShowEncodingMenu(ToolbarItemScreenRect(kIdToolbarEncoding));
@@ -12068,6 +13997,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         const NMHDR* header = reinterpret_cast<const NMHDR*>(lParam);
         if (header != nullptr && header->code == EN_SELCHANGE) {
             UpdateStatusBar();
+            ToolboxOnSelectionChanged();
             RefreshGutter();  // current-line number follows the caret
             return 0;
         }
@@ -12120,10 +14050,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         std::vector<std::wstring> files;
         files.swap(g_app.pendingOpenFiles);
         for (size_t f = 0; f < files.size(); ++f) {
-            if (files[f] == L"--diff" && f + 2 < files.size()) {
+            if (files[f] == L"--log" && f + 1 < files.size()) {
+                OpenLogViewer(files[++f]);
+                continue;
+            }
+            if ((files[f] == L"--diff" || files[f] == L"--diff-struct") && f + 2 < files.size()) {
                 std::error_code error;
                 if (fs::is_directory(files[f + 1], error) && fs::is_directory(files[f + 2], error)) CompareFolderPaths(files[f + 1], files[f + 2]);
-                else CompareFiles(files[f + 1], files[f + 2]);
+                else CompareFiles(files[f + 1], files[f + 2], files[f] == L"--diff-struct");
                 f += 2;
                 continue;
             }
@@ -12200,7 +14134,7 @@ void ForwardToRunningInstance() {
     if (LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount)) {
         for (int index = 1; index < argumentCount; ++index) {
             const std::wstring argument = arguments[index];
-            if (argument == L"--diff") {
+            if (argument == L"--diff" || argument == L"--diff-struct" || argument == L"--log") {
                 payload += argument;
                 payload.push_back(L'\0');
                 continue;
@@ -12316,6 +14250,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
         ShowWindow(window, showCommand);
     }
     UpdateWindow(window);
+    if (g_app.toolboxVisible) ToggleToolbox(true);
     OpenCommandLineFiles();
     PostMessageW(window, kMessageCheckExternalChanges, 0, 0);
 
@@ -12326,9 +14261,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
         // main window's Ctrl+C/V/Z accelerators from hijacking their text boxes.
         // Search panel: app shortcuts first (edit commands are routed to its
         // text boxes), then Tab/Enter/Esc dialog navigation.
-        if (g_app.searchPanel && IsChild(g_app.searchPanel, message.hwnd)) {
+        if ((g_app.searchPanel && IsChild(g_app.searchPanel, message.hwnd)) || (g_app.toolboxPanel && IsChild(g_app.toolboxPanel, message.hwnd))) {
             if (TranslateAcceleratorW(window, accelerators, &message)) continue;
-            if (IsDialogMessageW(g_app.searchPanel, &message)) continue;
+            HWND panel = g_app.toolboxPanel && IsChild(g_app.toolboxPanel, message.hwnd) ? g_app.toolboxPanel : g_app.searchPanel;
+            // Enter belongs to the multi-line boxes.
+            wchar_t klass[16]{};
+            GetClassNameW(message.hwnd, klass, 16);
+            const bool multilineEnter = message.message == WM_KEYDOWN && message.wParam == VK_RETURN && _wcsicmp(klass, L"Edit") == 0 &&
+                (GetWindowLongW(message.hwnd, GWL_STYLE) & ES_MULTILINE);
+            if (!multilineEnter && IsDialogMessageW(panel, &message)) continue;
             TranslateMessage(&message);
             DispatchMessageW(&message);
             continue;
