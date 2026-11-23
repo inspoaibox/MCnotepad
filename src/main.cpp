@@ -124,6 +124,7 @@ enum TextToolId : int {
     kIdToTraditional, kIdToSimplified,
     kIdBase64Encode, kIdBase64Decode, kIdUrlEncode, kIdUrlDecode, kIdRegexReplace,
     kIdExtractEmails, kIdExtractUrls, kIdExtractIps, kIdExtractNumbers, kIdExtractKeywordLines, kIdExtractFields,
+    kIdOutputReplace, kIdOutputNewTab, kIdOutputInsertBelow,  // order = ToolOutput values
     kIdTogglePreview,
     kIdTextToolLast = kIdTogglePreview
 };
@@ -248,6 +249,7 @@ struct AppState {
     bool searchPanelVisible = false;
     HMENU searchHistoryMenu = nullptr;
     bool previewTextTools = true;
+    int toolOutputMode = 1;  // 0 replace, 1 new tab, 2 insert below the original
     ULONGLONG statusNoticeUntil = 0;
     UINT dpi = 96;
     int gutterWidth = 42;
@@ -308,6 +310,8 @@ void RenameDocument(int index);
 void AppendTextToolMenus(HMENU menu);
 void ThemeCheckbox(HWND box);
 void ShowNotice(const std::wstring& text);
+void ApplyToolResult(TabDocument& document, CHARRANGE range, const std::wstring& result, int mode,
+    const std::wstring& toolName, std::wstring notice);
 void ApplySearchPanelTheme();
 void HideSearchPanel();
 bool EncodeTextBytes(std::wstring_view text, int encoding, std::string& bytes);
@@ -1645,7 +1649,8 @@ bool SaveSessionFile() {
            << g_app.lineEndingIndex << "\n";
     output << "PREFERENCES\t" << (g_app.launchAtStartup ? 1 : 0) << '\t'
            << static_cast<int>(g_app.closeBehavior) << '\t'
-           << (g_app.previewTextTools ? 1 : 0) << "\n";
+           << (g_app.previewTextTools ? 1 : 0) << '\t'
+           << g_app.toolOutputMode << "\n";
 
     // rcNormalPosition is the restored size even while maximized/minimized.
     WINDOWPLACEMENT placement{};
@@ -2172,6 +2177,7 @@ void SetMenuState() {
         (g_app.wordWrap ? MF_CHECKED : MF_UNCHECKED));
     CheckDocumentMenuItems(menu);
     CheckMenuItem(menu, kIdTogglePreview, MF_BYCOMMAND | (g_app.previewTextTools ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuRadioItem(menu, kIdOutputReplace, kIdOutputInsertBelow, kIdOutputReplace + g_app.toolOutputMode, MF_BYCOMMAND);
     CheckMenuItem(menu, kIdToggleSearchPanel, MF_BYCOMMAND | (g_app.searchPanelVisible ? MF_CHECKED : MF_UNCHECKED));
 }
 
@@ -2328,6 +2334,8 @@ void LoadPersistedSession() {
             ParseInt(parts[2], persistedCloseBehavior);
             int preview = 1;
             if (parts.size() >= 4 && ParseInt(parts[3], preview)) g_app.previewTextTools = preview != 0;
+            int outputMode = 1;
+            if (parts.size() >= 5 && ParseInt(parts[4], outputMode)) g_app.toolOutputMode = std::clamp(outputMode, 0, 2);
         } else if (parts[0] == "WINDOW" && parts.size() >= 6) {
             int left = 0, top = 0, width = 0, height = 0, maximized = 0;
             if (ParseInt(parts[1], left) && ParseInt(parts[2], top) &&
@@ -3325,12 +3333,11 @@ void FormatActiveDocument() {
         MessageBoxW(g_app.window, (L"JSON 格式化失败。\n" + error).c_str(), kWindowTitle, MB_ICONWARNING);
         return;
     }
-    // Replace through the selection so the change can be undone with Ctrl+Z.
-    SendMessageW(document->editor, EM_SETSEL, 0, -1);
-    SendMessageW(document->editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(formatted.c_str()));
-    SendMessageW(document->editor, EM_SETSEL, 0, 0);
-    HighlightDocument(*document);
-    RefreshGutter();
+    const std::wstring raw = GetEditorRawText(document->editor);
+    CHARRANGE range{0, static_cast<LONG>(raw.size())};
+    if (!raw.empty() && raw.back() == L'\r') --range.cpMax;
+    ApplyToolResult(*document, range, formatted, g_app.toolOutputMode, L"格式化 JSON", L"已格式化 JSON");
+    if (TabDocument* active = ActiveDocument()) HighlightDocument(*active);
 }
 
 // ---- Run ------------------------------------------------------------------
@@ -4561,7 +4568,15 @@ void RefreshChrome() {
 
 // ---- Small modal input dialog (1-2 text fields) ------------------------------
 
+struct PromptChoice {
+    std::wstring label;
+    std::vector<std::wstring> options;
+    int selected = 0;
+};
+
 struct PromptState {
+    std::vector<PromptChoice>* choices = nullptr;
+    std::vector<HWND> combos;
     std::vector<std::wstring> labels;
     std::vector<std::wstring>* values = nullptr;
     std::vector<HWND> edits;
@@ -4588,6 +4603,20 @@ LRESULT CALLBACK PromptProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             state->edits.push_back(edit);
             y += 58;
         }
+        if (state->choices) {
+            for (const PromptChoice& choice : *state->choices) {
+                HWND label = CreateWindowExW(0, L"STATIC", choice.label.c_str(), WS_CHILD | WS_VISIBLE,
+                    Scale(16), Scale(y), Scale(340), Scale(20), window, nullptr, g_app.instance, nullptr);
+                HWND combo = CreateWindowExW(0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+                    Scale(16), Scale(y + 22), Scale(340), Scale(200), window, nullptr, g_app.instance, nullptr);
+                for (const std::wstring& option : choice.options) SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(option.c_str()));
+                SendMessageW(combo, CB_SETCURSEL, std::clamp(choice.selected, 0, static_cast<int>(choice.options.size()) - 1), 0);
+                for (HWND control : {label, combo}) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+                if (g_app.darkTheme) SetWindowTheme(combo, L"DarkMode_CFD", nullptr);
+                state->combos.push_back(combo);
+                y += 58;
+            }
+        }
         if (state->checks) {
             for (const auto& [text, checked] : *state->checks) {
                 HWND box = CreateWindowExW(0, L"BUTTON", text.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
@@ -4612,6 +4641,9 @@ LRESULT CALLBACK PromptProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 for (size_t i = 0; i < state->edits.size(); ++i) (*state->values)[i] = GetWindowTextValue(state->edits[i]);
                 for (size_t i = 0; i < state->checkboxes.size(); ++i) {
                     (*state->checks)[i].second = SendMessageW(state->checkboxes[i], BM_GETCHECK, 0, 0) == BST_CHECKED;
+                }
+                for (size_t i = 0; i < state->combos.size(); ++i) {
+                    (*state->choices)[i].selected = static_cast<int>(SendMessageW(state->combos[i], CB_GETCURSEL, 0, 0));
                 }
                 state->accepted = true;
             }
@@ -4654,7 +4686,7 @@ void ThemePushButtons(std::initializer_list<HWND> buttons) {
 }
 
 bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels, std::vector<std::wstring>& values,
-    std::vector<std::pair<std::wstring, bool>>* checks = nullptr) {
+    std::vector<std::pair<std::wstring, bool>>* checks = nullptr, std::vector<PromptChoice>* choices = nullptr) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSW klass{};
@@ -4669,10 +4701,12 @@ bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels
     state.labels = labels;
     state.values = &values;
     state.checks = checks;
+    state.choices = choices;
     RECT owner{};
     GetWindowRect(g_app.window, &owner);
     const int checkHeight = checks ? 28 * static_cast<int>(checks->size()) : 0;
-    RECT frame{0, 0, Scale(372), Scale(16 + 58 * static_cast<int>(labels.size()) + checkHeight + 48)};
+    const int choiceHeight = choices ? 58 * static_cast<int>(choices->size()) : 0;
+    RECT frame{0, 0, Scale(372), Scale(16 + 58 * static_cast<int>(labels.size()) + choiceHeight + checkHeight + 48)};
     AdjustWindowRectExForDpi(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME, g_app.dpi);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -4687,6 +4721,8 @@ bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels
     if (!state.edits.empty()) {
         SetFocus(state.edits[0]);
         SendMessageW(state.edits[0], EM_SETSEL, 0, -1);
+    } else if (!state.combos.empty()) {
+        SetFocus(state.combos[0]);
     }
     MSG message{};
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -4885,7 +4921,9 @@ enum class PinyinMode { Tone, Plain, Initials };
 
 // Converts Chinese characters (polyphones resolved by phrase) and keeps all
 // other text. Syllables are separated by spaces; initials are run together.
-bool ConvertToPinyin(std::wstring_view text, PinyinMode mode, std::wstring& output, int& converted, std::wstring& error) {
+// annotate: keep each character and add its reading, e.g. 中(zhōng)文(wén).
+bool ConvertToPinyin(std::wstring_view text, PinyinMode mode, std::wstring& output, int& converted, std::wstring& error,
+    bool annotate = false) {
     Pinyin::Pinyin* converter = PinyinConverter(error);
     if (!converter) return false;
     const auto style = mode == PinyinMode::Tone ? Pinyin::ManTone::Style::TONE : Pinyin::ManTone::Style::NORMAL;
@@ -4899,7 +4937,34 @@ bool ConvertToPinyin(std::wstring_view text, PinyinMode mode, std::wstring& outp
     output.clear();
     converted = 0;
     bool previousWasPinyin = false;
+    // The library drops whitespace; walk the source alongside its results and
+    // copy anything it skipped, so no original character is lost.
+    size_t cursor = 0;
+    const auto copySkipped = [&](size_t upTo) {
+        if (upTo <= cursor) return;
+        output.append(text.substr(cursor, upTo - cursor));
+        previousWasPinyin = false;
+        cursor = upTo;
+    };
     for (const Pinyin::PinyinRes& item : results) {
+        const std::wstring piece = Utf8ToWide(item.hanzi);
+        if (!piece.empty()) {
+            const size_t found = text.find(piece, cursor);
+            if (found != std::wstring_view::npos) {
+                copySkipped(found);
+                cursor = found + piece.size();
+            }
+        }
+        if (annotate) {
+            const std::wstring hanzi = Utf8ToWide(item.hanzi);
+            output += hanzi;
+            if (!item.error) {
+                const std::wstring syllable = Utf8ToWide(item.pinyin);
+                output += L"(" + (mode == PinyinMode::Initials ? syllable.substr(0, 1) : syllable) + L")";
+                ++converted;
+            }
+            continue;
+        }
         if (item.error) {
             const std::wstring raw = Utf8ToWide(item.hanzi);
             // Keep "拼音 word" readable: a space between a syllable and a following word.
@@ -4912,12 +4977,13 @@ bool ConvertToPinyin(std::wstring_view text, PinyinMode mode, std::wstring& outp
         if (mode == PinyinMode::Initials) {
             output += syllable.substr(0, 1);
         } else {
-            if (!output.empty() && (previousWasPinyin || iswalnum(output.back()))) output += L' ';
+            if (!output.empty() && !iswspace(output.back()) && (previousWasPinyin || iswalnum(output.back()))) output += L' ';
             output += syllable;
         }
         previousWasPinyin = true;
         ++converted;
     }
+    copySkipped(text.size());
     return true;
 }
 
@@ -4954,6 +5020,8 @@ std::wstring g_breakAfter = L"。！？";
 std::wstring g_wrapWidth = L"80";
 std::wstring g_linePrefix = L"- ";
 std::wstring g_lineSuffix = L";";
+int g_pinyinFormat = 0;  // 0 tones, 1 plain, 2 initials
+int g_pinyinLayout = 1;  // 0 pinyin only, 1 annotate after each character, 2 pinyin line under each line
 
 bool IsTextToolCommand(int command) {
     return command >= kIdTextToolFirst && command <= kIdTextToolLast;
@@ -4998,9 +5066,7 @@ void AppendTextToolMenus(HMENU menu) {
     AppendMenuW(blanks, MF_STRING, kIdTitleCase, L"每个单词首字母大写");
 
     HMENU chinese = CreatePopupMenu();
-    AppendMenuW(chinese, MF_STRING, kIdPinyinTone, L"汉字转拼音（zhōng wén）");
-    AppendMenuW(chinese, MF_STRING, kIdPinyinPlain, L"汉字转拼音，不带声调（zhong wen）");
-    AppendMenuW(chinese, MF_STRING, kIdPinyinInitials, L"拼音首字母（zw）");
+    AppendMenuW(chinese, MF_STRING, kIdPinyinTone, L"汉字转拼音...");
     AppendMenuW(chinese, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(chinese, MF_STRING, kIdToTraditional, L"简体转繁体");
     AppendMenuW(chinese, MF_STRING, kIdToSimplified, L"繁体转简体");
@@ -5035,7 +5101,13 @@ void AppendTextToolMenus(HMENU menu) {
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(developer), L"开发者工具");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(extract), L"提取到新标签");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | (g_app.previewTextTools ? MF_CHECKED : 0), kIdTogglePreview, L"批量处理前预览更改");
+    HMENU output = CreatePopupMenu();
+    AppendMenuW(output, MF_STRING, kIdOutputNewTab, L"输出到新标签（原文不变）");
+    AppendMenuW(output, MF_STRING, kIdOutputInsertBelow, L"插入到原文下方（保留原文）");
+    AppendMenuW(output, MF_STRING, kIdOutputReplace, L"替换原文");
+    CheckMenuRadioItem(output, kIdOutputReplace, kIdOutputInsertBelow, kIdOutputReplace + g_app.toolOutputMode, MF_BYCOMMAND);
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(output), L"处理结果输出到");
+    AppendMenuW(menu, MF_STRING | (g_app.previewTextTools ? MF_CHECKED : 0), kIdTogglePreview, L"处理前预览更改");
 }
 
 // ---- Encoders -------------------------------------------------------------------
@@ -5155,6 +5227,7 @@ std::vector<DiffLine> DiffLines(const std::vector<std::wstring>& before, const s
 struct PreviewState {
     bool done = false;
     bool accepted = false;
+    int choice = -1;
     HWND view = nullptr;
     HWND dontAsk = nullptr;
     bool stopPreviewing = false;
@@ -5175,13 +5248,26 @@ LRESULT CALLBACK PreviewProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         MoveWindow(GetDlgItem(window, 100), Scale(16), Scale(12), width - Scale(32), Scale(22), TRUE);
         MoveWindow(state->view, Scale(16), Scale(40), width - Scale(32), std::max(0, bottom - Scale(48)), TRUE);
         MoveWindow(state->dontAsk, Scale(16), bottom + Scale(12), Scale(220), Scale(24), TRUE);
-        MoveWindow(GetDlgItem(window, IDOK), width - Scale(16 + 96 + 8 + 82), bottom + Scale(10), Scale(96), Scale(28), TRUE);
-        MoveWindow(GetDlgItem(window, IDCANCEL), width - Scale(16 + 82), bottom + Scale(10), Scale(82), Scale(28), TRUE);
+        int x = width - Scale(16 + 82);
+        MoveWindow(GetDlgItem(window, IDCANCEL), x, bottom + Scale(10), Scale(82), Scale(28), TRUE);
+        for (const int id : {303, 302, 301}) {  // right to left: insert below, new tab, replace
+            x -= Scale(8 + 112);
+            MoveWindow(GetDlgItem(window, id), x, bottom + Scale(10), Scale(112), Scale(28), TRUE);
+        }
         return 0;
     }
     case WM_COMMAND:
+        if (state && LOWORD(wParam) >= 301 && LOWORD(wParam) <= 303) {
+            state->choice = LOWORD(wParam) - 301;
+            state->accepted = true;
+            state->stopPreviewing = SendMessageW(state->dontAsk, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            state->done = true;
+            return 0;
+        }
         if (state && (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)) {
+            // Enter applies the default output mode; Esc cancels.
             state->accepted = LOWORD(wParam) == IDOK;
+            state->choice = state->accepted ? g_app.toolOutputMode : -1;
             state->stopPreviewing = SendMessageW(state->dontAsk, BM_GETCHECK, 0, 0) == BST_CHECKED;
             state->done = true;
             return 0;
@@ -5291,8 +5377,9 @@ void FillDiffView(HWND view, const std::wstring& before, const std::wstring& aft
     InvalidateRect(view, nullptr, TRUE);
 }
 
-// Shows what a tool will change and asks for confirmation. Returns true to apply.
-bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::wstring& after) {
+// Shows what a tool will change and how to use the result. Returns the
+// chosen output mode (0 replace, 1 new tab, 2 insert below) or -1 to cancel.
+int ConfirmChange(const wchar_t* title, const std::wstring& before, const std::wstring& after) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSW klass{};
@@ -5321,23 +5408,29 @@ bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::
         0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
     state.dontAsk = CreateWindowExW(0, L"BUTTON", L"以后不再预览", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
-    HWND apply = CreateWindowExW(0, L"BUTTON", L"应用更改", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_app.instance, nullptr);
+    HWND buttons[3]{};
+    const wchar_t* captions[3] = {L"替换原文", L"输出到新标签", L"插入到原文下方"};
+    for (int i = 0; i < 3; ++i) {
+        const DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | (i == g_app.toolOutputMode ? BS_DEFPUSHBUTTON : 0);
+        buttons[i] = CreateWindowExW(0, L"BUTTON", captions[i], style, 0, 0, 0, 0, dialog,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(301 + i)), g_app.instance, nullptr);
+    }
+    HWND apply = buttons[std::clamp(g_app.toolOutputMode, 0, 2)];
     HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
-    for (HWND control : {label, state.dontAsk, apply, cancel}) {
+    for (HWND control : {label, state.dontAsk, buttons[0], buttons[1], buttons[2], cancel}) {
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
     }
     SendMessageW(state.view, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
     ThemeCheckbox(state.dontAsk);
-    ThemePushButtons({apply, cancel});
+    ThemePushButtons({buttons[0], buttons[1], buttons[2], cancel});
     SetWindowTheme(state.view, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
     SendMessageW(state.view, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(4), 0));
     SendMessageW(state.view, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
     int removed = 0, added = 0;
     FillDiffView(state.view, before, after, removed, added);
-    SetWindowTextW(label, (L"将删除 " + std::to_wstring(removed) + L" 行，新增 " + std::to_wstring(added) +
-        L" 行。应用后可以按 Ctrl+Z 一次撤销。").c_str());
+    SetWindowTextW(label, (L"与原文相比：删除 " + std::to_wstring(removed) + L" 行，新增 " + std::to_wstring(added) +
+        L" 行。请选择如何使用处理结果（替换原文后可按 Ctrl+Z 撤销）。").c_str());
 
     RECT client{};
     GetClientRect(dialog, &client);
@@ -5361,7 +5454,7 @@ bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::
         g_app.stateDirty = true;
         SetMenuState();
     }
-    return state.accepted;
+    return state.accepted ? state.choice : -1;
 }
 
 // ---- Extraction -------------------------------------------------------------------
@@ -5503,7 +5596,18 @@ void ExtractToNewTab(int command) {
     ShowNotice(L"已提取 " + std::to_wstring(results.size()) + L" 个" + (what == L"行" ? L"行" : what) + L"到新标签");
 }
 
+const wchar_t* OutputModeName(int mode) {
+    return mode == 0 ? L"替换原文" : mode == 1 ? L"输出到新标签" : L"插入到原文下方";
+}
+
 void RunTextTool(int command) {
+    if (command >= kIdOutputReplace && command <= kIdOutputInsertBelow) {
+        g_app.toolOutputMode = command - kIdOutputReplace;
+        g_app.stateDirty = true;
+        SetMenuState();
+        ShowNotice(std::wstring(L"处理结果将") + OutputModeName(g_app.toolOutputMode));
+        return;
+    }
     if (command == kIdTogglePreview) {
         g_app.previewTextTools = !g_app.previewTextTools;
         g_app.stateDirty = true;
@@ -5569,6 +5673,18 @@ void RunTextTool(int command) {
         if (!PromptForText(L"每行末尾添加", {L"添加的内容："}, values)) return;
         g_lineSuffix = values[0];
         break;
+    case kIdPinyinTone:
+    case kIdPinyinPlain:
+    case kIdPinyinInitials: {
+        std::vector<PromptChoice> choices{
+            {L"拼音格式：", {L"带声调（zhōng wén）", L"不带声调（zhong wen）", L"首字母（zw）"}, g_pinyinFormat},
+            {L"结果形式：", {L"只保留拼音", L"在汉字后标注拼音：中(zhōng)文(wén)", L"在每行下方添加拼音"}, g_pinyinLayout},
+        };
+        if (!PromptForText(L"汉字转拼音", {}, values, nullptr, &choices)) return;
+        g_pinyinFormat = std::clamp(choices[0].selected, 0, 2);
+        g_pinyinLayout = std::clamp(choices[1].selected, 0, 2);
+        break;
+    }
     case kIdRegexReplace: {
         values = {g_regexFind, g_regexReplace};
         std::vector<std::pair<std::wstring, bool>> checks{{L"区分大小写", g_regexMatchCase}};
@@ -5948,10 +6064,25 @@ void RunTextTool(int command) {
     case kIdPinyinPlain:
     case kIdPinyinInitials: {
         std::wstring error;
-        const PinyinMode mode = command == kIdPinyinTone ? PinyinMode::Tone
-            : command == kIdPinyinPlain ? PinyinMode::Plain : PinyinMode::Initials;
+        const PinyinMode mode = g_pinyinFormat == 0 ? PinyinMode::Tone : g_pinyinFormat == 1 ? PinyinMode::Plain : PinyinMode::Initials;
         SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-        if (!ConvertToPinyin(text, mode, result, count, error)) {
+        bool ok = true;
+        if (g_pinyinLayout == 2) {
+            // Each line stays, followed by its pinyin (lines without Chinese get none).
+            std::vector<std::wstring> output;
+            for (const std::wstring& line : lines) {
+                output.push_back(line);
+                std::wstring pinyin;
+                int converted = 0;
+                if (!(ok = ConvertToPinyin(line, mode, pinyin, converted, error))) break;
+                if (converted > 0) output.push_back(pinyin);
+                count += converted;
+            }
+            result = JoinLines(output);
+        } else {
+            ok = ConvertToPinyin(text, mode, result, count, error, g_pinyinLayout == 1);
+        }
+        if (!ok) {
             MessageBoxW(g_app.window, error.c_str(), kWindowTitle, MB_ICONWARNING);
             return;
         }
@@ -5967,30 +6098,66 @@ void RunTextTool(int command) {
         ShowNotice(notice.empty() ? L"没有需要修改的内容" : notice);
         return;
     }
+    wchar_t label[128]{};
+    GetMenuStringW(g_app.mainMenu, static_cast<UINT>(command), label, static_cast<int>(std::size(label)), MF_BYCOMMAND);
+    std::wstring name = label;
+    if (const size_t tab = name.find(L'\t'); tab != std::wstring::npos) name.resize(tab);
+    if (const size_t dots = name.find(L"..."); dots != std::wstring::npos) name.resize(dots);
+    int outputMode = g_app.toolOutputMode;
     if (g_app.previewTextTools) {
-        wchar_t label[128]{};
-        GetMenuStringW(g_app.mainMenu, static_cast<UINT>(command), label, static_cast<int>(std::size(label)), MF_BYCOMMAND);
-        std::wstring name = label;
-        if (const size_t tab = name.find(L'\t'); tab != std::wstring::npos) name.resize(tab);
-        if (const size_t dots = name.find(L"..."); dots != std::wstring::npos) name.resize(dots);
-        if (!ConfirmChange(name.c_str(), text, result)) return;
+        outputMode = ConfirmChange(name.c_str(), text, result);
+        if (outputMode < 0) return;
     }
-    // One replace = one undo step; the result stays selected.
-    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
-    SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(result.c_str()));
-    const std::wstring after = GetEditorRawText(editor);
-    CHARRANGE selection{range.cpMin, range.cpMin};
-    // Measure the inserted text as RichEdit stores it (CRLF becomes CR).
-    LONG insertedLength = 0;
-    for (size_t i = 0; i < result.size(); ++i) {
-        if (result[i] == L'\r' && i + 1 < result.size() && result[i + 1] == L'\n') ++i;
-        ++insertedLength;
+    ApplyToolResult(*document, range, result, outputMode, name, notice);
+}
+
+LONG RichEditLength(const std::wstring& text) {
+    LONG length = 0;  // CRLF counts as one character in RichEdit
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') ++i;
+        ++length;
     }
-    selection.cpMax = std::min(static_cast<LONG>(after.size()), range.cpMin + insertedLength);
+    return length;
+}
+
+// Puts a tool's result where the user asked: over the original (one undo
+// step), into a new tab, or right after the original. The result is selected.
+void ApplyToolResult(TabDocument& document, CHARRANGE range, const std::wstring& result, int mode,
+    const std::wstring& toolName, std::wstring notice) {
+    HWND editor = document.editor;
+    if (mode == 1) {
+        DocumentFormat format;
+        format.encoding = document.encoding;
+        format.lineEnding = document.lineEnding;
+        const int language = EffectiveLanguage(document);
+        format.language = language > kLanguageAuto ? language : kLanguageAuto;
+        const int index = CreateDocument({}, L"处理结果 - " + toolName, result, true, true, 0, 0, 0, nullptr, format);
+        if (index < 0) return;
+        SelectTab(index);
+        PersistAll(false);
+        ShowNotice(notice + L"，结果在新标签中，原文未改动");
+        return;
+    }
+    CHARRANGE target = range;
+    std::wstring insertion = result;
+    if (mode == 2) {
+        // After the original: on its own line(s) when the original ends a line,
+        // otherwise right after it, separated by a space.
+        const std::wstring all = GetEditorRawText(editor);
+        const LONG end = std::min(range.cpMax, static_cast<LONG>(all.size()));
+        const bool atLineEnd = end >= static_cast<LONG>(all.size()) || all[static_cast<size_t>(end)] == L'\r';
+        insertion = (atLineEnd ? L"\r" : L" ") + result;
+        target = CHARRANGE{end, end};
+    }
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&target));
+    SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(insertion.c_str()));
+    const LONG total = static_cast<LONG>(GetEditorRawText(editor).size());
+    const LONG start = mode == 2 ? target.cpMin + 1 : target.cpMin;
+    CHARRANGE selection{std::min(start, total), std::min(total, start + RichEditLength(result))};
     SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
     SendMessageW(editor, EM_SCROLLCARET, 0, 0);
     RefreshGutter();
-    ShowNotice(notice);
+    ShowNotice(mode == 2 ? notice + L"，结果已插入到原文下方" : notice);
 }
 
 // Right-click menu inside the editor.
