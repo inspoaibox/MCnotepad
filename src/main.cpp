@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <regex>
+#include <wincrypt.h>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +44,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "crypt32.lib")
 #pragma comment(linker, "\"/manifestdependency:type=\'win32\' name=\'Microsoft.Windows.Common-Controls\' version=\'6.0.0.0\' processorArchitecture=\'*\' publicKeyToken=\'6595b64144ccf1df\' language=\'*\'\"")
 
 namespace fs = std::filesystem;
@@ -95,7 +98,11 @@ enum TextToolId : int {
     kIdFullToHalf, kIdHalfToFull, kIdChinesePunctToAscii, kIdAsciiPunctToChinese, kIdRemoveInvisible,
     kIdUpperCase, kIdLowerCase, kIdTitleCase,
     kIdPinyinTone, kIdPinyinPlain, kIdPinyinInitials,
-    kIdTextToolLast = kIdPinyinInitials
+    kIdToTraditional, kIdToSimplified,
+    kIdBase64Encode, kIdBase64Decode, kIdUrlEncode, kIdUrlDecode, kIdRegexReplace,
+    kIdExtractEmails, kIdExtractUrls, kIdExtractIps, kIdExtractNumbers, kIdExtractKeywordLines, kIdExtractFields,
+    kIdTogglePreview,
+    kIdTextToolLast = kIdTogglePreview
 };
 constexpr int kIdNewTabButton = 1301;
 constexpr int kIdToolbarNew = 1401;
@@ -213,6 +220,7 @@ struct AppState {
     std::vector<TabDocument> documents;
     std::vector<std::wstring> pendingOpenFiles;
     std::wstring statusNotice;
+    bool previewTextTools = true;
     ULONGLONG statusNoticeUntil = 0;
     UINT dpi = 96;
     int gutterWidth = 42;
@@ -271,6 +279,7 @@ void ApplyWordWrapAll();
 bool CloseDocument(int index);
 void RenameDocument(int index);
 void AppendTextToolMenus(HMENU menu);
+void ThemeCheckbox(HWND box);
 void ShowEditorContextMenu(HWND editor, POINT screen);
 void UpdateHorizontalScrollbar(HWND editor);
 void RefreshChrome();
@@ -1591,7 +1600,8 @@ bool SaveSessionFile() {
            << g_app.encodingIndex << '\t'
            << g_app.lineEndingIndex << "\n";
     output << "PREFERENCES\t" << (g_app.launchAtStartup ? 1 : 0) << '\t'
-           << static_cast<int>(g_app.closeBehavior) << "\n";
+           << static_cast<int>(g_app.closeBehavior) << '\t'
+           << (g_app.previewTextTools ? 1 : 0) << "\n";
 
     // rcNormalPosition is the restored size even while maximized/minimized.
     WINDOWPLACEMENT placement{};
@@ -2117,6 +2127,7 @@ void SetMenuState() {
     CheckMenuItem(menu, kIdToolbarWrap, MF_BYCOMMAND |
         (g_app.wordWrap ? MF_CHECKED : MF_UNCHECKED));
     CheckDocumentMenuItems(menu);
+    CheckMenuItem(menu, kIdTogglePreview, MF_BYCOMMAND | (g_app.previewTextTools ? MF_CHECKED : MF_UNCHECKED));
 }
 
 HMENU CreateApplicationMenu() {
@@ -2149,6 +2160,8 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(edit, MF_STRING, kIdEditCopy, L"复制\tCtrl+C");
     AppendMenuW(edit, MF_STRING, kIdEditPaste, L"粘贴\tCtrl+V");
     AppendMenuW(edit, MF_STRING, kIdEditSelectAll, L"全选\tCtrl+A");
+    AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+    AppendTextToolMenus(edit);
 
     AppendMenuW(search, MF_STRING, kIdToolbarFind, L"查找\tCtrl+F");
     AppendMenuW(search, MF_STRING, kIdFindNext, L"查找下一个\tF3");
@@ -2163,8 +2176,6 @@ HMENU CreateApplicationMenu() {
         AppendMenuW(language, MF_STRING, kIdLanguageFirst + index, kLanguageNames[index]);
     }
     AppendMenuW(run, MF_STRING, kIdToolbarRun, L"运行当前文件\tF5");
-    AppendTextToolMenus(tools);
-    AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(tools, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tCtrl+Shift+F");
     AppendMenuW(theme, MF_STRING, kIdThemeDark, L"深色");
     AppendMenuW(theme, MF_STRING, kIdThemeLight, L"浅色");
@@ -2250,6 +2261,8 @@ void LoadPersistedSession() {
         } else if (parts[0] == "PREFERENCES" && parts.size() >= 3) {
             ParseInt(parts[1], persistedStartup);
             ParseInt(parts[2], persistedCloseBehavior);
+            int preview = 1;
+            if (parts.size() >= 4 && ParseInt(parts[3], preview)) g_app.previewTextTools = preview != 0;
         } else if (parts[0] == "WINDOW" && parts.size() >= 6) {
             int left = 0, top = 0, width = 0, height = 0, maximized = 0;
             if (ParseInt(parts[1], left) && ParseInt(parts[2], top) &&
@@ -4461,6 +4474,8 @@ struct PromptState {
     std::vector<std::wstring> labels;
     std::vector<std::wstring>* values = nullptr;
     std::vector<HWND> edits;
+    std::vector<std::pair<std::wstring, bool>>* checks = nullptr;
+    std::vector<HWND> checkboxes;
     bool done = false;
     bool accepted = false;
 };
@@ -4482,6 +4497,17 @@ LRESULT CALLBACK PromptProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             state->edits.push_back(edit);
             y += 58;
         }
+        if (state->checks) {
+            for (const auto& [text, checked] : *state->checks) {
+                HWND box = CreateWindowExW(0, L"BUTTON", text.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    Scale(16), Scale(y), Scale(340), Scale(24), window, nullptr, g_app.instance, nullptr);
+                SendMessageW(box, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+                SendMessageW(box, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+                ThemeCheckbox(box);
+                state->checkboxes.push_back(box);
+                y += 28;
+            }
+        }
         HWND ok = CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
             Scale(186), Scale(y + 4), Scale(82), Scale(28), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_app.instance, nullptr);
         HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
@@ -4493,6 +4519,9 @@ LRESULT CALLBACK PromptProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (state && (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)) {
             if (LOWORD(wParam) == IDOK) {
                 for (size_t i = 0; i < state->edits.size(); ++i) (*state->values)[i] = GetWindowTextValue(state->edits[i]);
+                for (size_t i = 0; i < state->checkboxes.size(); ++i) {
+                    (*state->checks)[i].second = SendMessageW(state->checkboxes[i], BM_GETCHECK, 0, 0) == BST_CHECKED;
+                }
                 state->accepted = true;
             }
             state->done = true;
@@ -4508,7 +4537,8 @@ LRESULT CALLBACK PromptProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.windowBrush);
         return 1;
     }
-    case WM_CTLCOLORSTATIC: {
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
         HDC dc = reinterpret_cast<HDC>(wParam);
         SetTextColor(dc, CurrentPalette().controlText);
         SetBkColor(dc, CurrentPalette().windowBackground);
@@ -4522,7 +4552,12 @@ LRESULT CALLBACK PromptProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
 // Shows a modal dialog; returns false if cancelled. `values` holds the initial
 // text of each field and receives the result.
-bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels, std::vector<std::wstring>& values) {
+void ThemeCheckbox(HWND box) {
+    if (g_app.darkTheme) SetWindowTheme(box, L"", L"");
+}
+
+bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels, std::vector<std::wstring>& values,
+    std::vector<std::pair<std::wstring, bool>>* checks = nullptr) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSW klass{};
@@ -4536,9 +4571,11 @@ bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels
     PromptState state;
     state.labels = labels;
     state.values = &values;
+    state.checks = checks;
     RECT owner{};
     GetWindowRect(g_app.window, &owner);
-    RECT frame{0, 0, Scale(372), Scale(16 + 58 * static_cast<int>(labels.size()) + 48)};
+    const int checkHeight = checks ? 28 * static_cast<int>(checks->size()) : 0;
+    RECT frame{0, 0, Scale(372), Scale(16 + 58 * static_cast<int>(labels.size()) + checkHeight + 48)};
     AdjustWindowRectExForDpi(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME, g_app.dpi);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -4827,31 +4864,521 @@ void AppendTextToolMenus(HMENU menu) {
     AppendMenuW(blanks, MF_STRING, kIdCollapseSpaces, L"连续空格合并为一个");
     AppendMenuW(blanks, MF_STRING, kIdRemoveAllSpaces, L"删除所有空格");
     AppendMenuW(blanks, MF_STRING, kIdTabsToSpaces, L"制表符转为空格");
+    AppendMenuW(blanks, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(blanks, MF_STRING, kIdRemoveInvisible, L"清除不可见字符");
+    AppendMenuW(blanks, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(blanks, MF_STRING, kIdUpperCase, L"转为大写");
+    AppendMenuW(blanks, MF_STRING, kIdLowerCase, L"转为小写");
+    AppendMenuW(blanks, MF_STRING, kIdTitleCase, L"每个单词首字母大写");
 
-    HMENU symbols = CreatePopupMenu();
-    AppendMenuW(symbols, MF_STRING, kIdFullToHalf, L"全角转半角");
-    AppendMenuW(symbols, MF_STRING, kIdHalfToFull, L"半角转全角");
-    AppendMenuW(symbols, MF_STRING, kIdChinesePunctToAscii, L"中文标点转英文标点");
-    AppendMenuW(symbols, MF_STRING, kIdAsciiPunctToChinese, L"英文标点转中文标点");
-    AppendMenuW(symbols, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(symbols, MF_STRING, kIdRemoveInvisible, L"清除不可见字符");
-    AppendMenuW(symbols, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(symbols, MF_STRING, kIdUpperCase, L"转为大写");
-    AppendMenuW(symbols, MF_STRING, kIdLowerCase, L"转为小写");
-    AppendMenuW(symbols, MF_STRING, kIdTitleCase, L"每个单词首字母大写");
+    HMENU chinese = CreatePopupMenu();
+    AppendMenuW(chinese, MF_STRING, kIdPinyinTone, L"汉字转拼音（zhōng wén）");
+    AppendMenuW(chinese, MF_STRING, kIdPinyinPlain, L"汉字转拼音，不带声调（zhong wen）");
+    AppendMenuW(chinese, MF_STRING, kIdPinyinInitials, L"拼音首字母（zw）");
+    AppendMenuW(chinese, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(chinese, MF_STRING, kIdToTraditional, L"简体转繁体");
+    AppendMenuW(chinese, MF_STRING, kIdToSimplified, L"繁体转简体");
+    AppendMenuW(chinese, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(chinese, MF_STRING, kIdFullToHalf, L"全角转半角");
+    AppendMenuW(chinese, MF_STRING, kIdHalfToFull, L"半角转全角");
+    AppendMenuW(chinese, MF_STRING, kIdChinesePunctToAscii, L"中文标点转英文标点");
+    AppendMenuW(chinese, MF_STRING, kIdAsciiPunctToChinese, L"英文标点转中文标点");
 
-    HMENU pinyin = CreatePopupMenu();
-    AppendMenuW(pinyin, MF_STRING, kIdPinyinTone, L"带声调（zhōng wén）");
-    AppendMenuW(pinyin, MF_STRING, kIdPinyinPlain, L"不带声调（zhong wen）");
-    AppendMenuW(pinyin, MF_STRING, kIdPinyinInitials, L"首字母（zw）");
+    HMENU developer = CreatePopupMenu();
+    AppendMenuW(developer, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tCtrl+Shift+F");
+    AppendMenuW(developer, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(developer, MF_STRING, kIdBase64Encode, L"Base64 编码");
+    AppendMenuW(developer, MF_STRING, kIdBase64Decode, L"Base64 解码");
+    AppendMenuW(developer, MF_STRING, kIdUrlEncode, L"URL 编码");
+    AppendMenuW(developer, MF_STRING, kIdUrlDecode, L"URL 解码");
+    AppendMenuW(developer, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(developer, MF_STRING, kIdRegexReplace, L"正则表达式替换...");
+
+    HMENU extract = CreatePopupMenu();
+    AppendMenuW(extract, MF_STRING, kIdExtractEmails, L"邮箱地址");
+    AppendMenuW(extract, MF_STRING, kIdExtractUrls, L"链接");
+    AppendMenuW(extract, MF_STRING, kIdExtractIps, L"IP 地址");
+    AppendMenuW(extract, MF_STRING, kIdExtractNumbers, L"数字");
+    AppendMenuW(extract, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(extract, MF_STRING, kIdExtractKeywordLines, L"包含关键词的行...");
+    AppendMenuW(extract, MF_STRING, kIdExtractFields, L"指定列（字段）...");
 
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(lines), L"行处理");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(blanks), L"空格与空白");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(symbols), L"符号与大小写");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(pinyin), L"汉字转拼音");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(blanks), L"空格、符号与大小写");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(chinese), L"中文处理");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(developer), L"开发者工具");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(extract), L"提取到新标签");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (g_app.previewTextTools ? MF_CHECKED : 0), kIdTogglePreview, L"批量处理前预览更改");
+}
+
+// ---- Encoders -------------------------------------------------------------------
+
+std::wstring Base64Encode(std::wstring_view text) {
+    const std::string bytes = WideToUtf8(text);
+    if (bytes.empty()) return {};
+    DWORD size = 0;
+    const DWORD flags = CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF;
+    CryptBinaryToStringW(reinterpret_cast<const BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()), flags, nullptr, &size);
+    std::wstring result(size, L'\0');
+    CryptBinaryToStringW(reinterpret_cast<const BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()), flags, result.data(), &size);
+    result.resize(size);
+    return result;
+}
+
+// Accepts standard and URL-safe alphabets, with or without padding/whitespace.
+bool Base64Decode(std::wstring_view text, std::wstring& result) {
+    std::wstring clean;
+    for (wchar_t c : text) {
+        if (c == L'-') c = L'+';
+        else if (c == L'_') c = L'/';
+        if (!iswspace(c)) clean += c;
+    }
+    while (clean.size() % 4 != 0) clean += L'=';
+    DWORD size = 0;
+    if (clean.empty() || !CryptStringToBinaryW(clean.c_str(), static_cast<DWORD>(clean.size()), CRYPT_STRING_BASE64, nullptr, &size, nullptr, nullptr)) {
+        return false;
+    }
+    std::string bytes(size, '\0');
+    CryptStringToBinaryW(clean.c_str(), static_cast<DWORD>(clean.size()), CRYPT_STRING_BASE64,
+        reinterpret_cast<BYTE*>(bytes.data()), &size, nullptr, nullptr);
+    bytes.resize(size);
+    if (bytes.empty()) return false;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0) <= 0) return false;
+    result = Utf8ToWide(bytes);
+    return true;
+}
+
+// Percent-encodes UTF-8 bytes; unreserved characters stay as they are.
+std::wstring UrlEncode(std::wstring_view text) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::wstring result;
+    for (const unsigned char byte : WideToUtf8(text)) {
+        if (isalnum(byte) || byte == '-' || byte == '_' || byte == '.' || byte == '~') {
+            result += static_cast<wchar_t>(byte);
+        } else {
+            result += L'%';
+            result += static_cast<wchar_t>(hex[byte >> 4]);
+            result += static_cast<wchar_t>(hex[byte & 15]);
+        }
+    }
+    return result;
+}
+
+std::wstring UrlDecode(std::wstring_view text, int& decoded) {
+    std::string bytes;
+    const std::string input = WideToUtf8(text);
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '%' && i + 2 < input.size() && HexDigit(input[i + 1]) >= 0 && HexDigit(input[i + 2]) >= 0) {
+            bytes += static_cast<char>((HexDigit(input[i + 1]) << 4) | HexDigit(input[i + 2]));
+            i += 2;
+            ++decoded;
+        } else {
+            bytes += input[i];
+        }
+    }
+    return Utf8ToWide(bytes);
+}
+
+// ---- Preview: line diff of a pending change ------------------------------------------
+
+enum class DiffKind { Same, Removed, Added };
+struct DiffLine { DiffKind kind; std::wstring text; };
+
+std::vector<DiffLine> DiffLines(const std::vector<std::wstring>& before, const std::vector<std::wstring>& after) {
+    size_t prefix = 0;
+    while (prefix < before.size() && prefix < after.size() && before[prefix] == after[prefix]) ++prefix;
+    size_t suffix = 0;
+    while (suffix < before.size() - prefix && suffix < after.size() - prefix &&
+           before[before.size() - 1 - suffix] == after[after.size() - 1 - suffix]) {
+        ++suffix;
+    }
+    std::vector<DiffLine> diff;
+    for (size_t i = 0; i < prefix; ++i) diff.push_back({DiffKind::Same, before[i]});
+    const size_t n = before.size() - prefix - suffix;
+    const size_t m = after.size() - prefix - suffix;
+    if (n * m <= 4000000) {
+        // Longest common subsequence over the changed middle part.
+        std::vector<uint32_t> table((n + 1) * (m + 1), 0);
+        const auto at = [&](size_t i, size_t j) -> uint32_t& { return table[i * (m + 1) + j]; };
+        for (size_t i = n; i-- > 0;) {
+            for (size_t j = m; j-- > 0;) {
+                at(i, j) = before[prefix + i] == after[prefix + j] ? at(i + 1, j + 1) + 1 : std::max(at(i + 1, j), at(i, j + 1));
+            }
+        }
+        size_t i = 0, j = 0;
+        while (i < n || j < m) {
+            if (i < n && j < m && before[prefix + i] == after[prefix + j]) {
+                diff.push_back({DiffKind::Same, before[prefix + i]});
+                ++i;
+                ++j;
+            } else if (i < n && (j == m || at(i + 1, j) >= at(i, j + 1))) {
+                diff.push_back({DiffKind::Removed, before[prefix + i++]});  // removals first, like a diff
+            } else {
+                diff.push_back({DiffKind::Added, after[prefix + j++]});
+            }
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) diff.push_back({DiffKind::Removed, before[prefix + i]});
+        for (size_t j = 0; j < m; ++j) diff.push_back({DiffKind::Added, after[prefix + j]});
+    }
+    for (size_t i = before.size() - suffix; i < before.size(); ++i) diff.push_back({DiffKind::Same, before[i]});
+    return diff;
+}
+
+struct PreviewState {
+    bool done = false;
+    bool accepted = false;
+    HWND view = nullptr;
+    HWND dontAsk = nullptr;
+    bool stopPreviewing = false;
+};
+
+LRESULT CALLBACK PreviewProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<PreviewState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE:
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(
+            reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));
+        return 0;
+    case WM_SIZE: {
+        if (!state || !state->view) break;
+        const int width = LOWORD(lParam);
+        const int height = HIWORD(lParam);
+        const int bottom = height - Scale(48);
+        MoveWindow(GetDlgItem(window, 100), Scale(16), Scale(12), width - Scale(32), Scale(22), TRUE);
+        MoveWindow(state->view, Scale(16), Scale(40), width - Scale(32), std::max(0, bottom - Scale(48)), TRUE);
+        MoveWindow(state->dontAsk, Scale(16), bottom + Scale(12), Scale(220), Scale(24), TRUE);
+        MoveWindow(GetDlgItem(window, IDOK), width - Scale(16 + 96 + 8 + 82), bottom + Scale(10), Scale(96), Scale(28), TRUE);
+        MoveWindow(GetDlgItem(window, IDCANCEL), width - Scale(16 + 82), bottom + Scale(10), Scale(82), Scale(28), TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (state && (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)) {
+            state->accepted = LOWORD(wParam) == IDOK;
+            state->stopPreviewing = SendMessageW(state->dontAsk, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            state->done = true;
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        if (state) state->done = true;
+        return 0;
+    case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+        info->ptMinTrackSize = POINT{Scale(420), Scale(260)};
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.windowBrush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, CurrentPalette().controlText);
+        SetBkColor(dc, CurrentPalette().windowBackground);
+        return reinterpret_cast<LRESULT>(g_app.windowBrush);
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+COLORREF Blend(COLORREF a, COLORREF b, int percentB) {
+    return RGB((GetRValue(a) * (100 - percentB) + GetRValue(b) * percentB) / 100,
+               (GetGValue(a) * (100 - percentB) + GetGValue(b) * percentB) / 100,
+               (GetBValue(a) * (100 - percentB) + GetBValue(b) * percentB) / 100);
+}
+
+// Shows what a tool will change and asks for confirmation. Returns true to apply.
+bool ConfirmChange(const wchar_t* title, const std::wstring& before, const std::wstring& after) {
+    const std::vector<DiffLine> diff = DiffLines(SplitLines(before), SplitLines(after));
+    int removed = 0, added = 0;
+    for (const DiffLine& line : diff) {
+        if (line.kind == DiffKind::Removed) ++removed;
+        if (line.kind == DiffKind::Added) ++added;
+    }
+
+    // Changed lines with two lines of context; long unchanged runs collapse.
+    std::wstring text;
+    std::vector<std::pair<LONG, DiffKind>> marks;  // start of each coloured line
+    std::vector<LONG> lineLengths;
+    const auto nearChange = [&](size_t index) {
+        for (size_t k = (index >= 2 ? index - 2 : 0); k <= std::min(diff.size() - 1, index + 2); ++k) {
+            if (diff[k].kind != DiffKind::Same) return true;
+        }
+        return false;
+    };
+    constexpr size_t kMaxShown = 3000;
+    size_t shown = 0;
+    size_t skipped = 0;
+    LONG position = 0;
+    const auto emit = [&](const std::wstring& line, DiffKind kind) {
+        if (!text.empty()) {
+            text += L'\r';
+            ++position;
+        }
+        marks.push_back({position, kind});
+        lineLengths.push_back(static_cast<LONG>(line.size()));
+        text += line;
+        position += static_cast<LONG>(line.size());
+    };
+    for (size_t index = 0; index < diff.size() && shown < kMaxShown; ++index) {
+        const DiffLine& line = diff[index];
+        if (line.kind == DiffKind::Same && !nearChange(index)) {
+            ++skipped;
+            continue;
+        }
+        if (skipped > 0) {
+            emit(L"   ⋯ 省略 " + std::to_wstring(skipped) + L" 行未改动的内容", DiffKind::Same);
+            skipped = 0;
+        }
+        const wchar_t* prefix = line.kind == DiffKind::Removed ? L" − " : line.kind == DiffKind::Added ? L" + " : L"   ";
+        emit(prefix + line.text, line.kind);
+        ++shown;
+    }
+    if (shown >= kMaxShown) emit(L"   ⋯ 更多改动未显示", DiffKind::Same);
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{};
+        klass.hInstance = g_app.instance;
+        klass.lpfnWndProc = PreviewProc;
+        klass.lpszClassName = L"MCnotepadPreview";
+        klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        registered = RegisterClassW(&klass) != 0;
+    }
+    PreviewState state;
+    RECT owner{};
+    GetWindowRect(g_app.window, &owner);
+    const int width = std::min(Scale(820), static_cast<int>(owner.right - owner.left) - Scale(40));
+    const int height = std::min(Scale(560), static_cast<int>(owner.bottom - owner.top) - Scale(40));
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"MCnotepadPreview",
+        (std::wstring(L"预览更改 - ") + title).c_str(), WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+        owner.left + (owner.right - owner.left - width) / 2, owner.top + (owner.bottom - owner.top - height) / 2,
+        width, height, g_app.window, nullptr, g_app.instance, &state);
+    if (!dialog) return true;
+    ApplyWindowFrameTheme(dialog);
+
+    const std::wstring summary = L"将删除 " + std::to_wstring(removed) + L" 行，新增 " + std::to_wstring(added) +
+        L" 行。应用后可以按 Ctrl+Z 一次撤销。";
+    HWND label = CreateWindowExW(0, L"STATIC", summary.c_str(), WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
+        dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(100)), g_app.instance, nullptr);
+    state.view = CreateWindowExW(0, L"RICHEDIT50W", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+        0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
+    state.dontAsk = CreateWindowExW(0, L"BUTTON", L"以后不再预览", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
+    HWND apply = CreateWindowExW(0, L"BUTTON", L"应用更改", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_app.instance, nullptr);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
+    for (HWND control : {label, state.dontAsk, apply, cancel}) {
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+    }
+    SendMessageW(state.view, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+    ThemeCheckbox(state.dontAsk);
+    SetWindowTheme(state.view, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    const ThemePalette& palette = CurrentPalette();
+    SendMessageW(state.view, EM_SETBKGNDCOLOR, 0, palette.editorBackground);
+    SendMessageW(state.view, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(4), 0));
+    SendMessageW(state.view, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+    SetWindowTextW(state.view, text.c_str());
+    const COLORREF removedColor = g_app.darkTheme ? RGB(240, 128, 128) : RGB(176, 32, 32);
+    const COLORREF addedColor = g_app.darkTheme ? RGB(120, 214, 150) : RGB(20, 120, 50);
+    for (size_t k = 0; k < marks.size(); ++k) {
+        CHARFORMAT2W format{};
+        format.cbSize = sizeof(format);
+        format.dwMask = CFM_COLOR | CFM_BACKCOLOR;
+        const DiffKind kind = marks[k].second;
+        format.crTextColor = kind == DiffKind::Removed ? removedColor : kind == DiffKind::Added ? addedColor : palette.gutterText;
+        format.crBackColor = kind == DiffKind::Removed ? Blend(palette.editorBackground, removedColor, 14)
+            : kind == DiffKind::Added ? Blend(palette.editorBackground, addedColor, 14) : palette.editorBackground;
+        CHARRANGE range{marks[k].first, marks[k].first + lineLengths[k] + 1};
+        SendMessageW(state.view, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+        SendMessageW(state.view, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+    }
+    SendMessageW(state.view, EM_SETSEL, 0, 0);
+
+    RECT client{};
+    GetClientRect(dialog, &client);
+    SendMessageW(dialog, WM_SIZE, 0, MAKELPARAM(client.right, client.bottom));
+    EnableWindow(g_app.window, FALSE);
+    ShowWindow(dialog, SW_SHOW);
+    SetFocus(apply);
+    MSG message{};
+    while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dialog, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    if (message.message == WM_QUIT) PostQuitMessage(static_cast<int>(message.wParam));
+    EnableWindow(g_app.window, TRUE);
+    DestroyWindow(dialog);
+    SetForegroundWindow(g_app.window);
+    if (state.accepted && state.stopPreviewing) {
+        g_app.previewTextTools = false;
+        g_app.stateDirty = true;
+        SetMenuState();
+    }
+    return state.accepted;
+}
+
+// ---- Extraction -------------------------------------------------------------------
+
+std::wstring g_keywords = L"";
+std::wstring g_fieldDelimiter = L",";
+std::wstring g_fieldColumns = L"1";
+std::wstring g_regexFind = L"";
+std::wstring g_regexReplace = L"";
+bool g_regexMatchCase = false;
+bool g_keywordMatchCase = false;
+
+// Collects matches from the selection (or the whole document) into a new tab,
+// leaving the source untouched.
+void ExtractToNewTab(int command) {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    std::vector<std::pair<std::wstring, bool>> checks;
+    std::vector<std::wstring> values;
+    if (command == kIdExtractKeywordLines) {
+        values = {g_keywords};
+        checks = {{L"区分大小写", g_keywordMatchCase}};
+        if (!PromptForText(L"提取包含关键词的行", {L"关键词（多个关键词用空格分隔，满足任意一个即可）："}, values, &checks)) return;
+        g_keywords = values[0];
+        g_keywordMatchCase = checks[0].second;
+        if (TrimCopy(values[0]).empty()) return;
+    } else if (command == kIdExtractFields) {
+        values = {g_fieldDelimiter, g_fieldColumns};
+        if (!PromptForText(L"提取指定列", {L"分隔符（\\t 表示制表符）：", L"要提取的列号（如 1 或 1,3）："}, values)) return;
+        g_fieldDelimiter = values[0];
+        g_fieldColumns = values[1];
+        if (values[0].empty()) return;
+    }
+
+    CHARRANGE range{};
+    std::wstring text;
+    bool wholeDocument = false;
+    ToolRange(document->editor, false, range, text, wholeDocument);
+    std::vector<std::wstring> results;
+    std::wstring what;
+
+    const auto collect = [&](const wchar_t* pattern, bool unique) {
+        std::unordered_map<std::wstring, bool> seen;
+        try {
+            const std::wregex expression(pattern, std::regex_constants::ECMAScript | std::regex_constants::icase);
+            for (std::wsregex_iterator it(text.begin(), text.end(), expression), end; it != end; ++it) {
+                std::wstring value = it->str();
+                // Trailing sentence punctuation is rarely part of a link.
+                while (!value.empty() && std::wstring(L".,;:!?)]}'\"").find(value.back()) != std::wstring::npos) value.pop_back();
+                if (value.empty() || (unique && !seen.emplace(value, true).second)) continue;
+                results.push_back(value);
+            }
+        } catch (const std::exception&) {
+        }
+    };
+
+    switch (command) {
+    case kIdExtractEmails:
+        what = L"邮箱地址";
+        collect(LR"([A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,})", true);
+        break;
+    case kIdExtractUrls:
+        what = L"链接";
+        collect(LR"((?:https?|ftp)://[^\s<>"'，。；：！？、）】》]+|www\.[A-Za-z0-9\-]+\.[^\s<>"'，。；：！？、）】》]+)", true);
+        break;
+    case kIdExtractIps:
+        what = L"IP 地址";
+        collect(LR"((?:^|[^\d.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})(?![\d.]))", true);
+        for (std::wstring& value : results) {  // drop the leading guard character
+            const size_t first = value.find_first_of(L"0123456789");
+            value = value.substr(first);
+        }
+        break;
+    case kIdExtractNumbers:
+        what = L"数字";
+        // Whole dotted tokens first, so IPs and version numbers aren't split into "numbers".
+        collect(LR"(-?\d+(?:\.\d+)*)", false);
+        std::erase_if(results, [](const std::wstring& value) { return std::count(value.begin(), value.end(), L'.') > 1; });
+        break;
+    case kIdExtractKeywordLines: {
+        what = L"行";
+        std::vector<std::wstring> keywords;
+        std::wistringstream stream(g_keywords);
+        for (std::wstring word; stream >> word;) keywords.push_back(g_keywordMatchCase ? word : MapCase(word, LCMAP_LOWERCASE));
+        for (const std::wstring& line : SplitLines(text)) {
+            const std::wstring haystack = g_keywordMatchCase ? line : MapCase(line, LCMAP_LOWERCASE);
+            for (const std::wstring& keyword : keywords) {
+                if (haystack.find(keyword) != std::wstring::npos) {
+                    results.push_back(line);
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    case kIdExtractFields: {
+        what = L"行";
+        const std::wstring delimiter = UnescapeInput(g_fieldDelimiter);
+        std::vector<size_t> columns;
+        std::wstring columnText = g_fieldColumns;
+        std::replace(columnText.begin(), columnText.end(), L'，', L',');
+        std::wistringstream stream(columnText);
+        for (std::wstring part; std::getline(stream, part, L',');) {
+            const int column = _wtoi(part.c_str());
+            if (column > 0) columns.push_back(static_cast<size_t>(column));
+        }
+        if (columns.empty()) {
+            MessageBoxW(g_app.window, L"请输入要提取的列号，例如 1 或 1,3。", kWindowTitle, MB_ICONWARNING);
+            return;
+        }
+        for (const std::wstring& line : SplitLines(text)) {
+            if (line.find(delimiter) == std::wstring::npos) continue;  // not a delimited row
+            std::vector<std::wstring> fields;
+            size_t start = 0;
+            for (size_t found; (found = line.find(delimiter, start)) != std::wstring::npos; start = found + delimiter.size()) {
+                fields.push_back(line.substr(start, found - start));
+            }
+            fields.push_back(line.substr(start));
+            std::vector<std::wstring> picked;
+            for (const size_t column : columns) picked.push_back(column <= fields.size() ? fields[column - 1] : L"");
+            results.push_back(JoinLines(picked, delimiter));
+        }
+        break;
+    }
+    default:
+        return;
+    }
+
+    if (results.empty()) {
+        ShowNotice(L"没有找到" + what + (wholeDocument ? L"（全文）" : L"（选中内容）"));
+        return;
+    }
+    const std::wstring title = L"提取结果 - " + (command == kIdExtractKeywordLines ? std::wstring(L"关键词")
+        : command == kIdExtractFields ? std::wstring(L"指定列") : what);
+    const int index = CreateDocument({}, title, JoinLines(results, L"\r\n"), true, true, 0, 0, 0);
+    if (index < 0) return;
+    SelectTab(index);
+    PersistAll(false);
+    ShowNotice(L"已提取 " + std::to_wstring(results.size()) + L" 个" + (what == L"行" ? L"行" : what) + L"到新标签");
 }
 
 void RunTextTool(int command) {
+    if (command == kIdTogglePreview) {
+        g_app.previewTextTools = !g_app.previewTextTools;
+        g_app.stateDirty = true;
+        ShowNotice(g_app.previewTextTools ? L"批量处理前会先预览更改" : L"批量处理将直接应用（仍可撤销）");
+        return;
+    }
+    if (command >= kIdExtractEmails && command <= kIdExtractFields) {
+        ExtractToNewTab(command);
+        return;
+    }
     TabDocument* document = ActiveDocument();
     if (!document) return;
     HWND editor = document->editor;
@@ -4907,6 +5434,19 @@ void RunTextTool(int command) {
         if (!PromptForText(L"每行末尾添加", {L"添加的内容："}, values)) return;
         g_lineSuffix = values[0];
         break;
+    case kIdRegexReplace: {
+        values = {g_regexFind, g_regexReplace};
+        std::vector<std::pair<std::wstring, bool>> checks{{L"区分大小写", g_regexMatchCase}};
+        if (!PromptForText(L"正则表达式替换",
+                {L"查找（正则表达式，如 (\\d+)-(\\d+)）：", L"替换为（$1、$2 引用分组；\\n 表示换行）："}, values, &checks)) {
+            return;
+        }
+        g_regexFind = values[0];
+        g_regexReplace = values[1];
+        g_regexMatchCase = checks[0].second;
+        if (values[0].empty()) return;
+        break;
+    }
     default:
         break;
     }
@@ -5203,6 +5743,60 @@ void RunTextTool(int command) {
         result = MapCase(MapCase(text, LCMAP_LOWERCASE), LCMAP_TITLECASE);
         notice = L"已将每个单词首字母大写";
         break;
+    case kIdToTraditional:
+    case kIdToSimplified: {
+        const DWORD flags = command == kIdToTraditional ? LCMAP_TRADITIONAL_CHINESE : LCMAP_SIMPLIFIED_CHINESE;
+        if (!text.empty()) {
+            const int size = LCMapStringEx(L"zh-CN", flags, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr, 0);
+            result.assign(static_cast<size_t>(std::max(size, 0)), L'\0');
+            if (size > 0) LCMapStringEx(L"zh-CN", flags, text.c_str(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr, 0);
+        }
+        for (size_t i = 0; i < std::min(text.size(), result.size()); ++i) count += text[i] != result[i] ? 1 : 0;
+        notice = L"已转换 " + std::to_wstring(count) + L" 个字";
+        break;
+    }
+    case kIdBase64Encode:
+        result = Base64Encode(text);
+        notice = L"已 Base64 编码（UTF-8）";
+        break;
+    case kIdBase64Decode:
+        if (!Base64Decode(text, result)) {
+            MessageBoxW(g_app.window, L"无法解码：内容不是有效的 Base64，或解码结果不是 UTF-8 文本。", kWindowTitle, MB_ICONWARNING);
+            return;
+        }
+        notice = L"已 Base64 解码";
+        break;
+    case kIdUrlEncode:
+        for (std::wstring& line : lines) line = UrlEncode(line);  // keep one item per line
+        result = JoinLines(lines);
+        notice = L"已 URL 编码 " + std::to_wstring(lines.size()) + L" 行";
+        break;
+    case kIdUrlDecode:
+        for (std::wstring& line : lines) line = UrlDecode(line, count);
+        result = JoinLines(lines);
+        notice = L"已解码 " + std::to_wstring(count) + L" 处";
+        break;
+    case kIdRegexReplace: {
+        // Work with \n line breaks so patterns like ^ $ \n behave as expected.
+        std::wstring source = text;
+        std::replace(source.begin(), source.end(), L'\r', L'\n');
+        std::wstring replacement = UnescapeInput(g_regexReplace);
+        std::replace(replacement.begin(), replacement.end(), L'\r', L'\n');
+        try {
+            auto flags = std::regex_constants::ECMAScript | std::regex_constants::multiline;
+            if (!g_regexMatchCase) flags |= std::regex_constants::icase;
+            const std::wregex expression(g_regexFind, flags);
+            count = static_cast<int>(std::distance(std::wsregex_iterator(source.begin(), source.end(), expression), std::wsregex_iterator()));
+            result = std::regex_replace(source, expression, replacement);
+        } catch (const std::regex_error& error) {
+            const std::string reason = error.what();
+            MessageBoxW(g_app.window, (L"正则表达式有误：\n" + Utf8ToWide(reason)).c_str(), kWindowTitle, MB_ICONWARNING);
+            return;
+        }
+        std::replace(result.begin(), result.end(), L'\n', L'\r');
+        notice = count > 0 ? L"已替换 " + std::to_wstring(count) + L" 处" : L"没有找到匹配的内容";
+        break;
+    }
     case kIdPinyinTone:
     case kIdPinyinPlain:
     case kIdPinyinInitials: {
@@ -5225,6 +5819,14 @@ void RunTextTool(int command) {
     if (result == text) {
         ShowNotice(notice.empty() ? L"没有需要修改的内容" : notice);
         return;
+    }
+    if (g_app.previewTextTools) {
+        wchar_t label[128]{};
+        GetMenuStringW(g_app.mainMenu, static_cast<UINT>(command), label, static_cast<int>(std::size(label)), MF_BYCOMMAND);
+        std::wstring name = label;
+        if (const size_t tab = name.find(L'\t'); tab != std::wstring::npos) name.resize(tab);
+        if (const size_t dots = name.find(L"..."); dots != std::wstring::npos) name.resize(dots);
+        if (!ConfirmChange(name.c_str(), text, result)) return;
     }
     // One replace = one undo step; the result stays selected.
     SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
