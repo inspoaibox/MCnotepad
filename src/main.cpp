@@ -109,6 +109,10 @@ constexpr int kIdClearSearchResults = 1218;
 constexpr int kIdSearchErrorLog = 1219;
 constexpr int kIdUndoReplaceInFiles = 1220;
 constexpr int kIdCopySearchResults = 1221;
+constexpr int kIdCompareFiles = 1230;
+constexpr int kIdCompareWithFile = 1231;
+constexpr int kIdCompareFolders = 1232;
+constexpr int kIdCompareStructure = 1233;
 constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
@@ -3491,6 +3495,11 @@ HMENU CreateApplicationMenu() {
     }
     AppendMenuW(run, MF_STRING, kIdToolbarRun, L"运行当前文件\tF5");
     AppendMenuW(tools, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tShift+Alt+F");
+    AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(tools, MF_STRING, kIdCompareWithFile, L"比较当前文件与...");
+    AppendMenuW(tools, MF_STRING, kIdCompareFiles, L"比较两个文件...");
+    AppendMenuW(tools, MF_STRING, kIdCompareStructure, L"结构化比较 (JSON/CSV/YAML)...");
+    AppendMenuW(tools, MF_STRING, kIdCompareFolders, L"比较文件夹...");
     AppendMenuW(theme, MF_STRING, kIdThemeDark, L"深色");
     AppendMenuW(theme, MF_STRING, kIdThemeLight, L"浅色");
     AppendMenuW(theme, MF_STRING, kIdThemeGreen, L"护眼绿");
@@ -3708,6 +3717,9 @@ void InitializeStorage() {
     CreateRunningMarker();
 }
 
+void CompareFiles(const std::wstring& leftPath, const std::wstring& rightPath, bool structure = false);
+void CompareFolderPaths(const std::wstring& left, const std::wstring& right);
+
 void OpenCommandLineFiles() {
     int argumentCount = 0;
     LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
@@ -3718,6 +3730,14 @@ void OpenCommandLineFiles() {
     for (int index = 1; index < argumentCount; ++index) {
         const std::wstring argument = arguments[index];
         if (argument == L"--new-instance" || argument == L"--portable") {
+            continue;
+        }
+        if ((argument == L"--diff" || argument == L"--diff-struct") && index + 2 < argumentCount) {
+            const std::wstring left = arguments[index + 1], right = arguments[index + 2];
+            index += 2;
+            std::error_code error;
+            if (fs::is_directory(left, error) && fs::is_directory(right, error)) CompareFolderPaths(left, right);
+            else CompareFiles(left, right, argument == L"--diff-struct");
             continue;
         }
         if (!argument.empty() && argument[0] != L'-') {
@@ -5376,6 +5396,8 @@ int IndexOfEditor(HWND editor) {
     return -1;
 }
 
+void CompareTabs(int leftIndex, int rightIndex);
+
 void ShowTabContextMenu(int index, POINT screen) {
     if (index < 0 || index >= static_cast<int>(g_app.documents.size())) return;
     const TabDocument& document = g_app.documents[static_cast<size_t>(index)];
@@ -5390,6 +5412,8 @@ void ShowTabContextMenu(int index, POINT screen) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (hasFile ? 0 : MF_GRAYED), 4, L"复制文件路径");
     AppendMenuW(menu, MF_STRING | (hasFile ? 0 : MF_GRAYED), 5, L"在资源管理器中显示");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (index == g_app.activeIndex ? MF_GRAYED : 0), 7, L"与当前标签比较");
     const int command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, g_app.window, nullptr);
     DestroyMenu(menu);
 
@@ -5421,6 +5445,9 @@ void ShowTabContextMenu(int index, POINT screen) {
         break;
     case 6:
         RenameDocument(index);
+        break;
+    case 7:
+        CompareTabs(g_app.activeIndex, index);
         break;
     default:
         break;
@@ -9700,6 +9727,2084 @@ void UndoLastReplaceInFiles() {
     MessageBoxW(g_app.window, message.c_str(), kWindowTitle, failures.empty() ? MB_ICONINFORMATION : MB_ICONWARNING);
 }
 
+// ===========================================================================
+// Compare: two files side by side, and two folders
+// ===========================================================================
+
+// A block that exists on one side only can often sit in several places
+// ("}" + blank line ambiguity). Like git: move it down as far as it goes,
+// then back up while it ends with a blank line, so it reads as whole lines
+// of code being added or removed.
+void SlideOneSidedBlocks(std::vector<std::pair<int, int>>& pairs, const std::vector<std::wstring>& a, const std::vector<std::wstring>& b) {
+    const auto matched = [&](size_t k) { return pairs[k].first >= 0 && pairs[k].second >= 0; };
+    const auto blank = [](const std::wstring& line) {
+        return std::all_of(line.begin(), line.end(), [](wchar_t c) { return iswspace(c) != 0; });
+    };
+    size_t s = 0;
+    while (s < pairs.size()) {
+        if (matched(s)) { ++s; continue; }
+        size_t e = s;
+        while (e < pairs.size() && !matched(e)) ++e;
+        const bool left = pairs[s].second < 0;
+        bool oneSided = true;
+        for (size_t k = s; k < e; ++k) oneSided = oneSided && ((pairs[k].second < 0) == left);
+        if (!oneSided) { s = e; continue; }
+        const std::vector<std::wstring>& lines = left ? a : b;
+        const auto line = [&](size_t k) -> int { return left ? pairs[k].first : pairs[k].second; };
+        const auto other = [&](size_t k) -> int { return left ? pairs[k].second : pairs[k].first; };
+        const auto set = [&](size_t k, int here, int there) { pairs[k] = left ? std::make_pair(here, there) : std::make_pair(there, here); };
+        const size_t length = e - s;
+        // Down.
+        while (e < pairs.size() && matched(e) && lines[static_cast<size_t>(line(s))] == lines[static_cast<size_t>(line(e))]) {
+            const int first = line(s), there = other(e);
+            set(s, first, there);
+            for (size_t k = 1; k <= length; ++k) set(s + k, first + static_cast<int>(k), -1);
+            ++s;
+            ++e;
+        }
+        // Back up while the block ends with a blank line.
+        while (s > 0 && matched(s - 1) && blank(lines[static_cast<size_t>(line(e - 1))]) &&
+               lines[static_cast<size_t>(line(e - 1))] == lines[static_cast<size_t>(line(s - 1))]) {
+            const int first = line(s - 1), there = other(s - 1);
+            for (size_t k = 0; k < length; ++k) set(s - 1 + k, first + static_cast<int>(k), -1);
+            set(e - 1, first + static_cast<int>(length), there);
+            --s;
+            --e;
+        }
+        s = e;
+    }
+}
+
+// Pairs up lines of two texts: (leftIndex, rightIndex), -1 where a line
+// exists on one side only. Common prefix/suffix first, then LCS on the rest.
+std::vector<std::pair<int, int>> AlignLines(const std::vector<std::wstring>& a, const std::vector<std::wstring>& b) {
+    std::vector<std::pair<int, int>> out;
+    const size_t n = a.size(), m = b.size();
+    size_t prefix = 0;
+    while (prefix < n && prefix < m && a[prefix] == b[prefix]) ++prefix;
+    size_t suffix = 0;
+    while (suffix < n - prefix && suffix < m - prefix && a[n - 1 - suffix] == b[m - 1 - suffix]) ++suffix;
+    for (size_t i = 0; i < prefix; ++i) out.emplace_back(static_cast<int>(i), static_cast<int>(i));
+    const size_t rows = n - prefix - suffix, cols = m - prefix - suffix;
+    if (rows > 0 && cols > 0 && rows * cols <= 16'000'000 && std::min(rows, cols) < 65535) {
+        std::vector<uint16_t> table((rows + 1) * (cols + 1), 0);
+        const auto at = [&](size_t i, size_t j) -> uint16_t& { return table[i * (cols + 1) + j]; };
+        for (size_t i = rows; i-- > 0;) {
+            for (size_t j = cols; j-- > 0;) {
+                at(i, j) = a[prefix + i] == b[prefix + j] ? static_cast<uint16_t>(at(i + 1, j + 1) + 1) : std::max(at(i + 1, j), at(i, j + 1));
+            }
+        }
+        size_t i = 0, j = 0;
+        while (i < rows || j < cols) {
+            if (i < rows && j < cols && a[prefix + i] == b[prefix + j]) {
+                out.emplace_back(static_cast<int>(prefix + i++), static_cast<int>(prefix + j++));
+            } else if (i < rows && (j == cols || at(i + 1, j) >= at(i, j + 1))) {
+                out.emplace_back(static_cast<int>(prefix + i++), -1);
+            } else {
+                out.emplace_back(-1, static_cast<int>(prefix + j++));
+            }
+        }
+    } else {
+        for (size_t i = 0; i < rows; ++i) out.emplace_back(static_cast<int>(prefix + i), -1);
+        for (size_t j = 0; j < cols; ++j) out.emplace_back(-1, static_cast<int>(prefix + j));
+    }
+    for (size_t k = 0; k < suffix; ++k) out.emplace_back(static_cast<int>(n - suffix + k), static_cast<int>(m - suffix + k));
+    SlideOneSidedBlocks(out, a, b);
+    return out;
+}
+
+std::wstring WhitespaceKey(const std::wstring& line) {
+    std::wstring key;
+    for (const wchar_t c : line) if (!iswspace(c)) key += c;
+    return key;
+}
+
+enum class RowKind { Same, Changed, LeftOnly, RightOnly };
+
+struct CompareRow {
+    int left = -1;
+    int right = -1;
+    RowKind kind = RowKind::Same;
+};
+
+struct CompareHunk {
+    int firstRow = 0, lastRow = 0;     // rows in the aligned view
+    int leftStart = 0, leftCount = 0;  // line range on each side
+    int rightStart = 0, rightCount = 0;
+};
+
+struct CompareSide {
+    std::wstring path;       // empty for an untitled tab
+    std::wstring title;
+    HWND editor = nullptr;   // the tab this side came from, if any
+    std::vector<std::wstring> lines;
+    int encoding = 0;
+    std::wstring eol = L"\r\n";
+    bool dirty = false;
+};
+
+// Rows of the aligned view: changed pairs first within each block of edits.
+std::vector<CompareRow> BuildCompareRows(const CompareSide& left, const CompareSide& right, bool ignoreWhitespace,
+    std::vector<CompareHunk>& hunks) {
+    std::vector<std::wstring> keysLeft = left.lines, keysRight = right.lines;
+    if (ignoreWhitespace) {
+        for (std::wstring& line : keysLeft) line = WhitespaceKey(line);
+        for (std::wstring& line : keysRight) line = WhitespaceKey(line);
+    }
+    const auto pairs = AlignLines(keysLeft, keysRight);
+    std::vector<CompareRow> rows;
+    hunks.clear();
+    int nextLeft = 0, nextRight = 0;
+    for (size_t k = 0; k < pairs.size();) {
+        if (pairs[k].first >= 0 && pairs[k].second >= 0) {
+            rows.push_back({pairs[k].first, pairs[k].second, RowKind::Same});
+            nextLeft = pairs[k].first + 1;
+            nextRight = pairs[k].second + 1;
+            ++k;
+            continue;
+        }
+        std::vector<int> removed, added;
+        while (k < pairs.size() && !(pairs[k].first >= 0 && pairs[k].second >= 0)) {
+            if (pairs[k].first >= 0) removed.push_back(pairs[k].first);
+            else added.push_back(pairs[k].second);
+            ++k;
+        }
+        CompareHunk hunk;
+        hunk.firstRow = static_cast<int>(rows.size());
+        hunk.leftStart = removed.empty() ? nextLeft : removed.front();
+        hunk.leftCount = static_cast<int>(removed.size());
+        hunk.rightStart = added.empty() ? nextRight : added.front();
+        hunk.rightCount = static_cast<int>(added.size());
+        const size_t paired = std::min(removed.size(), added.size());
+        for (size_t p = 0; p < paired; ++p) rows.push_back({removed[p], added[p], RowKind::Changed});
+        for (size_t p = paired; p < removed.size(); ++p) rows.push_back({removed[p], -1, RowKind::LeftOnly});
+        for (size_t p = paired; p < added.size(); ++p) rows.push_back({-1, added[p], RowKind::RightOnly});
+        hunk.lastRow = static_cast<int>(rows.size()) - 1;
+        hunks.push_back(hunk);
+        if (!removed.empty()) nextLeft = removed.back() + 1;
+        if (!added.empty()) nextRight = added.back() + 1;
+    }
+    return rows;
+}
+
+bool LoadCompareSideFromFile(CompareSide& side, const std::wstring& path, std::wstring& error) {
+    std::vector<char> bytes;
+    if (!ReadBinaryFile(path, bytes)) {
+        error = L"无法读取：" + path;
+        return false;
+    }
+    const bool utf16Bom = bytes.size() >= 2 && ((static_cast<unsigned char>(bytes[0]) == 0xFF && static_cast<unsigned char>(bytes[1]) == 0xFE) ||
+        (static_cast<unsigned char>(bytes[0]) == 0xFE && static_cast<unsigned char>(bytes[1]) == 0xFF));
+    if (!utf16Bom && memchr(bytes.data(), 0, std::min<size_t>(bytes.size(), 8192))) {
+        error = L"二进制文件无法按文本比较：" + path;
+        return false;
+    }
+    bool mixed = false;
+    const std::wstring text = NormalizeToLf(DecodeTextBytes(bytes, &side.encoding), side.eol, mixed);
+    side.lines = SplitLines(text);
+    side.path = path;
+    side.title = fs::path(path).filename().wstring();
+    side.editor = nullptr;
+    side.dirty = false;
+    return true;
+}
+
+void LoadCompareSideFromTab(CompareSide& side, const TabDocument& document) {
+    side.lines = SplitLines(GetEditorRawText(document.editor));
+    side.path = document.untitled ? std::wstring() : document.path;
+    side.title = document.title + (document.modified ? L"（未保存的修改）" : L"");
+    side.editor = document.editor;
+    side.encoding = document.encoding;
+    side.eol = document.lineEnding == 1 ? L"\n" : document.lineEnding == 2 ? L"\r" : L"\r\n";
+    side.dirty = false;
+}
+
+// ---- File compare window -------------------------------------------------------
+
+enum CompareControl : int {
+    kCmpPrev = 4001, kCmpNext, kCmpToRight, kCmpToLeft, kCmpSwap, kCmpIgnoreSpace, kCmpSaveLeft, kCmpSaveRight, kCmpRefresh,
+    kCmpLeftView, kCmpRightView, kCmpStats, kCmpLeftTitle, kCmpRightTitle, kCmpStructure, kCmpList,
+};
+
+// ---- Structured compare: JSON / CSV / YAML ------------------------------------------
+// Each format is flattened to items addressed by a path ("server.port",
+// "users[2].name", "row-key › column"). Items are compared one by one and
+// any item can be taken from the other side.
+
+enum class StructFormat { None, Json, Csv, Yaml };
+
+struct StructItem {
+    std::wstring path;
+    std::wstring parent;   // path of the parent item ("" = root)
+    std::wstring value;    // what is shown and compared (leaves)
+    bool container = false;
+};
+
+class StructDoc {
+public:
+    virtual ~StructDoc() = default;
+    virtual bool Parse(const std::vector<std::wstring>& lines, std::wstring& error) = 0;
+    // Every item in document order, parents before their children.
+    virtual std::vector<StructItem> Items() const = 0;
+    // Makes `path` here match `from`: replace, insert or delete.
+    virtual bool Take(const std::wstring& path, const StructDoc& from, std::wstring& error) = 0;
+    virtual std::vector<std::wstring> Lines() const = 0;
+};
+
+// ---- JSON (comments allowed, numbers and strings kept as written) ----
+
+struct JsonNode {
+    enum Type { Scalar, Object, Array } type = Scalar;
+    std::wstring raw;  // scalars: exactly as written ("text", 1.50, true, null)
+    std::vector<std::pair<std::wstring, JsonNode>> members;  // key as written, with quotes
+    std::vector<JsonNode> items;
+};
+
+class JsonDoc : public StructDoc {
+public:
+    bool Parse(const std::vector<std::wstring>& lines, std::wstring& error) override {
+        text_ = JoinLines(lines, L"\n");
+        position_ = 0;
+        indent_ = L"  ";
+        compact_ = text_.find(L'\n') == std::wstring::npos || TrimCopy(text_).find(L'\n') == std::wstring::npos;
+        for (const std::wstring& line : lines) {
+            const size_t first = line.find_first_not_of(L" \t");
+            if (first != std::wstring::npos && first > 0) { indent_ = line.substr(0, first); break; }
+        }
+        trailingNewline_ = !lines.empty() && lines.back().empty();
+        SkipSpace();
+        if (position_ >= text_.size()) { root_ = JsonNode{}; root_.type = JsonNode::Object; return true; }
+        if (!ParseValue(root_, error)) return false;
+        SkipSpace();
+        if (position_ < text_.size()) { error = L"JSON 第 " + std::to_wstring(LineAt(position_)) + L" 行：多余的内容"; return false; }
+        text_.clear();
+        return true;
+    }
+
+    std::vector<StructItem> Items() const override {
+        std::vector<StructItem> out;
+        Collect(root_, L"", L"", out, true);
+        return out;
+    }
+
+    bool Take(const std::wstring& path, const StructDoc& fromBase, std::wstring& error) override {
+        const auto& from = static_cast<const JsonDoc&>(fromBase);
+        Location source = from.Find(path);
+        Location target = Find(path);
+        if (source.node && target.node) {
+            *target.node = *source.node;
+            return true;
+        }
+        if (!source.node && target.node) {
+            if (target.parent->type == JsonNode::Object) target.parent->members.erase(target.parent->members.begin() + static_cast<std::ptrdiff_t>(target.index));
+            else target.parent->items.erase(target.parent->items.begin() + static_cast<std::ptrdiff_t>(target.index));
+            return true;
+        }
+        if (!source.node) return true;
+        Location parent = source.parentPath.empty() ? Location{&root_, nullptr, 0, L""} : Find(source.parentPath);
+        if (!parent.node || parent.node->type != source.parent->type) {
+            error = L"另一侧没有“" + source.parentPath + L"”这个对象，无法插入";
+            return false;
+        }
+        if (source.parent->type == JsonNode::Array) {
+            const size_t at = std::min(source.index, parent.node->items.size());
+            parent.node->items.insert(parent.node->items.begin() + static_cast<std::ptrdiff_t>(at), *source.node);
+            return true;
+        }
+        // After the nearest earlier key that exists here, else first.
+        size_t at = 0;
+        for (size_t k = source.index; k-- > 0;) {
+            const std::wstring& key = source.parent->members[k].first;
+            const auto it = std::find_if(parent.node->members.begin(), parent.node->members.end(), [&](const auto& m) { return m.first == key; });
+            if (it != parent.node->members.end()) { at = static_cast<size_t>(it - parent.node->members.begin()) + 1; break; }
+        }
+        parent.node->members.insert(parent.node->members.begin() + static_cast<std::ptrdiff_t>(at), {source.parent->members[source.index].first, *source.node});
+        return true;
+    }
+
+    std::vector<std::wstring> Lines() const override {
+        std::wstring out;
+        Write(root_, 0, out);
+        std::vector<std::wstring> lines = SplitLines(out);
+        if (trailingNewline_) lines.emplace_back();
+        return lines;
+    }
+
+private:
+    struct Location {
+        JsonNode* node = nullptr;
+        JsonNode* parent = nullptr;
+        size_t index = 0;
+        std::wstring parentPath;
+    };
+
+    static std::wstring KeyName(const std::wstring& raw) {
+        return raw.size() >= 2 && raw.front() == L'"' ? raw.substr(1, raw.size() - 2) : raw;
+    }
+    static std::wstring ChildPath(const std::wstring& parent, const std::wstring& key) {
+        return parent.empty() ? key : parent + L"." + key;
+    }
+
+    void Collect(const JsonNode& node, const std::wstring& path, const std::wstring& parent, std::vector<StructItem>& out, bool root) const {
+        if (!root) {
+            StructItem item{path, parent, {}, node.type != JsonNode::Scalar};
+            if (node.type == JsonNode::Scalar) item.value = node.raw;
+            else if (node.type == JsonNode::Object) item.value = L"{ " + std::to_wstring(node.members.size()) + L" 个键 }";
+            else item.value = L"[ " + std::to_wstring(node.items.size()) + L" 项 ]";
+            out.push_back(item);
+        }
+        if (node.type == JsonNode::Object) {
+            for (const auto& [key, child] : node.members) Collect(child, ChildPath(path, KeyName(key)), path, out, false);
+        } else if (node.type == JsonNode::Array) {
+            for (size_t i = 0; i < node.items.size(); ++i) Collect(node.items[i], path + L"[" + std::to_wstring(i) + L"]", path, out, false);
+        }
+    }
+
+    // Walks the tree; paths are the ones Collect produces.
+    Location Find(const std::wstring& path) const {
+        Location found;
+        Search(const_cast<JsonNode&>(root_), L"", path, found);
+        return found;
+    }
+    static bool Search(JsonNode& node, const std::wstring& path, const std::wstring& wanted, Location& found) {
+        if (node.type == JsonNode::Object) {
+            for (size_t k = 0; k < node.members.size(); ++k) {
+                const std::wstring child = ChildPath(path, KeyName(node.members[k].first));
+                if (child == wanted) { found = {&node.members[k].second, &node, k, path}; return true; }
+                if (wanted.compare(0, child.size(), child) == 0 && wanted.size() > child.size() &&
+                    (wanted[child.size()] == L'.' || wanted[child.size()] == L'[') && Search(node.members[k].second, child, wanted, found)) return true;
+            }
+        } else if (node.type == JsonNode::Array) {
+            for (size_t k = 0; k < node.items.size(); ++k) {
+                const std::wstring child = path + L"[" + std::to_wstring(k) + L"]";
+                if (child == wanted) { found = {&node.items[k], &node, k, path}; return true; }
+                if (wanted.compare(0, child.size(), child) == 0 && wanted.size() > child.size() && Search(node.items[k], child, wanted, found)) return true;
+            }
+        }
+        return false;
+    }
+
+    int LineAt(size_t position) const { return 1 + static_cast<int>(std::count(text_.begin(), text_.begin() + static_cast<std::ptrdiff_t>(std::min(position, text_.size())), L'\n')); }
+
+    void SkipSpace() {
+        while (position_ < text_.size()) {
+            const wchar_t c = text_[position_];
+            if (iswspace(c) || c == 0xFEFF) { ++position_; continue; }
+            if (c == L'/' && position_ + 1 < text_.size() && text_[position_ + 1] == L'/') {
+                while (position_ < text_.size() && text_[position_] != L'\n') ++position_;
+                continue;
+            }
+            if (c == L'/' && position_ + 1 < text_.size() && text_[position_ + 1] == L'*') {
+                const size_t end = text_.find(L"*/", position_ + 2);
+                position_ = end == std::wstring::npos ? text_.size() : end + 2;
+                continue;
+            }
+            break;
+        }
+    }
+
+    bool ParseString(std::wstring& raw, std::wstring& error) {
+        const size_t start = position_++;
+        while (position_ < text_.size() && text_[position_] != L'"') {
+            if (text_[position_] == L'\\') ++position_;
+            ++position_;
+        }
+        if (position_ >= text_.size()) { error = L"JSON 第 " + std::to_wstring(LineAt(start)) + L" 行：字符串没有结束"; return false; }
+        ++position_;
+        raw = text_.substr(start, position_ - start);
+        return true;
+    }
+
+    bool ParseValue(JsonNode& node, std::wstring& error) {
+        SkipSpace();
+        if (position_ >= text_.size()) { error = L"JSON 意外结束"; return false; }
+        const wchar_t c = text_[position_];
+        if (c == L'{' || c == L'[') {
+            const bool object = c == L'{';
+            node.type = object ? JsonNode::Object : JsonNode::Array;
+            ++position_;
+            SkipSpace();
+            if (position_ < text_.size() && text_[position_] == (object ? L'}' : L']')) { ++position_; return true; }
+            while (true) {
+                SkipSpace();
+                if (object) {
+                    std::wstring key;
+                    if (position_ >= text_.size() || text_[position_] != L'"') { error = L"JSON 第 " + std::to_wstring(LineAt(position_)) + L" 行：应为键名"; return false; }
+                    if (!ParseString(key, error)) return false;
+                    SkipSpace();
+                    if (position_ >= text_.size() || text_[position_] != L':') { error = L"JSON 第 " + std::to_wstring(LineAt(position_)) + L" 行：缺少冒号"; return false; }
+                    ++position_;
+                    JsonNode child;
+                    if (!ParseValue(child, error)) return false;
+                    node.members.emplace_back(std::move(key), std::move(child));
+                } else {
+                    JsonNode child;
+                    if (!ParseValue(child, error)) return false;
+                    node.items.push_back(std::move(child));
+                }
+                SkipSpace();
+                if (position_ < text_.size() && text_[position_] == L',') {
+                    ++position_;
+                    SkipSpace();
+                    if (position_ < text_.size() && text_[position_] == (object ? L'}' : L']')) { ++position_; return true; }  // trailing comma
+                    continue;
+                }
+                if (position_ < text_.size() && text_[position_] == (object ? L'}' : L']')) { ++position_; return true; }
+                error = L"JSON 第 " + std::to_wstring(LineAt(position_)) + L" 行：缺少逗号或括号";
+                return false;
+            }
+        }
+        node.type = JsonNode::Scalar;
+        if (c == L'"') return ParseString(node.raw, error);
+        const size_t start = position_;
+        while (position_ < text_.size() && !iswspace(text_[position_]) && wcschr(L",}]/", text_[position_]) == nullptr) ++position_;
+        if (position_ == start) { error = L"JSON 第 " + std::to_wstring(LineAt(position_)) + L" 行：无法识别的字符"; return false; }
+        node.raw = text_.substr(start, position_ - start);
+        return true;
+    }
+
+    void Write(const JsonNode& node, int depth, std::wstring& out) const {
+        if (node.type == JsonNode::Scalar) { out += node.raw; return; }
+        const bool object = node.type == JsonNode::Object;
+        const size_t count = object ? node.members.size() : node.items.size();
+        if (count == 0) { out += object ? L"{}" : L"[]"; return; }
+        out += object ? L'{' : L'[';
+        for (size_t k = 0; k < count; ++k) {
+            if (compact_) out += k ? L", " : L"";
+            else {
+                out += L'\n';
+                for (int d = 0; d <= depth; ++d) out += indent_;
+            }
+            if (object) {
+                out += node.members[k].first + L": ";
+                Write(node.members[k].second, depth + 1, out);
+            } else {
+                Write(node.items[k], depth + 1, out);
+            }
+            if (!compact_ && k + 1 < count) out += L',';
+        }
+        if (!compact_) {
+            out += L'\n';
+            for (int d = 0; d < depth; ++d) out += indent_;
+        }
+        out += object ? L'}' : L']';
+    }
+
+    JsonNode root_;
+    std::wstring text_;
+    size_t position_ = 0;
+    std::wstring indent_;
+    bool compact_ = false;
+    bool trailingNewline_ = false;
+};
+
+// ---- CSV / TSV: rows matched by their first column ----
+
+class CsvDoc : public StructDoc {
+public:
+    explicit CsvDoc(wchar_t delimiter = 0) : delimiter_(delimiter) {}
+
+    bool Parse(const std::vector<std::wstring>& lines, std::wstring& error) override {
+        const std::wstring text = JoinLines(lines, L"\n");
+        trailingNewline_ = !lines.empty() && lines.back().empty();
+        if (!delimiter_) {
+            const std::wstring first = lines.empty() ? std::wstring() : lines.front();
+            const size_t commas = std::count(first.begin(), first.end(), L','), tabs = std::count(first.begin(), first.end(), L'\t'),
+                         semis = std::count(first.begin(), first.end(), L';');
+            delimiter_ = tabs > commas && tabs >= semis ? L'\t' : semis > commas ? L';' : L',';
+        }
+        records_.clear();
+        std::vector<std::wstring> record;
+        std::wstring cell;
+        bool quoted = false, any = false;
+        for (size_t i = 0; i < text.size(); ++i) {
+            const wchar_t c = text[i];
+            if (quoted) {
+                if (c == L'"' && i + 1 < text.size() && text[i + 1] == L'"') { cell += L'"'; ++i; }
+                else if (c == L'"') quoted = false;
+                else cell += c;
+                continue;
+            }
+            if (c == L'"' && cell.empty()) { quoted = true; any = true; }
+            else if (c == delimiter_) { record.push_back(cell); cell.clear(); any = true; }
+            else if (c == L'\n') {
+                record.push_back(cell);
+                cell.clear();
+                if (any || record.size() > 1 || !record.front().empty()) records_.push_back(record);
+                record.clear();
+                any = false;
+            } else { cell += c; any = true; }
+        }
+        if (quoted) { error = L"CSV 中有未闭合的引号"; return false; }
+        if (any || !cell.empty()) { record.push_back(cell); records_.push_back(record); }
+        if (records_.empty()) { error = L"CSV 是空的"; return false; }
+        return true;
+    }
+
+    std::vector<StructItem> Items() const override {
+        std::vector<StructItem> out;
+        const std::vector<std::wstring>& header = records_.front();
+        const std::vector<std::wstring> keys = RowKeys();
+        for (size_t r = 1; r < records_.size(); ++r) {
+            const std::wstring& key = keys[r];
+            std::wstring summary;
+            for (size_t c = 0; c < records_[r].size(); ++c) summary += (c ? L", " : L"") + records_[r][c];
+            out.push_back({key, L"", summary, true});
+            for (size_t c = 1; c < header.size(); ++c) {
+                if (c < records_[r].size() && !records_[r][c].empty()) out.push_back({key + L" › " + header[c], key, records_[r][c], false});
+            }
+        }
+        return out;
+    }
+
+    bool Take(const std::wstring& path, const StructDoc& fromBase, std::wstring& error) override {
+        const auto& from = static_cast<const CsvDoc&>(fromBase);
+        const size_t split = path.find(L" › ");
+        const std::wstring key = split == std::wstring::npos ? path : path.substr(0, split);
+        const int sourceRow = from.RowOf(key), targetRow = RowOf(key);
+        if (split != std::wstring::npos) {
+            const std::wstring column = path.substr(split + 3);
+            if (targetRow < 0) { error = L"本侧没有行“" + key + L"”"; return false; }
+            int targetColumn = ColumnOf(column);
+            if (targetColumn < 0) {
+                records_.front().push_back(column);
+                targetColumn = static_cast<int>(records_.front().size()) - 1;
+            }
+            std::vector<std::wstring>& row = records_[static_cast<size_t>(targetRow)];
+            if (row.size() <= static_cast<size_t>(targetColumn)) row.resize(static_cast<size_t>(targetColumn) + 1);
+            const int sourceColumn = from.ColumnOf(column);
+            row[static_cast<size_t>(targetColumn)] = sourceRow >= 0 && sourceColumn >= 0 && static_cast<size_t>(sourceColumn) < from.records_[static_cast<size_t>(sourceRow)].size()
+                ? from.records_[static_cast<size_t>(sourceRow)][static_cast<size_t>(sourceColumn)] : L"";
+            // A column the other side does not have goes once it is empty.
+            if (sourceColumn < 0) {
+                bool empty = true;
+                for (size_t r = 1; r < records_.size() && empty; ++r) {
+                    empty = records_[r].size() <= static_cast<size_t>(targetColumn) || records_[r][static_cast<size_t>(targetColumn)].empty();
+                }
+                if (empty) {
+                    for (auto& record : records_) {
+                        if (record.size() > static_cast<size_t>(targetColumn)) record.erase(record.begin() + targetColumn);
+                    }
+                }
+            }
+            return true;
+        }
+        if (sourceRow < 0) {
+            if (targetRow > 0) records_.erase(records_.begin() + targetRow);
+            return true;
+        }
+        // Row in this side's column order.
+        std::vector<std::wstring> row(records_.front().size());
+        for (size_t c = 0; c < row.size(); ++c) {
+            const int sourceColumn = c == 0 ? 0 : from.ColumnOf(records_.front()[c]);
+            const auto& sourceRecord = from.records_[static_cast<size_t>(sourceRow)];
+            if (sourceColumn >= 0 && static_cast<size_t>(sourceColumn) < sourceRecord.size()) row[c] = sourceRecord[static_cast<size_t>(sourceColumn)];
+        }
+        if (targetRow > 0) { records_[static_cast<size_t>(targetRow)] = row; return true; }
+        size_t at = 1;
+        const std::vector<std::wstring> sourceKeys = from.RowKeys();
+        for (int r = sourceRow - 1; r >= 1; --r) {
+            const int here = RowOf(sourceKeys[static_cast<size_t>(r)]);
+            if (here > 0) { at = static_cast<size_t>(here) + 1; break; }
+        }
+        records_.insert(records_.begin() + static_cast<std::ptrdiff_t>(at), row);
+        return true;
+    }
+
+    std::vector<std::wstring> Lines() const override {
+        std::wstring text;
+        for (const auto& record : records_) {
+            for (size_t c = 0; c < record.size(); ++c) {
+                if (c) text += delimiter_;
+                const std::wstring& cell = record[c];
+                const bool quote = cell.find_first_of(std::wstring(L"\"\r\n") + delimiter_) != std::wstring::npos ||
+                    (!cell.empty() && (iswspace(cell.front()) || iswspace(cell.back())));
+                if (!quote) { text += cell; continue; }
+                text += L'"';
+                for (const wchar_t ch : cell) { if (ch == L'"') text += L'"'; text += ch; }
+                text += L'"';
+            }
+            text += L'\n';
+        }
+        if (!text.empty()) text.pop_back();
+        std::vector<std::wstring> lines = SplitLines(text);
+        if (trailingNewline_) lines.emplace_back();
+        return lines;
+    }
+
+private:
+    std::vector<std::wstring> RowKeys() const {
+        std::vector<std::wstring> keys(records_.size());
+        std::unordered_map<std::wstring, int> seen;
+        for (size_t r = 1; r < records_.size(); ++r) {
+            const std::wstring base = records_[r].empty() || records_[r][0].empty() ? L"(空)" : records_[r][0];
+            const int count = ++seen[base];
+            keys[r] = count == 1 ? base : base + L" #" + std::to_wstring(count);
+        }
+        return keys;
+    }
+    int RowOf(const std::wstring& key) const {
+        const std::vector<std::wstring> keys = RowKeys();
+        for (size_t r = 1; r < keys.size(); ++r) if (keys[r] == key) return static_cast<int>(r);
+        return -1;
+    }
+    int ColumnOf(const std::wstring& name) const {
+        const auto& header = records_.front();
+        for (size_t c = 1; c < header.size(); ++c) if (header[c] == name) return static_cast<int>(c);
+        return -1;
+    }
+
+    wchar_t delimiter_ = 0;
+    std::vector<std::vector<std::wstring>> records_;
+    bool trailingNewline_ = false;
+};
+
+// ---- YAML (block style): edits whole lines, so comments and layout survive ----
+
+class YamlDoc : public StructDoc {
+public:
+    bool Parse(const std::vector<std::wstring>& lines, std::wstring& error) override {
+        lines_ = lines;
+        nodes_.clear();
+        struct Open { int indent; std::wstring path; bool dash; };
+        std::vector<Open> stack;
+        std::unordered_map<std::wstring, int> sequenceCounters;
+        for (size_t i = 0; i < lines_.size(); ++i) {
+            const std::wstring& line = lines_[i];
+            const size_t first = line.find_first_not_of(L' ');
+            if (first == std::wstring::npos || line[first] == L'#' || line[first] == L'\t') continue;
+            if (first == 0 && (line.compare(0, 3, L"---") == 0 || line.compare(0, 3, L"...") == 0)) {
+                if (!nodes_.empty()) { error = L"暂不支持包含多个文档（---）的 YAML"; return false; }
+                continue;
+            }
+            int indent = static_cast<int>(first);
+            size_t column = first;
+            const bool dash = line[first] == L'-' && (first + 1 == line.size() || line[first + 1] == L' ');
+            if (dash) {
+                while (!stack.empty() && (stack.back().indent > indent || (stack.back().indent == indent && stack.back().dash))) stack.pop_back();
+                const std::wstring parent = stack.empty() ? L"" : stack.back().path;
+                const int index = sequenceCounters[parent]++;
+                Node item;
+                item.path = parent + L"[" + std::to_wstring(index) + L"]";
+                item.parent = parent;
+                item.line = i;
+                item.column = column;
+                item.dash = true;
+                stack.push_back({indent, item.path, true});
+                size_t rest = line.find_first_not_of(L' ', first + 1);
+                const size_t colon = rest == std::wstring::npos ? std::wstring::npos : KeyColon(line, rest);
+                item.prefixEnd = first + 1;
+                if (rest == std::wstring::npos || line[rest] == L'#') {
+                    nodes_.push_back(item);
+                    continue;
+                }
+                if (colon == std::wstring::npos) {  // "- scalar"
+                    item.valueColumn = rest;
+                    nodes_.push_back(item);
+                    continue;
+                }
+                item.inlineKey = true;
+                nodes_.push_back(item);
+                indent = static_cast<int>(rest);
+                column = rest;
+                sequenceCounters.erase(item.path);
+                AddKey(i, column, indent, colon, item.path, true, stack, sequenceCounters);
+                continue;
+            }
+            const size_t colon = KeyColon(line, first);
+            if (colon == std::wstring::npos) continue;  // continuation of a multi-line value
+            while (!stack.empty() && stack.back().indent >= indent) stack.pop_back();
+            AddKey(i, column, indent, colon, stack.empty() ? L"" : stack.back().path, false, stack, sequenceCounters);
+        }
+        // Block ends.
+        for (Node& node : nodes_) {
+            size_t end = node.line + 1;
+            for (size_t j = node.line + 1; j < lines_.size(); ++j) {
+                const size_t first = lines_[j].find_first_not_of(L' ');
+                if (first == std::wstring::npos || lines_[j][first] == L'#') continue;
+                const bool childDash = lines_[j][first] == L'-' && !node.dash && !node.onDashLine;
+                if (static_cast<int>(first) > static_cast<int>(node.column) || (childDash && first == node.column)) end = j + 1;
+                else break;
+            }
+            node.end = end;
+            node.container = end > node.line + 1 || node.inlineKey || (node.valueColumn == std::wstring::npos && end > node.line + 1);
+        }
+        return true;
+    }
+
+    std::vector<StructItem> Items() const override {
+        std::vector<StructItem> out;
+        for (const Node& node : nodes_) {
+            StructItem item{node.path, node.parent, {}, node.container};
+            item.value = node.container ? L"(" + std::to_wstring(node.end - node.line) + L" 行)" : Value(node);
+            out.push_back(item);
+        }
+        return out;
+    }
+
+    bool Take(const std::wstring& path, const StructDoc& fromBase, std::wstring& error) override {
+        const auto& from = static_cast<const YamlDoc&>(fromBase);
+        const Node* source = from.Find(path);
+        const Node* target = Find(path);
+        const std::wstring unsupported = L"“" + path + L"”写在“- ”同一行，无法自动合并，请在文本视图中手动修改";
+        if (source && target) {
+            if (!source->container && !target->container) {
+                std::wstring& line = lines_[target->line];
+                const std::wstring value = source->valueColumn == std::wstring::npos ? L"" : from.lines_[source->line].substr(source->valueColumn);
+                line = line.substr(0, target->prefixEnd) + (value.empty() ? L"" : L" " + value);
+            } else {
+                if (source->onDashLine || target->onDashLine) { error = unsupported; return false; }
+                const std::vector<std::wstring> block = from.Block(*source, static_cast<int>(target->column) - static_cast<int>(source->column));
+                ReplaceLines(target->line, target->end, block);
+            }
+        } else if (target) {
+            if (target->onDashLine) { error = unsupported; return false; }
+            ReplaceLines(target->line, target->end, {});
+        } else if (source) {
+            if (source->onDashLine) { error = unsupported; return false; }
+            const Node* parent = source->parent.empty() ? nullptr : Find(source->parent);
+            if (!source->parent.empty() && !parent) { error = L"本侧没有“" + source->parent + L"”"; return false; }
+            const Node* sourceParent = source->parent.empty() ? nullptr : from.Find(source->parent);
+            // After the nearest earlier sibling that exists here.
+            const Node* previous = nullptr;
+            for (const Node& node : from.nodes_) {
+                if (&node == source) break;
+                if (node.parent == source->parent) {
+                    if (const Node* here = Find(node.path)) previous = here;
+                }
+            }
+            size_t at;
+            int column;
+            if (previous) { at = previous->end; column = static_cast<int>(previous->column); }
+            else if (parent) {
+                at = parent->line + 1;
+                column = static_cast<int>(parent->column) + (static_cast<int>(source->column) - static_cast<int>(sourceParent ? sourceParent->column : 0));
+            } else {
+                at = 0;
+                while (at < lines_.size() && (TrimCopy(lines_[at]).empty() || TrimCopy(lines_[at])[0] == L'#' || lines_[at].compare(0, 3, L"---") == 0)) ++at;
+                column = 0;
+            }
+            if (parent && !parent->container && parent->valueColumn != std::wstring::npos) {
+                error = L"本侧的“" + source->parent + L"”是一个值，不是对象或列表";
+                return false;
+            }
+            const std::vector<std::wstring> block = from.Block(*source, column - static_cast<int>(source->column));
+            lines_.insert(lines_.begin() + static_cast<std::ptrdiff_t>(at), block.begin(), block.end());
+        }
+        std::wstring parseError;
+        if (!Parse(std::vector<std::wstring>(lines_), parseError)) { error = parseError; return false; }
+        return true;
+    }
+
+    std::vector<std::wstring> Lines() const override { return lines_; }
+
+private:
+    struct Node {
+        std::wstring path, parent;
+        size_t line = 0, end = 0;
+        size_t column = 0;                         // where the key or "-" starts
+        size_t prefixEnd = 0;                      // just after "key:" or "-"
+        size_t valueColumn = std::wstring::npos;   // where a scalar value starts
+        bool dash = false, onDashLine = false, inlineKey = false, container = false;
+    };
+
+    // Colon ending a key ("key: value" or "key:"), outside quotes.
+    static size_t KeyColon(const std::wstring& line, size_t from) {
+        wchar_t quote = 0;
+        for (size_t i = from; i < line.size(); ++i) {
+            const wchar_t c = line[i];
+            if (quote) { if (c == quote) quote = 0; continue; }
+            if ((c == L'"' || c == L'\'') && i == from) { quote = c; continue; }
+            if (c == L'#' && i > from && line[i - 1] == L' ') return std::wstring::npos;
+            if (c == L':' && (i + 1 == line.size() || line[i + 1] == L' ')) return i;
+            if (i == from && (c == L'[' || c == L'{' || c == L'|' || c == L'>')) return std::wstring::npos;
+        }
+        return std::wstring::npos;
+    }
+
+    template <typename Stack>
+    void AddKey(size_t i, size_t column, int indent, size_t colon, const std::wstring& parent, bool onDash, Stack& stack,
+        std::unordered_map<std::wstring, int>& counters) {
+        const std::wstring& line = lines_[i];
+        std::wstring key = TrimCopy(std::wstring_view(line).substr(column, colon - column));
+        if (key.size() >= 2 && (key.front() == L'"' || key.front() == L'\'') && key.back() == key.front()) key = key.substr(1, key.size() - 2);
+        Node node;
+        node.path = parent.empty() ? key : parent + L"." + key;
+        node.parent = parent;
+        node.line = i;
+        node.column = column;
+        node.onDashLine = onDash;
+        const size_t value = line.find_first_not_of(L' ', colon + 1);
+        node.prefixEnd = colon + 1;
+        node.valueColumn = value == std::wstring::npos || line[value] == L'#' ? std::wstring::npos : value;
+        counters.erase(node.path);
+        nodes_.push_back(node);
+        stack.push_back({indent, node.path, false});
+    }
+
+    std::wstring Value(const Node& node) const {
+        if (node.valueColumn == std::wstring::npos) return L"";
+        std::wstring value = lines_[node.line].substr(node.valueColumn);
+        const size_t comment = value.find(L" #");
+        if (comment != std::wstring::npos && value[0] != L'"' && value[0] != L'\'') value.erase(comment);
+        return TrimCopy(value);
+    }
+
+    const Node* Find(const std::wstring& path) const {
+        for (const Node& node : nodes_) if (node.path == path) return &node;
+        return nullptr;
+    }
+
+    std::vector<std::wstring> Block(const Node& node, int shift) const {
+        std::vector<std::wstring> block(lines_.begin() + static_cast<std::ptrdiff_t>(node.line), lines_.begin() + static_cast<std::ptrdiff_t>(node.end));
+        for (std::wstring& line : block) {
+            if (shift > 0) line.insert(0, static_cast<size_t>(shift), L' ');
+            else if (shift < 0) {
+                const size_t spaces = std::min(static_cast<size_t>(-shift), line.find_first_not_of(L' ') == std::wstring::npos ? line.size() : line.find_first_not_of(L' '));
+                line.erase(0, spaces);
+            }
+        }
+        return block;
+    }
+
+    void ReplaceLines(size_t start, size_t end, const std::vector<std::wstring>& block) {
+        lines_.erase(lines_.begin() + static_cast<std::ptrdiff_t>(start), lines_.begin() + static_cast<std::ptrdiff_t>(end));
+        lines_.insert(lines_.begin() + static_cast<std::ptrdiff_t>(start), block.begin(), block.end());
+    }
+
+    std::vector<std::wstring> lines_;
+    std::vector<Node> nodes_;
+};
+
+StructFormat DetectStructFormat(const CompareSide& side) {
+    const std::wstring name = LowerInvariantSyntax(side.path.empty() ? side.title : side.path);
+    const auto ends = [&](const wchar_t* suffix) {
+        const size_t n = wcslen(suffix);
+        return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+    };
+    if (ends(L".json") || ends(L".jsonc") || ends(L".json5") || ends(L".geojson")) return StructFormat::Json;
+    if (ends(L".csv") || ends(L".tsv")) return StructFormat::Csv;
+    if (ends(L".yaml") || ends(L".yml")) return StructFormat::Yaml;
+    for (const std::wstring& line : side.lines) {
+        const std::wstring trimmed = TrimCopy(line);
+        if (trimmed.empty()) continue;
+        if (trimmed[0] == L'{' || trimmed[0] == L'[') return StructFormat::Json;
+        break;
+    }
+    return StructFormat::None;
+}
+
+std::unique_ptr<StructDoc> MakeStructDoc(StructFormat format, const CompareSide& side) {
+    if (format == StructFormat::Json) return std::make_unique<JsonDoc>();
+    if (format == StructFormat::Yaml) return std::make_unique<YamlDoc>();
+    if (format == StructFormat::Csv) {
+        const std::wstring name = LowerInvariantSyntax(side.path.empty() ? side.title : side.path);
+        return std::make_unique<CsvDoc>(name.size() > 4 && name.compare(name.size() - 4, 4, L".tsv") == 0 ? L'\t' : wchar_t{0});
+    }
+    return nullptr;
+}
+
+struct StructRow {
+    std::wstring path;
+    RowKind kind = RowKind::Same;
+    std::wstring left, right;
+};
+
+// Compares item by item; a subtree that exists on one side only is one row.
+std::vector<StructRow> CompareStructItems(const std::vector<StructItem>& left, const std::vector<StructItem>& right) {
+    std::unordered_map<std::wstring, size_t> rightIndex, leftIndex;
+    for (size_t i = 0; i < right.size(); ++i) rightIndex.emplace(right[i].path, i);
+    for (size_t i = 0; i < left.size(); ++i) leftIndex.emplace(left[i].path, i);
+    std::vector<StructRow> rows;
+    std::unordered_set<std::wstring> covered;  // reported as a whole subtree
+    std::unordered_map<std::wstring, size_t> rowOf;
+    for (const StructItem& item : left) {
+        if (covered.count(item.parent)) { covered.insert(item.path); continue; }
+        const auto other = rightIndex.find(item.path);
+        if (other == rightIndex.end()) {
+            rows.push_back({item.path, RowKind::LeftOnly, item.value, L""});
+            covered.insert(item.path);
+        } else {
+            const StructItem& peer = right[other->second];
+            if (item.container && peer.container) {
+                rows.push_back({item.path, RowKind::Same, item.value, peer.value});
+            } else if (item.container != peer.container || item.value != peer.value) {
+                rows.push_back({item.path, RowKind::Changed, item.value, peer.value});
+                if (item.container || peer.container) covered.insert(item.path);
+            } else {
+                rows.push_back({item.path, RowKind::Same, item.value, peer.value});
+            }
+        }
+        rowOf[item.path] = rows.size() - 1;
+    }
+    // Right-only items go after the row of the item before them on the right.
+    // End of each row's subtree (rows are in document order, parents first).
+    std::vector<size_t> subtreeEnd(rows.size(), rows.size());
+    {
+        std::unordered_map<std::wstring, std::wstring> parentOf;
+        for (const StructItem& item : left) parentOf.emplace(item.path, item.parent);
+        std::vector<size_t> open;
+        for (size_t r = 0; r < rows.size(); ++r) {
+            const std::wstring& parent = parentOf[rows[r].path];
+            while (!open.empty() && rows[open.back()].path != parent) {
+                subtreeEnd[open.back()] = r;
+                open.pop_back();
+            }
+            open.push_back(r);
+        }
+    }
+    std::vector<std::pair<size_t, StructRow>> inserts;
+    std::unordered_map<std::wstring, std::wstring> lastShared;  // parent -> last child present on both sides
+    std::unordered_set<std::wstring> coveredRight;
+    for (const StructItem& item : right) {
+        if (leftIndex.count(item.path)) {
+            if (covered.count(item.path) || coveredRight.count(item.parent)) coveredRight.insert(item.path);
+            if (rowOf.count(item.path)) lastShared[item.parent] = item.path;
+            continue;
+        }
+        if (coveredRight.count(item.parent) || covered.count(item.parent)) { coveredRight.insert(item.path); continue; }
+        size_t at = 0;
+        const auto sibling = lastShared.find(item.parent);
+        if (sibling != lastShared.end()) at = subtreeEnd[rowOf[sibling->second]];
+        else if (const auto parent = rowOf.find(item.parent); parent != rowOf.end()) at = parent->second + 1;
+        inserts.push_back({at, {item.path, RowKind::RightOnly, L"", item.value}});
+        coveredRight.insert(item.path);
+    }
+    // Stable insertion, keeping right-side order for the same anchor.
+    std::stable_sort(inserts.begin(), inserts.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<StructRow> merged;
+    merged.reserve(rows.size() + inserts.size());
+    size_t next = 0;
+    for (size_t r = 0; r <= rows.size(); ++r) {
+        while (next < inserts.size() && inserts[next].first == r) merged.push_back(inserts[next++].second);
+        if (r < rows.size()) merged.push_back(rows[r]);
+    }
+    while (next < inserts.size()) merged.push_back(inserts[next++].second);
+    // Containers present on both sides are only headings; drop identical ones.
+    merged.erase(std::remove_if(merged.begin(), merged.end(), [](const StructRow& row) { return row.kind == RowKind::Same; }), merged.end());
+    return merged;
+}
+
+struct CompareWindow {
+    HWND window = nullptr;
+    HWND left = nullptr, right = nullptr, stats = nullptr, leftTitle = nullptr, rightTitle = nullptr;
+    CompareSide sides[2];
+    std::vector<CompareRow> rows;
+    std::vector<CompareHunk> hunks;
+    int current = -1;          // current hunk
+    bool ignoreWhitespace = false;
+    bool syncing = false;
+    // Structured view (JSON / CSV / YAML)
+    bool structMode = false;
+    HWND list = nullptr;
+    StructFormat format = StructFormat::None;
+    std::unique_ptr<StructDoc> docs[2];
+    std::vector<StructRow> structRows;
+};
+
+bool BuildStructure(CompareWindow& compare, bool showErrors);
+
+std::unordered_map<HWND, WNDPROC> g_compareViewProcs;
+
+CompareWindow* CompareFromChild(HWND child) {
+    return reinterpret_cast<CompareWindow*>(GetWindowLongPtrW(GetParent(child), GWLP_USERDATA));
+}
+
+// Keeps the two panes on the same row: rows are aligned, so the first
+// visible line is shared.
+void SyncCompareScroll(CompareWindow& compare, HWND source) {
+    if (compare.syncing) return;
+    compare.syncing = true;
+    HWND other = source == compare.left ? compare.right : compare.left;
+    const LRESULT first = SendMessageW(source, EM_GETFIRSTVISIBLELINE, 0, 0);
+    const LRESULT otherFirst = SendMessageW(other, EM_GETFIRSTVISIBLELINE, 0, 0);
+    if (first != otherFirst) SendMessageW(other, EM_LINESCROLL, 0, first - otherFirst);
+    POINT scroll{};
+    SendMessageW(source, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    POINT otherScroll{};
+    SendMessageW(other, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&otherScroll));
+    otherScroll.x = scroll.x;
+    SendMessageW(other, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&otherScroll));
+    compare.syncing = false;
+}
+
+LRESULT CALLBACK CompareViewProc(HWND view, UINT message, WPARAM wParam, LPARAM lParam) {
+    const auto it = g_compareViewProcs.find(view);
+    const WNDPROC old = it != g_compareViewProcs.end() ? it->second : DefWindowProcW;
+    const LRESULT result = CallWindowProcW(old, view, message, wParam, lParam);
+    if (message == WM_VSCROLL || message == WM_HSCROLL || message == WM_MOUSEWHEEL || message == WM_KEYDOWN || message == WM_MOUSEHWHEEL) {
+        if (CompareWindow* compare = CompareFromChild(view)) SyncCompareScroll(*compare, view);
+    }
+    if (message == WM_NCDESTROY) g_compareViewProcs.erase(view);
+    return result;
+}
+
+std::wstring PadNumber(int value, size_t width) {
+    std::wstring text = value > 0 ? std::to_wstring(value) : std::wstring();
+    if (text.size() < width) text.insert(0, width - text.size(), L' ');
+    return text;
+}
+
+void RenderCompare(CompareWindow& compare, bool keepScroll) {
+    const ThemePalette& palette = CurrentPalette();
+    const bool dark = g_app.darkTheme;
+    const COLORREF removedBack = Blend(palette.editorBackground, dark ? RGB(240, 90, 90) : RGB(230, 60, 60), dark ? 22 : 16);
+    const COLORREF addedBack = Blend(palette.editorBackground, dark ? RGB(80, 200, 120) : RGB(40, 170, 80), dark ? 22 : 16);
+    const COLORREF changedBack = Blend(palette.editorBackground, dark ? RGB(220, 180, 80) : RGB(220, 160, 30), dark ? 16 : 14);
+    const COLORREF changedInner = Blend(palette.editorBackground, dark ? RGB(220, 180, 80) : RGB(220, 160, 30), dark ? 42 : 36);
+    const COLORREF fillerBack = Blend(palette.editorBackground, palette.gutterText, 10);
+
+    const size_t widthLeft = std::to_wstring(std::max<size_t>(1, compare.sides[0].lines.size())).size();
+    const size_t widthRight = std::to_wstring(std::max<size_t>(1, compare.sides[1].lines.size())).size();
+    const size_t width = std::max(widthLeft, widthRight);
+    // Changed rows are padded with spaces so their tint runs the full row.
+    size_t longest = 0;
+    for (const CompareSide& side : compare.sides) {
+        for (const std::wstring& line : side.lines) longest = std::max(longest, line.size());
+    }
+    size_t visibleColumns = 0;
+    if (HDC dc = GetDC(compare.left)) {
+        HGDIOBJ previous = SelectObject(dc, g_app.editorFont);
+        TEXTMETRICW metrics{};
+        GetTextMetricsW(dc, &metrics);
+        SelectObject(dc, previous);
+        ReleaseDC(compare.left, dc);
+        RECT client{};
+        GetClientRect(compare.left, &client);
+        if (metrics.tmAveCharWidth > 0) visibleColumns = static_cast<size_t>(client.right / metrics.tmAveCharWidth);
+    }
+    const size_t padTo = std::max(width + 2 + std::min<size_t>(longest, 400) + 4, visibleColumns > 2 ? visibleColumns - 2 : 0);
+    HWND views[2] = {compare.left, compare.right};
+    POINT scroll[2]{};
+    for (int s = 0; s < 2; ++s) SendMessageW(views[s], EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll[s]));
+
+    for (int s = 0; s < 2; ++s) {
+        const CompareSide& side = compare.sides[s];
+        std::wstring text;
+        std::vector<LONG> rowStart;
+        rowStart.reserve(compare.rows.size() + 1);
+        for (const CompareRow& row : compare.rows) {
+            rowStart.push_back(static_cast<LONG>(text.size()));
+            const int index = s == 0 ? row.left : row.right;
+            const size_t before = text.size();
+            if (index >= 0) text += PadNumber(index + 1, width) + L"  " + side.lines[static_cast<size_t>(index)];
+            else text += std::wstring(width, L' ') + L"  ";
+            if (row.kind != RowKind::Same && text.size() - before < padTo) text.append(padTo - (text.size() - before), L' ');
+            text += L'\r';
+        }
+        rowStart.push_back(static_cast<LONG>(text.size()));
+        HWND view = views[s];
+        SendMessageW(view, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(view, EM_SETBKGNDCOLOR, 0, palette.editorBackground);
+        CHARFORMAT2W base{};
+        base.cbSize = sizeof(base);
+        base.dwMask = CFM_COLOR | CFM_BACKCOLOR | CFM_BOLD;
+        base.crTextColor = palette.editorText;
+        base.crBackColor = palette.editorBackground;
+        SendMessageW(view, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&base));
+        SendMessageW(view, EM_SETCHARFORMAT, SCF_DEFAULT, reinterpret_cast<LPARAM>(&base));
+        SendMessageW(view, EM_SETREADONLY, FALSE, 0);  // TOM refuses to format read-only text
+        SetWindowTextW(view, text.c_str());
+
+        TextDocumentRef tom(view);
+        if (tom) {
+            ITextFont* gutter = tom.MakeStyleFont(palette.gutterText, false);
+            ITextFont* backs[5]{};
+            const COLORREF colors[5] = {removedBack, addedBack, changedBack, changedInner, fillerBack};
+            for (int c = 0; c < 5; ++c) {
+                ITextFont* font = tom.MakeStyleFont(palette.editorText, false);
+                if (font) {
+                    font->Reset(tomUndefined);
+                    font->SetBackColor(static_cast<long>(colors[c]));
+                }
+                backs[c] = font;
+            }
+            for (size_t r = 0; r < compare.rows.size(); ++r) {
+                const CompareRow& row = compare.rows[r];
+                const LONG start = rowStart[r];
+                const LONG end = rowStart[r + 1] - 1;  // without the line break
+                const int index = s == 0 ? row.left : row.right;
+                tom.ApplyFont(start, start + static_cast<LONG>(width), gutter);
+                if (row.kind == RowKind::Same) continue;
+                if (index < 0) {
+                    tom.ApplyFont(start, end, backs[4]);
+                    continue;
+                }
+                const bool onlyHere = (s == 0 && row.kind == RowKind::LeftOnly) || (s == 1 && row.kind == RowKind::RightOnly);
+                tom.ApplyFont(start, end, onlyHere ? backs[s == 0 ? 0 : 1] : backs[2]);
+                if (row.kind == RowKind::Changed) {
+                    // Highlight just the part of the line that differs.
+                    const std::wstring& a = compare.sides[0].lines[static_cast<size_t>(row.left)];
+                    const std::wstring& b = compare.sides[1].lines[static_cast<size_t>(row.right)];
+                    size_t pre = 0;
+                    while (pre < a.size() && pre < b.size() && a[pre] == b[pre]) ++pre;
+                    size_t suf = 0;
+                    while (suf < a.size() - pre && suf < b.size() - pre && a[a.size() - 1 - suf] == b[b.size() - 1 - suf]) ++suf;
+                    const std::wstring& mine = s == 0 ? a : b;
+                    const LONG textStart = start + static_cast<LONG>(width) + 2;
+                    if (mine.size() > pre + suf) tom.ApplyFont(textStart + static_cast<LONG>(pre), textStart + static_cast<LONG>(mine.size() - suf), backs[3]);
+                }
+            }
+            if (gutter) gutter->Release();
+            for (ITextFont* font : backs) if (font) font->Release();
+            SendMessageW(view, EM_EMPTYUNDOBUFFER, 0, 0);
+        }
+        if (keepScroll) SendMessageW(view, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll[s]));
+        SendMessageW(view, EM_SETREADONLY, TRUE, 0);
+        SendMessageW(view, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(view, nullptr, TRUE);
+    }
+
+    int changed = 0, leftOnly = 0, rightOnly = 0;
+    for (const CompareRow& row : compare.rows) {
+        changed += row.kind == RowKind::Changed;
+        leftOnly += row.kind == RowKind::LeftOnly;
+        rightOnly += row.kind == RowKind::RightOnly;
+    }
+    std::wstring stats = compare.hunks.empty() ? std::wstring(L"两侧内容相同")
+        : L"共 " + std::to_wstring(compare.hunks.size()) + L" 处差异：修改 " + std::to_wstring(changed) + L" 行，仅左侧 " +
+          std::to_wstring(leftOnly) + L" 行，仅右侧 " + std::to_wstring(rightOnly) + L" 行";
+    if (compare.ignoreWhitespace) stats += L"（已忽略空白）";
+    if (!compare.structMode) SetWindowTextW(compare.stats, stats.c_str());
+    for (int s = 0; s < 2; ++s) {
+        const CompareSide& side = compare.sides[s];
+        std::wstring title = (side.dirty ? L"● " : L"") + (side.path.empty() ? side.title : side.path);
+        if (side.editor && !side.path.empty()) title += L"（来自标签）";
+        SetWindowTextW(s == 0 ? compare.leftTitle : compare.rightTitle, title.c_str());
+    }
+    EnableWindow(GetDlgItem(compare.window, kCmpSaveLeft), compare.sides[0].dirty);
+    EnableWindow(GetDlgItem(compare.window, kCmpSaveRight), compare.sides[1].dirty);
+    if (!compare.structMode) {
+        for (const int id : {kCmpPrev, kCmpNext, kCmpToRight, kCmpToLeft}) EnableWindow(GetDlgItem(compare.window, id), !compare.hunks.empty());
+    }
+}
+
+void RecomputeCompare(CompareWindow& compare, bool keepScroll) {
+    compare.rows = BuildCompareRows(compare.sides[0], compare.sides[1], compare.ignoreWhitespace, compare.hunks);
+    compare.current = std::min(compare.current, static_cast<int>(compare.hunks.size()) - 1);
+    RenderCompare(compare, keepScroll);
+    if (compare.structMode && !BuildStructure(compare, true)) {
+        compare.structMode = false;
+        ShowWindow(compare.list, SW_HIDE);
+        ShowWindow(compare.left, SW_SHOW);
+        ShowWindow(compare.right, SW_SHOW);
+        SetWindowTextW(GetDlgItem(compare.window, kCmpStructure), L"结构比较");
+    }
+}
+
+void GoToHunk(CompareWindow& compare, int index) {
+    if (compare.hunks.empty()) return;
+    index = (index % static_cast<int>(compare.hunks.size()) + static_cast<int>(compare.hunks.size())) % static_cast<int>(compare.hunks.size());
+    compare.current = index;
+    const CompareHunk& hunk = compare.hunks[static_cast<size_t>(index)];
+    for (HWND view : {compare.left, compare.right}) {
+        const LRESULT first = SendMessageW(view, EM_GETFIRSTVISIBLELINE, 0, 0);
+        SendMessageW(view, EM_LINESCROLL, 0, std::max(0, hunk.firstRow - 3) - first);
+        const LRESULT position = SendMessageW(view, EM_LINEINDEX, hunk.firstRow, 0);
+        SendMessageW(view, EM_SETSEL, position, position);
+    }
+    SyncCompareScroll(compare, compare.left);
+    SetWindowTextW(compare.stats, (L"第 " + std::to_wstring(index + 1) + L" / " + std::to_wstring(compare.hunks.size()) + L" 处差异").c_str());
+}
+
+// The hunk at the caret of the focused pane, else the current one.
+int HunkAtCaret(CompareWindow& compare) {
+    HWND view = GetFocus() == compare.right ? compare.right : compare.left;
+    CHARRANGE selection{};
+    SendMessageW(view, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const int row = static_cast<int>(SendMessageW(view, EM_EXLINEFROMCHAR, 0, selection.cpMin));
+    for (size_t h = 0; h < compare.hunks.size(); ++h) {
+        if (row >= compare.hunks[h].firstRow && row <= compare.hunks[h].lastRow) return static_cast<int>(h);
+    }
+    return compare.current;
+}
+
+// Takes one block from one side into the other (block-level merge).
+void CopyHunk(CompareWindow& compare, bool toRight) {
+    const int index = HunkAtCaret(compare);
+    if (index < 0 || index >= static_cast<int>(compare.hunks.size())) {
+        MessageBeep(MB_ICONWARNING);
+        return;
+    }
+    const CompareHunk hunk = compare.hunks[static_cast<size_t>(index)];
+    CompareSide& from = compare.sides[toRight ? 0 : 1];
+    CompareSide& to = compare.sides[toRight ? 1 : 0];
+    const int fromStart = toRight ? hunk.leftStart : hunk.rightStart;
+    const int fromCount = toRight ? hunk.leftCount : hunk.rightCount;
+    const int toStart = toRight ? hunk.rightStart : hunk.leftStart;
+    const int toCount = toRight ? hunk.rightCount : hunk.leftCount;
+    std::vector<std::wstring> block(from.lines.begin() + fromStart, from.lines.begin() + fromStart + fromCount);
+    to.lines.erase(to.lines.begin() + toStart, to.lines.begin() + toStart + toCount);
+    to.lines.insert(to.lines.begin() + toStart, block.begin(), block.end());
+    to.dirty = true;
+    compare.current = index;
+    RecomputeCompare(compare, true);
+    if (!compare.hunks.empty()) GoToHunk(compare, std::min(index, static_cast<int>(compare.hunks.size()) - 1));
+}
+
+bool SaveCompareSide(CompareWindow& compare, int s) {
+    CompareSide& side = compare.sides[s];
+    std::wstring text;
+    if (side.editor) {
+        const int index = IndexOfEditor(side.editor);
+        if (index < 0) {
+            MessageBoxW(compare.window, L"来源标签已关闭，无法写回。", kWindowTitle, MB_ICONWARNING);
+            return false;
+        }
+        text = JoinLines(side.lines, L"\r");
+        SendMessageW(side.editor, EM_SETSEL, 0, -1);
+        SendMessageW(side.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(text.c_str()));
+        side.dirty = false;
+        RenderCompare(compare, true);
+        ShowNotice(L"已写回标签“" + g_app.documents[static_cast<size_t>(index)].title + L"”（未保存到磁盘，可撤销）");
+        return true;
+    }
+    text = JoinLines(side.lines, side.eol);
+    if (side.encoding == kEncodingAnsi && !IsAnsiRepresentable(text)) {
+        MessageBoxW(compare.window, L"内容包含 ANSI 编码无法表示的字符，未保存。", kWindowTitle, MB_ICONWARNING);
+        return false;
+    }
+    std::string bytes;
+    if (!EncodeTextBytes(text, side.encoding, bytes) || !WriteAtomicFile(side.path, bytes)) {
+        MessageBoxW(compare.window, (L"保存失败：" + side.path).c_str(), kWindowTitle, MB_ICONERROR);
+        return false;
+    }
+    side.dirty = false;
+    for (size_t d = 0; d < g_app.documents.size(); ++d) {
+        const TabDocument& document = g_app.documents[d];
+        if (!document.untitled && !document.modified && SamePath(document.path, side.path)) ReloadDocumentFromDisk(static_cast<int>(d));
+    }
+    RenderCompare(compare, true);
+    ShowNotice(L"已保存 " + fs::path(side.path).filename().wstring());
+    return true;
+}
+
+void LayoutCompareWindow(CompareWindow& compare) {
+    RECT client{};
+    GetClientRect(compare.window, &client);
+    const int width = client.right, height = client.bottom;
+    int x = Scale(10);
+    const int buttonY = Scale(8), buttonH = Scale(28);
+    const std::pair<int, int> buttons[] = {{kCmpPrev, 72}, {kCmpNext, 72}, {kCmpToRight, 108}, {kCmpToLeft, 108}, {kCmpSwap, 56},
+        {kCmpStructure, 84}, {kCmpIgnoreSpace, 92}, {kCmpSaveLeft, 80}, {kCmpSaveRight, 80}, {kCmpRefresh, 56}};
+    for (const auto& [id, w] : buttons) {
+        MoveWindow(GetDlgItem(compare.window, id), x, buttonY, Scale(w), buttonH, TRUE);
+        x += Scale(w) + Scale(6);
+    }
+    MoveWindow(compare.stats, Scale(10), buttonY + buttonH + Scale(6), std::max(0, width - Scale(20)), Scale(20), TRUE);
+    const int half = (width - Scale(30)) / 2;
+    const int titleY = buttonY + buttonH + Scale(30);
+    MoveWindow(compare.leftTitle, Scale(10), titleY, half, Scale(20), TRUE);
+    MoveWindow(compare.rightTitle, Scale(20) + half, titleY, half, Scale(20), TRUE);
+    const int viewY = titleY + Scale(24);
+    MoveWindow(compare.left, Scale(10), viewY, half, std::max(0, height - viewY - Scale(10)), TRUE);
+    MoveWindow(compare.right, Scale(20) + half, viewY, half, std::max(0, height - viewY - Scale(10)), TRUE);
+    if (compare.list) {
+        MoveWindow(compare.list, Scale(10), viewY, std::max(0, width - Scale(20)), std::max(0, height - viewY - Scale(10)), TRUE);
+        const int column = std::max(Scale(120), (width - Scale(20) - Scale(70) - Scale(30)) / 3);
+        ListView_SetColumnWidth(compare.list, 0, column);
+        ListView_SetColumnWidth(compare.list, 1, Scale(70));
+        ListView_SetColumnWidth(compare.list, 2, column);
+        ListView_SetColumnWidth(compare.list, 3, column);
+    }
+}
+
+bool ConfirmDiscardCompare(CompareWindow& compare) {
+    if (!compare.sides[0].dirty && !compare.sides[1].dirty) return true;
+    const int choice = MessageBoxW(compare.window, L"合并后的修改还没有保存。是否保存？", kWindowTitle, MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (choice == IDCANCEL) return false;
+    if (choice == IDYES) {
+        for (int s = 0; s < 2; ++s) {
+            if (compare.sides[s].dirty && !SaveCompareSide(compare, s)) return false;
+        }
+    }
+    return true;
+}
+
+// ---- Structured view inside the compare window ------------------------------------
+
+const wchar_t* StructFormatName(StructFormat format) {
+    switch (format) {
+    case StructFormat::Json: return L"JSON";
+    case StructFormat::Csv: return L"CSV";
+    case StructFormat::Yaml: return L"YAML";
+    default: return L"";
+    }
+}
+
+void FillStructList(CompareWindow& compare) {
+    HWND list = compare.list;
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(list);
+    static const wchar_t* kinds[] = {L"相同", L"修改", L"仅左侧", L"仅右侧"};
+    for (size_t r = 0; r < compare.structRows.size(); ++r) {
+        StructRow& row = compare.structRows[r];
+        std::wstring cells[4] = {row.path, kinds[static_cast<int>(row.kind)], row.left, row.right};
+        for (std::wstring& cell : cells) if (cell.size() > 300) cell = cell.substr(0, 300) + L"…";
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = static_cast<int>(r);
+        item.pszText = cells[0].data();
+        ListView_InsertItem(list, &item);
+        for (int c = 1; c < 4; ++c) ListView_SetItemText(list, static_cast<int>(r), c, cells[c].data());
+    }
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+}
+
+// Parses both sides and lists the differing items. Returns false (and
+// explains why) when the text is not valid for the format.
+bool BuildStructure(CompareWindow& compare, bool showErrors) {
+    StructFormat format = DetectStructFormat(compare.sides[0]);
+    if (format == StructFormat::None) format = DetectStructFormat(compare.sides[1]);
+    if (format == StructFormat::None) {
+        if (showErrors) MessageBoxW(compare.window, L"结构比较支持 JSON、CSV/TSV 和 YAML 文件（按扩展名或内容识别）。", kWindowTitle, MB_ICONINFORMATION);
+        return false;
+    }
+    std::unique_ptr<StructDoc> docs[2];
+    for (int s = 0; s < 2; ++s) {
+        docs[s] = MakeStructDoc(format, compare.sides[s]);
+        std::wstring error;
+        if (!docs[s]->Parse(compare.sides[s].lines, error)) {
+            if (showErrors) MessageBoxW(compare.window, ((s == 0 ? L"左侧" : L"右侧") + std::wstring(L"无法按 ") + StructFormatName(format) + L" 解析：\n" + error).c_str(), kWindowTitle, MB_ICONWARNING);
+            return false;
+        }
+    }
+    compare.format = format;
+    compare.docs[0] = std::move(docs[0]);
+    compare.docs[1] = std::move(docs[1]);
+    compare.structRows = CompareStructItems(compare.docs[0]->Items(), compare.docs[1]->Items());
+    FillStructList(compare);
+    int counts[4]{};
+    for (const StructRow& row : compare.structRows) ++counts[static_cast<int>(row.kind)];
+    std::wstring stats = std::wstring(StructFormatName(format)) + L" 结构比较：";
+    stats += compare.structRows.empty() ? std::wstring(L"所有项都相同")
+        : std::to_wstring(compare.structRows.size()) + L" 项不同（修改 " + std::to_wstring(counts[1]) + L"，仅左侧 " + std::to_wstring(counts[2]) +
+          L"，仅右侧 " + std::to_wstring(counts[3]) + L"）";
+    if (format == StructFormat::Json) stats += L"  · 采用后该侧 JSON 按原缩进重新排版";
+    SetWindowTextW(compare.stats, stats.c_str());
+    for (const int id : {kCmpPrev, kCmpNext, kCmpToRight, kCmpToLeft}) EnableWindow(GetDlgItem(compare.window, id), !compare.structRows.empty());
+    return true;
+}
+
+void SetStructMode(CompareWindow& compare, bool on) {
+    if (on && !BuildStructure(compare, true)) on = false;
+    compare.structMode = on;
+    SetWindowTextW(GetDlgItem(compare.window, kCmpStructure), on ? L"文本比较" : L"结构比较");
+    ShowWindow(compare.list, on ? SW_SHOW : SW_HIDE);
+    ShowWindow(compare.left, on ? SW_HIDE : SW_SHOW);
+    ShowWindow(compare.right, on ? SW_HIDE : SW_SHOW);
+    EnableWindow(GetDlgItem(compare.window, kCmpIgnoreSpace), !on);
+    if (on) {
+        if (!compare.structRows.empty()) {
+            ListView_SetItemState(compare.list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        }
+        SetFocus(compare.list);
+    } else {
+        RecomputeCompare(compare, true);
+    }
+}
+
+void StepStructRow(CompareWindow& compare, int step) {
+    const int count = ListView_GetItemCount(compare.list);
+    if (count == 0) return;
+    int row = ListView_GetNextItem(compare.list, -1, LVNI_FOCUSED);
+    row = row < 0 ? 0 : ((row + step) % count + count) % count;
+    ListView_SetItemState(compare.list, -1, 0, LVIS_SELECTED);
+    ListView_SetItemState(compare.list, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(compare.list, row, FALSE);
+    SetFocus(compare.list);
+}
+
+// Takes the selected items from one side into the other.
+void TakeStructItems(CompareWindow& compare, bool toRight) {
+    std::vector<int> picked;
+    for (int row = -1; (row = ListView_GetNextItem(compare.list, row, LVNI_SELECTED)) >= 0;) picked.push_back(row);
+    if (picked.empty()) {
+        MessageBoxW(compare.window, L"请先在列表中选中要合并的项（可按住 Ctrl 或 Shift 多选）。", kWindowTitle, MB_ICONINFORMATION);
+        return;
+    }
+    const int target = toRight ? 1 : 0;
+    StructDoc& into = *compare.docs[target];
+    const StructDoc& from = *compare.docs[toRight ? 0 : 1];
+    std::wstring failures;
+    int done = 0;
+    // From the bottom up, so removing array elements keeps earlier paths valid.
+    for (auto it = picked.rbegin(); it != picked.rend(); ++it) {
+        const std::wstring& path = compare.structRows[static_cast<size_t>(*it)].path;
+        std::wstring error;
+        if (into.Take(path, from, error)) ++done;
+        else failures += L"\n• " + error;
+    }
+    if (done > 0) {
+        compare.sides[target].lines = into.Lines();
+        compare.sides[target].dirty = true;
+        const int first = picked.front();
+        RecomputeCompare(compare, true);  // rebuilds the item list as well
+        const int count = ListView_GetItemCount(compare.list);
+        if (count > 0) {
+            const int row = std::min(first, count - 1);
+            ListView_SetItemState(compare.list, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(compare.list, row, FALSE);
+        }
+        SetFocus(compare.list);
+    }
+    if (!failures.empty()) MessageBoxW(compare.window, (L"部分项无法合并：" + failures).c_str(), kWindowTitle, MB_ICONWARNING);
+}
+
+LRESULT CALLBACK CompareWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* compare = reinterpret_cast<CompareWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE: {
+        compare = static_cast<CompareWindow*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(compare));
+        compare->window = window;
+        const std::pair<int, const wchar_t*> buttons[] = {{kCmpPrev, L"上一处"}, {kCmpNext, L"下一处"}, {kCmpToRight, L"复制到右侧 →"},
+            {kCmpToLeft, L"← 复制到左侧"}, {kCmpSwap, L"交换"}, {kCmpStructure, L"结构比较"}, {kCmpSaveLeft, L"保存左侧"}, {kCmpSaveRight, L"保存右侧"}, {kCmpRefresh, L"刷新"}};
+        std::vector<HWND> pushButtons;
+        for (const auto& [id, text] : buttons) {
+            HWND button = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+            SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            pushButtons.push_back(button);
+        }
+        for (HWND button : pushButtons) if (g_app.darkTheme) SetWindowTheme(button, L"DarkMode_Explorer", nullptr);
+        HWND ignore = CreateWindowExW(0, L"BUTTON", L"忽略空白", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCmpIgnoreSpace)), g_app.instance, nullptr);
+        SendMessageW(ignore, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        ThemeCheckbox(ignore);
+        compare->stats = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
+        compare->leftTitle = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_NOPREFIX | SS_PATHELLIPSIS, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
+        compare->rightTitle = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_NOPREFIX | SS_PATHELLIPSIS, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
+        for (HWND label : {compare->stats, compare->leftTitle, compare->rightTitle}) SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        for (int s = 0; s < 2; ++s) {
+            HWND view = CreateWindowExW(0, L"RICHEDIT50W", nullptr,
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
+                0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(s == 0 ? kCmpLeftView : kCmpRightView)), g_app.instance, nullptr);
+            SendMessageW(view, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+            SendMessageW(view, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+            SendMessageW(view, EM_SETTARGETDEVICE, 0, 1);  // no wrapping: rows must stay aligned
+            SendMessageW(view, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(4), 0));
+            const LRESULT options = SendMessageW(view, EM_GETLANGOPTIONS, 0, 0);
+            SendMessageW(view, EM_SETLANGOPTIONS, 0, options & ~static_cast<LRESULT>(IMF_AUTOFONT | IMF_DUALFONT | IMF_AUTOFONTSIZEADJUST));
+            SetWindowTheme(view, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            g_compareViewProcs[view] = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(view, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CompareViewProc)));
+            (s == 0 ? compare->left : compare->right) = view;
+        }
+        compare->list = CreateWindowExW(0, WC_LISTVIEWW, nullptr, WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS,
+            0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCmpList)), g_app.instance, nullptr);
+        ListView_SetExtendedListViewStyle(compare->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
+        SendMessageW(compare->list, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        SetWindowTheme(compare->list, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        if (HWND header = ListView_GetHeader(compare->list)) SetWindowTheme(header, g_app.darkTheme ? L"DarkMode_ItemsView" : nullptr, nullptr);
+        ListView_SetBkColor(compare->list, CurrentPalette().editorBackground);
+        ListView_SetTextBkColor(compare->list, CurrentPalette().editorBackground);
+        ListView_SetTextColor(compare->list, CurrentPalette().editorText);
+        const wchar_t* columns[] = {L"路径", L"状态", L"左侧值", L"右侧值"};
+        for (int c = 0; c < 4; ++c) {
+            LVCOLUMNW column{};
+            column.mask = LVCF_TEXT | LVCF_WIDTH;
+            column.pszText = const_cast<wchar_t*>(columns[c]);
+            column.cx = Scale(c == 1 ? 70 : 240);
+            ListView_InsertColumn(compare->list, c, &column);
+        }
+        return 0;
+    }
+    case WM_NOTIFY: {
+        auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (compare && header->hwndFrom == compare->list && header->code == NM_CUSTOMDRAW) {
+            auto* draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
+            if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                const size_t row = static_cast<size_t>(draw->nmcd.dwItemSpec);
+                if (row < compare->structRows.size()) {
+                    const RowKind kind = compare->structRows[row].kind;
+                    const bool dark = g_app.darkTheme;
+                    draw->clrText = kind == RowKind::Changed ? (dark ? RGB(229, 192, 123) : RGB(176, 110, 0))
+                        : kind == RowKind::LeftOnly ? (dark ? RGB(244, 135, 113) : RGB(190, 40, 40))
+                        : kind == RowKind::RightOnly ? (dark ? RGB(129, 199, 132) : RGB(22, 130, 52))
+                        : CurrentPalette().editorText;
+                }
+                return CDRF_DODEFAULT;
+            }
+        }
+        break;
+    }
+    case WM_SIZE:
+        if (compare && compare->left) {
+            LayoutCompareWindow(*compare);
+            if (!compare->rows.empty() && wParam != SIZE_MINIMIZED) SetTimer(window, 1, 150, nullptr);
+        }
+        return 0;
+    case WM_TIMER:
+        KillTimer(window, 1);
+        if (compare) RenderCompare(*compare, true);
+        return 0;
+    case WM_GETMINMAXINFO:
+        reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = POINT{Scale(760), Scale(360)};
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.toolbarBrush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, reinterpret_cast<HWND>(lParam) == (compare ? compare->stats : nullptr) ? CurrentPalette().statusText : CurrentPalette().toolbarText);
+        SetBkColor(dc, CurrentPalette().toolbarBackground);
+        return reinterpret_cast<LRESULT>(g_app.toolbarBrush);
+    }
+    case WM_COMMAND:
+        if (!compare) break;
+        switch (LOWORD(wParam)) {
+        case kCmpPrev:
+            if (compare->structMode) StepStructRow(*compare, -1);
+            else GoToHunk(*compare, compare->current - 1);
+            return 0;
+        case kCmpNext:
+            if (compare->structMode) StepStructRow(*compare, 1);
+            else GoToHunk(*compare, compare->current + 1);
+            return 0;
+        case kCmpToRight:
+            if (compare->structMode) TakeStructItems(*compare, true);
+            else CopyHunk(*compare, true);
+            return 0;
+        case kCmpToLeft:
+            if (compare->structMode) TakeStructItems(*compare, false);
+            else CopyHunk(*compare, false);
+            return 0;
+        case kCmpStructure:
+            SetStructMode(*compare, !compare->structMode);
+            return 0;
+        case kCmpSwap:
+            std::swap(compare->sides[0], compare->sides[1]);
+            RecomputeCompare(*compare, true);
+            return 0;
+        case kCmpIgnoreSpace:
+            compare->ignoreWhitespace = SendMessageW(GetDlgItem(window, kCmpIgnoreSpace), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            RecomputeCompare(*compare, true);
+            return 0;
+        case kCmpSaveLeft: SaveCompareSide(*compare, 0); return 0;
+        case kCmpSaveRight: SaveCompareSide(*compare, 1); return 0;
+        case kCmpRefresh:
+            if (!ConfirmDiscardCompare(*compare)) return 0;
+            for (CompareSide& side : compare->sides) {
+                std::wstring error;
+                const int index = side.editor ? IndexOfEditor(side.editor) : -1;
+                if (index >= 0) LoadCompareSideFromTab(side, g_app.documents[static_cast<size_t>(index)]);
+                else if (!side.path.empty()) LoadCompareSideFromFile(side, side.path, error);
+            }
+            RecomputeCompare(*compare, true);
+            return 0;
+        case IDCANCEL:
+            SendMessageW(window, WM_CLOSE, 0, 0);
+            return 0;
+        default:
+            break;
+        }
+        break;
+    case WM_KEYDOWN:
+        break;
+    case WM_CLOSE:
+        if (compare && !ConfirmDiscardCompare(*compare)) return 0;
+        DestroyWindow(window);
+        return 0;
+    case WM_NCDESTROY:
+        delete compare;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+std::vector<HWND> g_toolWindows;  // compare / log windows: get IsDialogMessage and F7/F8 keys
+
+void OpenCompareWindow(CompareSide left, CompareSide right, bool structure = false) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{};
+        klass.hInstance = g_app.instance;
+        klass.lpfnWndProc = CompareWindowProc;
+        klass.lpszClassName = L"MCnotepadCompare";
+        klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        klass.hIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_MCNOTEPAD));
+        registered = RegisterClassW(&klass) != 0;
+    }
+    auto* compare = new CompareWindow();
+    compare->sides[0] = std::move(left);
+    compare->sides[1] = std::move(right);
+    RECT owner{};
+    GetWindowRect(g_app.window, &owner);
+    const std::wstring title = L"比较 - " + compare->sides[0].title + L" ↔ " + compare->sides[1].title;
+    HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, L"MCnotepadCompare", title.c_str(), WS_OVERLAPPEDWINDOW,
+        owner.left + Scale(30), owner.top + Scale(30), std::max(Scale(980), static_cast<int>(owner.right - owner.left) - Scale(60)),
+        std::max(Scale(560), static_cast<int>(owner.bottom - owner.top) - Scale(60)), nullptr, nullptr, g_app.instance, compare);
+    if (!window) {
+        delete compare;
+        return;
+    }
+    ApplyWindowFrameTheme(window);
+    g_toolWindows.push_back(window);
+    LayoutCompareWindow(*compare);
+    RecomputeCompare(*compare, false);
+    ShowWindow(window, SW_SHOW);
+    if (!compare->hunks.empty()) GoToHunk(*compare, 0);
+    if (structure) SetStructMode(*compare, true);
+}
+
+std::wstring PickFile(const wchar_t* title) {
+    wchar_t fileName[MAX_PATH]{};
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = g_app.window;
+    dialog.lpstrFilter = L"所有文件\0*.*\0";
+    dialog.lpstrFile = fileName;
+    dialog.nMaxFile = MAX_PATH;
+    dialog.lpstrTitle = title;
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST;
+    return GetOpenFileNameW(&dialog) ? std::wstring(fileName) : std::wstring();
+}
+
+std::wstring PickFolder(const wchar_t* title) {
+    std::wstring result;
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return result;
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    dialog->SetTitle(title);
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(dialog->Show(g_app.window)) && SUCCEEDED(dialog->GetResult(&item))) {
+        PWSTR path = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+            result = path;
+            CoTaskMemFree(path);
+        }
+        item->Release();
+    }
+    dialog->Release();
+    return result;
+}
+
+void CompareFiles(const std::wstring& leftPath, const std::wstring& rightPath, bool structure) {
+    CompareSide left, right;
+    std::wstring error;
+    if (!LoadCompareSideFromFile(left, leftPath, error) || !LoadCompareSideFromFile(right, rightPath, error)) {
+        MessageBoxW(g_app.window, error.c_str(), kWindowTitle, MB_ICONWARNING);
+        return;
+    }
+    OpenCompareWindow(std::move(left), std::move(right), structure);
+}
+
+void CompareTwoFilesCommand(bool structure) {
+    const std::wstring left = PickFile(L"选择左侧文件（原文件）");
+    if (left.empty()) return;
+    const std::wstring right = PickFile(L"选择右侧文件（新文件）");
+    if (right.empty()) return;
+    CompareFiles(left, right, structure);
+}
+
+// Current tab (with unsaved edits) on the left, a file on the right.
+void CompareActiveWithFileCommand() {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    const std::wstring right = PickFile(L"选择要与当前标签比较的文件");
+    if (right.empty()) return;
+    CompareSide left, other;
+    LoadCompareSideFromTab(left, *document);
+    std::wstring error;
+    if (!LoadCompareSideFromFile(other, right, error)) {
+        MessageBoxW(g_app.window, error.c_str(), kWindowTitle, MB_ICONWARNING);
+        return;
+    }
+    OpenCompareWindow(std::move(left), std::move(other));
+}
+
+void CompareTabs(int leftIndex, int rightIndex) {
+    if (leftIndex < 0 || rightIndex < 0 || leftIndex >= static_cast<int>(g_app.documents.size()) || rightIndex >= static_cast<int>(g_app.documents.size())) return;
+    CompareSide left, right;
+    LoadCompareSideFromTab(left, g_app.documents[static_cast<size_t>(leftIndex)]);
+    LoadCompareSideFromTab(right, g_app.documents[static_cast<size_t>(rightIndex)]);
+    OpenCompareWindow(std::move(left), std::move(right));
+}
+
+// ---- Folder compare --------------------------------------------------------------
+
+enum class EntryState { Same, Different, LeftOnly, RightOnly };
+
+struct FolderEntry {
+    std::wstring relative;
+    EntryState state = EntryState::Same;
+    uint64_t leftSize = 0, rightSize = 0;
+    uint64_t leftTime = 0, rightTime = 0;
+};
+
+struct FolderCompare {
+    HWND window = nullptr, list = nullptr, summary = nullptr, onlyDiff = nullptr;
+    std::wstring roots[2];
+    std::vector<FolderEntry> entries;
+    std::vector<int> shown;  // indices into entries for the list rows
+    std::atomic<bool> running{false};
+};
+
+enum FolderControl : int { kFolderOnlyDiff = 4101, kFolderOpen, kFolderToRight, kFolderToLeft, kFolderRefresh, kFolderList };
+constexpr UINT kMessageFolderDone = WM_APP + 30;
+
+void ListFolderFiles(const std::wstring& root, std::unordered_map<std::wstring, std::pair<uint64_t, uint64_t>>& files) {
+    std::vector<std::wstring> stack{root};
+    while (!stack.empty()) {
+        const std::wstring directory = stack.back();
+        stack.pop_back();
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileExW((directory + L"\\*").c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) continue;
+        do {
+            const std::wstring name = data.cFileName;
+            if (name == L"." || name == L"..") continue;
+            const std::wstring full = directory + L"\\" + name;
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (name == L".git" || name == L"node_modules" || (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+                stack.push_back(full);
+            } else {
+                const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+                const uint64_t time = (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
+                files[full.substr(root.size() + 1)] = {size, time};
+            }
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+    }
+}
+
+bool SameFileContent(const std::wstring& a, const std::wstring& b) {
+    std::ifstream left(a, std::ios::binary), right(b, std::ios::binary);
+    if (!left || !right) return false;
+    std::vector<char> bufferA(1 << 16), bufferB(1 << 16);
+    while (left && right) {
+        left.read(bufferA.data(), static_cast<std::streamsize>(bufferA.size()));
+        right.read(bufferB.data(), static_cast<std::streamsize>(bufferB.size()));
+        if (left.gcount() != right.gcount() || memcmp(bufferA.data(), bufferB.data(), static_cast<size_t>(left.gcount())) != 0) return false;
+    }
+    return left.eof() && right.eof();
+}
+
+std::wstring FormatSize(uint64_t size) {
+    wchar_t buffer[32]{};
+    if (size < 1024) swprintf_s(buffer, L"%llu B", size);
+    else if (size < 1024 * 1024) swprintf_s(buffer, L"%.1f KB", size / 1024.0);
+    else swprintf_s(buffer, L"%.1f MB", size / 1048576.0);
+    return buffer;
+}
+
+std::wstring FormatFileTime(uint64_t value) {
+    if (value == 0) return {};
+    FILETIME utc{static_cast<DWORD>(value), static_cast<DWORD>(value >> 32)}, local{};
+    SYSTEMTIME time{};
+    FileTimeToLocalFileTime(&utc, &local);
+    FileTimeToSystemTime(&local, &time);
+    wchar_t buffer[32]{};
+    swprintf_s(buffer, L"%04u-%02u-%02u %02u:%02u", time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute);
+    return buffer;
+}
+
+void FillFolderList(FolderCompare& folder) {
+    const bool onlyDiff = SendMessageW(folder.onlyDiff, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    SendMessageW(folder.list, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(folder.list);
+    folder.shown.clear();
+    int counts[4]{};
+    for (size_t i = 0; i < folder.entries.size(); ++i) {
+        const FolderEntry& entry = folder.entries[i];
+        ++counts[static_cast<int>(entry.state)];
+        if (onlyDiff && entry.state == EntryState::Same) continue;
+        folder.shown.push_back(static_cast<int>(i));
+        const int row = static_cast<int>(folder.shown.size()) - 1;
+        static const wchar_t* states[] = {L"相同", L"不同", L"仅左侧", L"仅右侧"};
+        std::wstring cells[4] = {entry.relative, states[static_cast<int>(entry.state)],
+            entry.state == EntryState::RightOnly ? L"" : FormatSize(entry.leftSize) + L"  " + FormatFileTime(entry.leftTime),
+            entry.state == EntryState::LeftOnly ? L"" : FormatSize(entry.rightSize) + L"  " + FormatFileTime(entry.rightTime)};
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = row;
+        item.pszText = cells[0].data();
+        ListView_InsertItem(folder.list, &item);
+        for (int c = 1; c < 4; ++c) ListView_SetItemText(folder.list, row, c, cells[c].data());
+    }
+    SendMessageW(folder.list, WM_SETREDRAW, TRUE, 0);
+    const std::wstring summary = L"相同 " + std::to_wstring(counts[0]) + L" | 不同 " + std::to_wstring(counts[1]) +
+        L" | 仅左侧 " + std::to_wstring(counts[2]) + L" | 仅右侧 " + std::to_wstring(counts[3]) + L"   （已跳过 .git、node_modules）";
+    SetWindowTextW(folder.summary, summary.c_str());
+}
+
+void StartFolderCompare(FolderCompare& folder) {
+    if (folder.running) return;
+    folder.running = true;
+    SetWindowTextW(folder.summary, L"正在比较…");
+    ListView_DeleteAllItems(folder.list);
+    const std::wstring left = folder.roots[0], right = folder.roots[1];
+    HWND window = folder.window;
+    HANDLE thread = StartSearchThread([left, right, window] {
+        std::unordered_map<std::wstring, std::pair<uint64_t, uint64_t>> a, b;
+        ListFolderFiles(left, a);
+        ListFolderFiles(right, b);
+        auto* entries = new std::vector<FolderEntry>();
+        for (const auto& [relative, info] : a) {
+            FolderEntry entry{relative, EntryState::LeftOnly, info.first, 0, info.second, 0};
+            const auto other = b.find(relative);
+            if (other != b.end()) {
+                entry.rightSize = other->second.first;
+                entry.rightTime = other->second.second;
+                entry.state = entry.leftSize == entry.rightSize && SameFileContent(left + L"\\" + relative, right + L"\\" + relative)
+                    ? EntryState::Same : EntryState::Different;
+            }
+            entries->push_back(entry);
+        }
+        for (const auto& [relative, info] : b) {
+            if (!a.count(relative)) entries->push_back({relative, EntryState::RightOnly, 0, info.first, 0, info.second});
+        }
+        std::sort(entries->begin(), entries->end(), [](const FolderEntry& x, const FolderEntry& y) { return _wcsicmp(x.relative.c_str(), y.relative.c_str()) < 0; });
+        if (!PostMessageW(window, kMessageFolderDone, 0, reinterpret_cast<LPARAM>(entries))) delete entries;
+    });
+    if (thread) CloseHandle(thread);
+    else folder.running = false;
+}
+
+std::vector<int> CheckedOrSelectedEntries(FolderCompare& folder) {
+    std::vector<int> result;
+    for (int row = 0; row < ListView_GetItemCount(folder.list); ++row) {
+        if (ListView_GetCheckState(folder.list, row)) result.push_back(folder.shown[static_cast<size_t>(row)]);
+    }
+    if (result.empty()) {
+        for (int row = -1; (row = ListView_GetNextItem(folder.list, row, LVNI_SELECTED)) >= 0;) result.push_back(folder.shown[static_cast<size_t>(row)]);
+    }
+    return result;
+}
+
+void CopyFolderEntries(FolderCompare& folder, bool toRight) {
+    std::vector<int> picked;
+    for (const int index : CheckedOrSelectedEntries(folder)) {
+        const EntryState state = folder.entries[static_cast<size_t>(index)].state;
+        if (state == EntryState::Same || state == (toRight ? EntryState::RightOnly : EntryState::LeftOnly)) continue;
+        picked.push_back(index);
+    }
+    if (picked.empty()) {
+        MessageBoxW(folder.window, L"请先勾选或选中需要复制的文件（“不同”或只存在于来源一侧的文件）。", kWindowTitle, MB_ICONINFORMATION);
+        return;
+    }
+    const std::wstring prompt = L"将把 " + std::to_wstring(picked.size()) + L" 个文件从" + (toRight ? L"左侧复制到右侧" : L"右侧复制到左侧") +
+        L"，目标中的同名文件会被覆盖。确定继续吗？";
+    if (MessageBoxW(folder.window, prompt.c_str(), kWindowTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+    int copied = 0;
+    std::wstring failures;
+    for (const int index : picked) {
+        const std::wstring& relative = folder.entries[static_cast<size_t>(index)].relative;
+        const fs::path from = fs::path(folder.roots[toRight ? 0 : 1]) / relative;
+        const fs::path to = fs::path(folder.roots[toRight ? 1 : 0]) / relative;
+        std::error_code error;
+        fs::create_directories(to.parent_path(), error);
+        if (CopyFileW(from.c_str(), to.c_str(), FALSE)) ++copied;
+        else failures += L"\n• " + relative;
+    }
+    std::wstring message = L"已复制 " + std::to_wstring(copied) + L" 个文件。";
+    if (!failures.empty()) message += L"\n\n复制失败：" + failures;
+    MessageBoxW(folder.window, message.c_str(), kWindowTitle, failures.empty() ? MB_ICONINFORMATION : MB_ICONWARNING);
+    StartFolderCompare(folder);
+}
+
+void OpenFolderEntry(FolderCompare& folder) {
+    const int row = ListView_GetNextItem(folder.list, -1, LVNI_SELECTED);
+    if (row < 0) return;
+    const FolderEntry& entry = folder.entries[static_cast<size_t>(folder.shown[static_cast<size_t>(row)])];
+    const fs::path left = fs::path(folder.roots[0]) / entry.relative;
+    const fs::path right = fs::path(folder.roots[1]) / entry.relative;
+    if (entry.state == EntryState::LeftOnly) OpenFileInNewTab(left);
+    else if (entry.state == EntryState::RightOnly) OpenFileInNewTab(right);
+    else CompareFiles(left.wstring(), right.wstring());
+}
+
+LRESULT CALLBACK FolderCompareProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* folder = reinterpret_cast<FolderCompare*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE: {
+        folder = static_cast<FolderCompare*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(folder));
+        folder->window = window;
+        const std::pair<int, const wchar_t*> buttons[] = {{kFolderOpen, L"对比所选文件"}, {kFolderToRight, L"复制到右侧 →"},
+            {kFolderToLeft, L"← 复制到左侧"}, {kFolderRefresh, L"刷新"}};
+        for (const auto& [id, text] : buttons) {
+            HWND button = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+            SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            if (g_app.darkTheme) SetWindowTheme(button, L"DarkMode_Explorer", nullptr);
+        }
+        folder->onlyDiff = CreateWindowExW(0, L"BUTTON", L"只显示不同的文件", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFolderOnlyDiff)), g_app.instance, nullptr);
+        SendMessageW(folder->onlyDiff, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        SendMessageW(folder->onlyDiff, BM_SETCHECK, BST_CHECKED, 0);
+        ThemeCheckbox(folder->onlyDiff);
+        folder->summary = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
+        SendMessageW(folder->summary, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        folder->list = CreateWindowExW(0, WC_LISTVIEWW, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS,
+            0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFolderList)), g_app.instance, nullptr);
+        ListView_SetExtendedListViewStyle(folder->list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        SendMessageW(folder->list, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        const ThemePalette& palette = CurrentPalette();
+        SetWindowTheme(folder->list, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        if (HWND header = ListView_GetHeader(folder->list)) SetWindowTheme(header, g_app.darkTheme ? L"DarkMode_ItemsView" : nullptr, nullptr);
+        ListView_SetBkColor(folder->list, palette.editorBackground);
+        ListView_SetTextBkColor(folder->list, palette.editorBackground);
+        ListView_SetTextColor(folder->list, palette.editorText);
+        const std::pair<const wchar_t*, int> columns[] = {{L"文件", 420}, {L"状态", 80}, {L"左侧", 200}, {L"右侧", 200}};
+        for (int c = 0; c < 4; ++c) {
+            LVCOLUMNW column{};
+            column.mask = LVCF_TEXT | LVCF_WIDTH;
+            column.pszText = const_cast<wchar_t*>(columns[c].first);
+            column.cx = Scale(columns[c].second);
+            ListView_InsertColumn(folder->list, c, &column);
+        }
+        return 0;
+    }
+    case WM_SIZE: {
+        if (!folder || !folder->list) break;
+        const int width = LOWORD(lParam), height = HIWORD(lParam);
+        int x = Scale(10);
+        for (const auto& [id, w] : std::initializer_list<std::pair<int, int>>{{kFolderOpen, 110}, {kFolderToRight, 110}, {kFolderToLeft, 110}, {kFolderRefresh, 70}}) {
+            MoveWindow(GetDlgItem(window, id), x, Scale(8), Scale(w), Scale(28), TRUE);
+            x += Scale(w) + Scale(6);
+        }
+        MoveWindow(folder->onlyDiff, x + Scale(6), Scale(10), Scale(150), Scale(24), TRUE);
+        MoveWindow(folder->summary, Scale(10), Scale(44), width - Scale(20), Scale(20), TRUE);
+        MoveWindow(folder->list, Scale(10), Scale(68), width - Scale(20), std::max(0, height - Scale(78)), TRUE);
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.toolbarBrush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, CurrentPalette().toolbarText);
+        SetBkColor(dc, CurrentPalette().toolbarBackground);
+        return reinterpret_cast<LRESULT>(g_app.toolbarBrush);
+    }
+    case kMessageFolderDone: {
+        std::unique_ptr<std::vector<FolderEntry>> entries(reinterpret_cast<std::vector<FolderEntry>*>(lParam));
+        if (!folder) return 0;
+        folder->running = false;
+        folder->entries = std::move(*entries);
+        FillFolderList(*folder);
+        return 0;
+    }
+    case WM_NOTIFY: {
+        auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (folder && header->hwndFrom == folder->list) {
+            if (header->code == NM_DBLCLK) { OpenFolderEntry(*folder); return 0; }
+            if (header->code == NM_CUSTOMDRAW) {
+                auto* draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
+                if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                    const size_t row = static_cast<size_t>(draw->nmcd.dwItemSpec);
+                    if (row < folder->shown.size()) {
+                        const EntryState state = folder->entries[static_cast<size_t>(folder->shown[row])].state;
+                        const bool dark = g_app.darkTheme;
+                        draw->clrText = state == EntryState::Different ? (dark ? RGB(229, 192, 123) : RGB(176, 110, 0))
+                            : state == EntryState::LeftOnly ? (dark ? RGB(244, 135, 113) : RGB(190, 40, 40))
+                            : state == EntryState::RightOnly ? (dark ? RGB(129, 199, 132) : RGB(22, 130, 52))
+                            : CurrentPalette().gutterText;
+                    }
+                    return CDRF_DODEFAULT;
+                }
+            }
+        }
+        break;
+    }
+    case WM_COMMAND:
+        if (!folder) break;
+        switch (LOWORD(wParam)) {
+        case kFolderOnlyDiff: FillFolderList(*folder); return 0;
+        case kFolderOpen: case IDOK: OpenFolderEntry(*folder); return 0;
+        case kFolderToRight: CopyFolderEntries(*folder, true); return 0;
+        case kFolderToLeft: CopyFolderEntries(*folder, false); return 0;
+        case kFolderRefresh: StartFolderCompare(*folder); return 0;
+        case IDCANCEL: DestroyWindow(window); return 0;
+        default: break;
+        }
+        break;
+    case WM_NCDESTROY:
+        delete folder;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        break;
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void CompareFoldersCommand() {
+    const std::wstring left = PickFolder(L"选择左侧文件夹（原始）");
+    if (left.empty()) return;
+    const std::wstring right = PickFolder(L"选择右侧文件夹（新版本）");
+    if (right.empty()) return;
+    CompareFolderPaths(left, right);
+}
+
+void CompareFolderPaths(const std::wstring& left, const std::wstring& right) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{};
+        klass.hInstance = g_app.instance;
+        klass.lpfnWndProc = FolderCompareProc;
+        klass.lpszClassName = L"MCnotepadFolderCompare";
+        klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        klass.hIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_MCNOTEPAD));
+        registered = RegisterClassW(&klass) != 0;
+    }
+    auto* folder = new FolderCompare();
+    folder->roots[0] = left;
+    folder->roots[1] = right;
+    RECT owner{};
+    GetWindowRect(g_app.window, &owner);
+    const std::wstring title = L"比较文件夹 - " + left + L" ↔ " + right;
+    HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, L"MCnotepadFolderCompare", title.c_str(), WS_OVERLAPPEDWINDOW,
+        owner.left + Scale(40), owner.top + Scale(40), Scale(1000), Scale(620), nullptr, nullptr, g_app.instance, folder);
+    if (!window) {
+        delete folder;
+        return;
+    }
+    ApplyWindowFrameTheme(window);
+    g_toolWindows.push_back(window);
+    ShowWindow(window, SW_SHOW);
+    StartFolderCompare(*folder);
+}
+
+// Keys for the compare window: F8 / Shift+F8 next/previous difference,
+// Ctrl+S saves the changed sides, F5 refreshes.
+bool ToolWindowKey(HWND root, WPARAM key) {
+    wchar_t klass[64]{};
+    GetClassNameW(root, klass, 64);
+    const bool shift = GetKeyState(VK_SHIFT) < 0, control = GetKeyState(VK_CONTROL) < 0;
+    if (wcscmp(klass, L"MCnotepadCompare") == 0) {
+        auto* compare = reinterpret_cast<CompareWindow*>(GetWindowLongPtrW(root, GWLP_USERDATA));
+        if (!compare) return false;
+        if (key == VK_F8 || key == VK_F7) { GoToHunk(*compare, compare->current + ((key == VK_F7 || shift) ? -1 : 1)); return true; }
+        if (key == VK_F5) { SendMessageW(root, WM_COMMAND, kCmpRefresh, 0); return true; }
+        if (control && key == 'S') {
+            for (int s = 0; s < 2; ++s) if (compare->sides[s].dirty) SaveCompareSide(*compare, s);
+            return true;
+        }
+    }
+    if (wcscmp(klass, L"MCnotepadFolderCompare") == 0 && key == VK_F5) {
+        SendMessageW(root, WM_COMMAND, kFolderRefresh, 0);
+        return true;
+    }
+    return false;
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (g_app.findReplaceMessage != 0 && message == g_app.findReplaceMessage) {
         HandleFindReplaceMessage(lParam);
@@ -9848,6 +11953,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdClearSearchResults: ClearSearchResults(); break;
         case kIdSearchErrorLog: ShowSearchErrorLog(); break;
         case kIdUndoReplaceInFiles: UndoLastReplaceInFiles(); break;
+        case kIdCompareFiles: CompareTwoFilesCommand(false); break;
+        case kIdCompareStructure: CompareTwoFilesCommand(true); break;
+        case kIdCompareWithFile: CompareActiveWithFileCommand(); break;
+        case kIdCompareFolders: CompareFoldersCommand(); break;
         case kIdToolbarRun: RunActiveDocument(); break;
         case kIdToolbarEncoding:
             ShowEncodingMenu(ToolbarItemScreenRect(kIdToolbarEncoding));
@@ -10010,7 +12119,16 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case kMessageOpenPendingFiles: {
         std::vector<std::wstring> files;
         files.swap(g_app.pendingOpenFiles);
-        for (const std::wstring& file : files) OpenFileInNewTab(fs::path(file));
+        for (size_t f = 0; f < files.size(); ++f) {
+            if (files[f] == L"--diff" && f + 2 < files.size()) {
+                std::error_code error;
+                if (fs::is_directory(files[f + 1], error) && fs::is_directory(files[f + 2], error)) CompareFolderPaths(files[f + 1], files[f + 2]);
+                else CompareFiles(files[f + 1], files[f + 2]);
+                f += 2;
+                continue;
+            }
+            OpenFileInNewTab(fs::path(files[f]));
+        }
         SetMenuState();
         return 0;
     }
@@ -10082,6 +12200,11 @@ void ForwardToRunningInstance() {
     if (LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount)) {
         for (int index = 1; index < argumentCount; ++index) {
             const std::wstring argument = arguments[index];
+            if (argument == L"--diff") {
+                payload += argument;
+                payload.push_back(L'\0');
+                continue;
+            }
             if (argument.empty() || argument[0] == L'-') continue;
             std::error_code error;
             const fs::path absolute = fs::absolute(fs::path(argument), error);
@@ -10210,6 +12333,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
             DispatchMessageW(&message);
             continue;
         }
+        // Compare / log windows: their own keys, dialog navigation, no main accelerators.
+        if (HWND root = GetAncestor(message.hwnd, GA_ROOT);
+            root && std::find(g_toolWindows.begin(), g_toolWindows.end(), root) != g_toolWindows.end()) {
+            if (!IsWindow(root)) continue;
+            if (message.message == WM_KEYDOWN && ToolWindowKey(root, message.wParam)) continue;
+            if (IsDialogMessageW(root, &message)) continue;
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+            continue;
+        }
+        g_toolWindows.erase(std::remove_if(g_toolWindows.begin(), g_toolWindows.end(), [](HWND w) { return !IsWindow(w); }), g_toolWindows.end());
         bool handled = false;
         for (HWND dialog : {g_app.findDialog, g_app.gotoWindow, g_app.settingsWindow}) {
             if (dialog && IsWindow(dialog) && IsDialogMessageW(dialog, &message)) {
