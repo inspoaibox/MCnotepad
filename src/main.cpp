@@ -54,11 +54,13 @@ constexpr wchar_t kSingleInstanceMutex[] = L"Local\\MCnotepad.SingleInstance";
 constexpr ULONG_PTR kCopyDataOpenFiles = 0x4D434E50;  // 'MCNP'
 constexpr UINT kMessageOpenPendingFiles = WM_APP + 1;
 constexpr UINT kMessageCheckExternalChanges = WM_APP + 2;
-constexpr int kToolbarHeight = 28;
-constexpr int kTabHeight = 28;
+constexpr UINT kMessageOpenMenuBar = WM_APP + 3;
+constexpr int kMenuBarHeight = 30;
+constexpr int kToolbarHeight = 36;
+constexpr int kTabHeight = 34;
 constexpr int kTabCloseHitWidth = 22;
 constexpr int kTabCloseIconHalf = 4;
-constexpr int kStatusHeight = 22;
+constexpr int kStatusHeight = 26;
 constexpr int kNewTabButtonWidth = 46;
 constexpr int kGutterWidth = 42;
 
@@ -155,6 +157,8 @@ struct AppState {
     HWND newTabButton = nullptr;
     HWND statusBar = nullptr;
     HWND toolbar = nullptr;
+    HWND menuBar = nullptr;
+    HMENU mainMenu = nullptr;
     HWND gutter = nullptr;
     HWND gotoWindow = nullptr;
     HWND gotoEdit = nullptr;
@@ -164,6 +168,7 @@ struct AppState {
     ULONG_PTR gdiplusToken = 0;
     std::vector<std::unique_ptr<Bitmap>> toolbarIconImages;
     HFONT uiBoldFont = nullptr;
+    std::wstring uiFontFace = L"Segoe UI";
     HBRUSH editorBrush = nullptr;
     HBRUSH sidebarBrush = nullptr;
     HBRUSH toolbarBrush = nullptr;
@@ -243,94 +248,127 @@ void RefreshGutter();
 void AppendEncodingItems(HMENU menu);
 void CheckDocumentMenuItems(HMENU menu);
 void ApplyWordWrapAll();
-void CloseDocument(int index);
+bool CloseDocument(int index);
+void UpdateHorizontalScrollbar(HWND editor);
+void RefreshChrome();
+void ApplyMenuColorMode();
+void EnsureTabVisible(int index);
+void InvalidateToolbar();
 
 LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lParam);
 void ApplyEditorFont();
 void SetMenuState();
 
+// Colour roles. "Chrome" is the menu bar, toolbar, tab strip and status bar;
+// the active tab and the gutter share the editor colour so they read as one
+// surface. `attention` marks unsaved work, the one accent the eye should catch.
 struct ThemePalette {
-    COLORREF windowBackground;
-    COLORREF panelBackground;
-    COLORREF panelBorder;
-    COLORREF toolbarBackground;
-    COLORREF toolbarButtonBackground;
-    COLORREF toolbarButtonPressed;
-    COLORREF toolbarText;
+    COLORREF windowBackground;        // chrome
+    COLORREF panelBackground;         // chrome (dialogs)
+    COLORREF panelBorder;             // hairlines
+    COLORREF toolbarBackground;       // chrome
+    COLORREF toolbarButtonBackground; // hover
+    COLORREF toolbarButtonPressed;    // pressed
+    COLORREF toolbarText;             // primary chrome text
     COLORREF toolbarIcon;
     COLORREF toolbarIconDisabled;
     COLORREF tabBarBackground;
     COLORREF tabBackground;
-    COLORREF tabActiveBackground;
-    COLORREF tabText;
+    COLORREF tabActiveBackground;     // = editor
+    COLORREF tabText;                 // inactive tab text
     COLORREF tabActiveText;
     COLORREF tabClose;
-    COLORREF gutterBackground;
+    COLORREF gutterBackground;        // = editor
     COLORREF gutterText;
     COLORREF editorBackground;
     COLORREF editorText;
     COLORREF statusBackground;
-    COLORREF statusText;
+    COLORREF statusText;              // secondary chrome text
     COLORREF controlBackground;
     COLORREF controlText;
     COLORREF controlBorder;
     COLORREF controlHover;
     COLORREF accent;
-    COLORREF accentSoft;
+    COLORREF accentSoft;              // toggled-on buttons
     COLORREF syntaxTag;
     COLORREF syntaxString;
     COLORREF syntaxComment;
+    COLORREF attention;               // unsaved marker
 };
 
 const ThemePalette& ThemePaletteFor(ThemeKind theme) {
     static constexpr ThemePalette palettes[] = {
-        {
-            RGB(24, 24, 27), RGB(31, 32, 36), RGB(63, 64, 70),
-            RGB(28, 29, 33), RGB(38, 39, 44), RGB(52, 53, 59),
-            RGB(232, 232, 235), RGB(184, 190, 201), RGB(118, 120, 128),
-            RGB(27, 28, 31), RGB(39, 40, 45), RGB(52, 53, 59),
-            RGB(170, 172, 181), RGB(245, 245, 247), RGB(220, 221, 225),
-            RGB(30, 31, 34), RGB(145, 147, 156), RGB(22, 23, 26),
-            RGB(235, 235, 238), RGB(38, 39, 43), RGB(196, 198, 205),
-            RGB(43, 44, 49), RGB(232, 233, 237), RGB(78, 79, 87),
-            RGB(72, 73, 82), RGB(184, 190, 201), RGB(100, 101, 112),
-            RGB(255, 124, 157), RGB(232, 195, 106), RGB(140, 165, 164)
+        {   // Dark: neutral graphite chrome, slightly deeper editor, jade accent.
+            .windowBackground = RGB(30, 32, 38), .panelBackground = RGB(30, 32, 38),
+            .panelBorder = RGB(43, 46, 54), .toolbarBackground = RGB(30, 32, 38),
+            .toolbarButtonBackground = RGB(44, 48, 57), .toolbarButtonPressed = RGB(54, 59, 70),
+            .toolbarText = RGB(218, 221, 227), .toolbarIcon = RGB(184, 190, 200),
+            .toolbarIconDisabled = RGB(84, 89, 99), .tabBarBackground = RGB(30, 32, 38),
+            .tabBackground = RGB(30, 32, 38), .tabActiveBackground = RGB(23, 25, 30),
+            .tabText = RGB(138, 144, 156), .tabActiveText = RGB(235, 237, 241),
+            .tabClose = RGB(160, 166, 177), .gutterBackground = RGB(23, 25, 30),
+            .gutterText = RGB(84, 90, 102), .editorBackground = RGB(23, 25, 30),
+            .editorText = RGB(216, 220, 226), .statusBackground = RGB(30, 32, 38),
+            .statusText = RGB(140, 146, 158), .controlBackground = RGB(38, 41, 48),
+            .controlText = RGB(218, 221, 227), .controlBorder = RGB(60, 64, 74),
+            .controlHover = RGB(44, 48, 57), .accent = RGB(63, 181, 168),
+            .accentSoft = RGB(32, 60, 60), .syntaxTag = RGB(232, 125, 155),
+            .syntaxString = RGB(226, 192, 120), .syntaxComment = RGB(108, 126, 124),
+            .attention = RGB(229, 181, 103)
         },
-        {
-            RGB(244, 247, 251), RGB(250, 252, 255), RGB(216, 224, 235),
-            RGB(248, 250, 253), RGB(243, 246, 251), RGB(229, 238, 250),
-            RGB(38, 50, 68), RGB(61, 127, 214), RGB(166, 177, 192),
-            RGB(237, 241, 247), RGB(245, 248, 252), RGB(255, 255, 255),
-            RGB(102, 117, 138), RGB(31, 45, 64), RGB(91, 108, 132),
-            RGB(244, 247, 251), RGB(133, 147, 167), RGB(255, 255, 255),
-            RGB(37, 49, 67), RGB(246, 248, 251), RGB(94, 109, 128),
-            RGB(255, 255, 255), RGB(37, 49, 67), RGB(202, 211, 223),
-            RGB(234, 242, 252), RGB(61, 127, 214), RGB(220, 234, 250),
-            RGB(178, 77, 114), RGB(141, 100, 0), RGB(91, 123, 112)
+        {   // Light: cool paper chrome around a white page.
+            .windowBackground = RGB(243, 244, 246), .panelBackground = RGB(243, 244, 246),
+            .panelBorder = RGB(222, 225, 230), .toolbarBackground = RGB(243, 244, 246),
+            .toolbarButtonBackground = RGB(228, 231, 236), .toolbarButtonPressed = RGB(216, 220, 227),
+            .toolbarText = RGB(36, 41, 51), .toolbarIcon = RGB(74, 82, 96),
+            .toolbarIconDisabled = RGB(178, 184, 193), .tabBarBackground = RGB(243, 244, 246),
+            .tabBackground = RGB(243, 244, 246), .tabActiveBackground = RGB(255, 255, 255),
+            .tabText = RGB(104, 112, 125), .tabActiveText = RGB(24, 29, 38),
+            .tabClose = RGB(100, 108, 120), .gutterBackground = RGB(255, 255, 255),
+            .gutterText = RGB(172, 178, 188), .editorBackground = RGB(255, 255, 255),
+            .editorText = RGB(32, 36, 44), .statusBackground = RGB(243, 244, 246),
+            .statusText = RGB(98, 106, 119), .controlBackground = RGB(255, 255, 255),
+            .controlText = RGB(36, 41, 51), .controlBorder = RGB(205, 210, 217),
+            .controlHover = RGB(228, 231, 236), .accent = RGB(14, 128, 118),
+            .accentSoft = RGB(214, 237, 233), .syntaxTag = RGB(184, 52, 98),
+            .syntaxString = RGB(150, 98, 0), .syntaxComment = RGB(110, 128, 120),
+            .attention = RGB(196, 124, 10)
         },
-        {
-            RGB(234, 242, 231), RGB(246, 250, 243), RGB(201, 218, 195),
-            RGB(239, 247, 236), RGB(231, 242, 228), RGB(215, 231, 209),
-            RGB(48, 73, 54), RGB(88, 151, 99), RGB(149, 169, 145),
-            RGB(226, 238, 224), RGB(239, 247, 236), RGB(255, 255, 255),
-            RGB(103, 122, 105), RGB(48, 73, 54), RGB(102, 128, 106),
-            RGB(239, 246, 237), RGB(126, 150, 127), RGB(250, 253, 249),
-            RGB(46, 64, 50), RGB(239, 246, 237), RGB(91, 116, 94),
-            RGB(255, 255, 255), RGB(46, 64, 50), RGB(200, 216, 195),
-            RGB(231, 242, 228), RGB(94, 155, 103), RGB(218, 235, 214),
-            RGB(165, 78, 104), RGB(138, 108, 25), RGB(90, 132, 100)
+        {   // Eye-care green: low-contrast sage chrome, soft green page.
+            .windowBackground = RGB(222, 233, 219), .panelBackground = RGB(222, 233, 219),
+            .panelBorder = RGB(199, 214, 195), .toolbarBackground = RGB(222, 233, 219),
+            .toolbarButtonBackground = RGB(208, 223, 204), .toolbarButtonPressed = RGB(195, 213, 191),
+            .toolbarText = RGB(40, 62, 45), .toolbarIcon = RGB(62, 90, 68),
+            .toolbarIconDisabled = RGB(152, 172, 152), .tabBarBackground = RGB(222, 233, 219),
+            .tabBackground = RGB(222, 233, 219), .tabActiveBackground = RGB(237, 245, 234),
+            .tabText = RGB(90, 112, 94), .tabActiveText = RGB(28, 48, 33),
+            .tabClose = RGB(80, 104, 86), .gutterBackground = RGB(237, 245, 234),
+            .gutterText = RGB(150, 170, 152), .editorBackground = RGB(237, 245, 234),
+            .editorText = RGB(38, 56, 42), .statusBackground = RGB(222, 233, 219),
+            .statusText = RGB(84, 106, 88), .controlBackground = RGB(246, 250, 244),
+            .controlText = RGB(40, 62, 45), .controlBorder = RGB(190, 207, 186),
+            .controlHover = RGB(208, 223, 204), .accent = RGB(52, 128, 82),
+            .accentSoft = RGB(203, 227, 206), .syntaxTag = RGB(165, 60, 95),
+            .syntaxString = RGB(130, 96, 10), .syntaxComment = RGB(100, 128, 106),
+            .attention = RGB(182, 110, 20)
         },
-        {
-            RGB(15, 26, 43), RGB(22, 40, 64), RGB(44, 70, 104),
-            RGB(14, 29, 49), RGB(24, 48, 79), RGB(32, 64, 100),
-            RGB(225, 236, 250), RGB(98, 164, 246), RGB(113, 137, 165),
-            RGB(12, 25, 43), RGB(24, 48, 79), RGB(33, 67, 103),
-            RGB(145, 170, 201), RGB(242, 247, 253), RGB(183, 203, 228),
-            RGB(18, 36, 58), RGB(114, 141, 171), RGB(15, 27, 45),
-            RGB(226, 237, 250), RGB(23, 42, 67), RGB(175, 194, 218),
-            RGB(27, 51, 83), RGB(225, 236, 250), RGB(51, 84, 123),
-            RGB(34, 70, 103), RGB(98, 164, 246), RGB(45, 94, 146),
-            RGB(255, 137, 169), RGB(240, 208, 121), RGB(142, 173, 158)
+        {   // Night blue: deep navy chrome, darker page, sky accent.
+            .windowBackground = RGB(17, 28, 46), .panelBackground = RGB(17, 28, 46),
+            .panelBorder = RGB(30, 46, 70), .toolbarBackground = RGB(17, 28, 46),
+            .toolbarButtonBackground = RGB(29, 45, 69), .toolbarButtonPressed = RGB(37, 57, 87),
+            .toolbarText = RGB(220, 230, 245), .toolbarIcon = RGB(168, 186, 212),
+            .toolbarIconDisabled = RGB(68, 86, 112), .tabBarBackground = RGB(17, 28, 46),
+            .tabBackground = RGB(17, 28, 46), .tabActiveBackground = RGB(12, 20, 34),
+            .tabText = RGB(120, 140, 168), .tabActiveText = RGB(234, 241, 252),
+            .tabClose = RGB(150, 170, 198), .gutterBackground = RGB(12, 20, 34),
+            .gutterText = RGB(68, 88, 116), .editorBackground = RGB(12, 20, 34),
+            .editorText = RGB(214, 225, 242), .statusBackground = RGB(17, 28, 46),
+            .statusText = RGB(128, 148, 176), .controlBackground = RGB(24, 38, 60),
+            .controlText = RGB(220, 230, 245), .controlBorder = RGB(44, 66, 98),
+            .controlHover = RGB(29, 45, 69), .accent = RGB(98, 164, 246),
+            .accentSoft = RGB(26, 50, 82), .syntaxTag = RGB(255, 137, 169),
+            .syntaxString = RGB(240, 208, 121), .syntaxComment = RGB(110, 140, 130),
+            .attention = RGB(240, 190, 100)
         }
     };
     return palettes[std::clamp(static_cast<int>(theme), 0, 3)];
@@ -436,16 +474,9 @@ void ApplyThemeToEditors(bool rehighlight = true) {
         ApplyEditorTheme(document.editor);
         if (rehighlight) HighlightDocument(document);
     }
-    if (g_app.tabs) {
-        InvalidateRect(g_app.tabs, nullptr, TRUE);
-    }
-    if (g_app.statusBar) InvalidateRect(g_app.statusBar, nullptr, TRUE);
     if (g_app.gutter) InvalidateRect(g_app.gutter, nullptr, TRUE);
-    if (g_app.toolbar) InvalidateRect(g_app.toolbar, nullptr, TRUE);
-    for (HWND button : g_app.toolbarButtons) {
-        if (button) InvalidateRect(button, nullptr, TRUE);
-    }
-    if (g_app.newTabButton) InvalidateRect(g_app.newTabButton, nullptr, TRUE);
+    ApplyMenuColorMode();
+    RefreshChrome();
     if (g_app.settingsThemeCombo) SendMessageW(g_app.settingsThemeCombo, CB_SETCURSEL, static_cast<int>(g_app.theme), 0);
     for (HWND window : {g_app.window, g_app.settingsWindow, g_app.gotoWindow}) ApplyWindowFrameTheme(window);
     if (g_app.window) {
@@ -495,7 +526,7 @@ int ToolbarButtonWidth(int id) {
     }
 }
 
-void ShowThemeMenu(HWND anchor) {
+void ShowThemeMenu(const RECT& anchor) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     AppendMenuW(menu, MF_STRING, kIdThemeDark, L"深色");
@@ -505,11 +536,10 @@ void ShowThemeMenu(HWND anchor) {
     CheckMenuRadioItem(menu, kIdThemeDark, kIdThemeBlue,
         kIdThemeDark + static_cast<int>(g_app.theme), MF_BYCOMMAND);
 
-    RECT rect{};
-    GetWindowRect(anchor ? anchor : g_app.toolbar, &rect);
+    TPMPARAMS params{sizeof(params), anchor};
     const int command = TrackPopupMenuEx(menu,
-        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
-        rect.left, rect.bottom, g_app.window, nullptr);
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_VERTICAL,
+        anchor.left, anchor.bottom, g_app.window, &params);
     DestroyMenu(menu);
     if (command >= kIdThemeDark && command <= kIdThemeBlue) {
         SetThemeKind(static_cast<ThemeKind>(command - kIdThemeDark));
@@ -737,51 +767,6 @@ void HighlightDocument(const TabDocument& document) {
     ApplySimpleSyntaxHighlight(document.editor, EffectiveLanguage(document));
 }
 
-LRESULT CALLBACK StatusProc(HWND status, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_ERASEBKGND) return 1;
-    if (message == WM_PAINT) {
-        PAINTSTRUCT paint{};
-        HDC dc = BeginPaint(status, &paint);
-        RECT client{};
-        GetClientRect(status, &client);
-        const ThemePalette& palette = CurrentPalette();
-        HBRUSH background = CreateSolidBrush(palette.statusBackground);
-        FillRect(dc, &client, background);
-        DeleteObject(background);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, palette.statusText);
-        HFONT font = g_app.uiFont ? g_app.uiFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, font));
-        int parts[16]{};
-        const int count = std::clamp(static_cast<int>(SendMessageW(status, SB_GETPARTS, 16,
-            reinterpret_cast<LPARAM>(parts))), 0, 16);
-        int left = 0;
-        for (int index = 0; index < count; ++index) {
-            const int right = parts[index] < 0 ? static_cast<int>(client.right)
-                : std::min(static_cast<int>(client.right), parts[index]);
-            wchar_t text[256]{};
-            SendMessageW(status, SB_GETTEXTW, static_cast<WPARAM>(index), reinterpret_cast<LPARAM>(text));
-            RECT textRect{left + 8, 0, std::max(left + 8, right - 8), client.bottom};
-            DrawTextW(dc, text, -1, &textRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-            if (index + 1 < count) {
-                HPEN separator = CreatePen(PS_SOLID, 1, palette.panelBorder);
-                HPEN oldPen = static_cast<HPEN>(SelectObject(dc, separator));
-                MoveToEx(dc, right, 4, nullptr);
-                LineTo(dc, right, std::max(4, static_cast<int>(client.bottom) - 4));
-                SelectObject(dc, oldPen);
-                DeleteObject(separator);
-            }
-            left = right;
-        }
-        SelectObject(dc, oldFont);
-        EndPaint(status, &paint);
-        return 0;
-    }
-    return g_app.oldStatusProc
-        ? CallWindowProcW(g_app.oldStatusProc, status, message, wParam, lParam)
-        : DefWindowProcW(status, message, wParam, lParam);
-}
-
 // Width needed for the active document's line numbers (at least 3 digits).
 int GutterWidthFor(HWND editor) {
     const int lines = editor ? static_cast<int>(SendMessageW(editor, EM_GETLINECOUNT, 0, 0)) : 1;
@@ -967,124 +952,6 @@ void DrawToolbarIcon(HDC dc, const RECT& bounds, int id, COLORREF color) {
     SelectObject(dc, oldPen);
     DeleteObject(pen);
     RestoreDC(dc, savedDc);
-}
-
-void DrawToolbarItem(const DRAWITEMSTRUCT& item) {
-    const int id = static_cast<int>(item.CtlID);
-    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
-    const bool hot = (item.itemState & ODS_HOTLIGHT) != 0;
-    const bool disabled = (item.itemState & ODS_DISABLED) != 0;
-    const ThemePalette& palette = CurrentPalette();
-    RECT rect = item.rcItem;
-    HBRUSH baseBrush = CreateSolidBrush(palette.toolbarBackground);
-    FillRect(item.hDC, &rect, baseBrush);
-    DeleteObject(baseBrush);
-    if (hot || pressed) {
-        RECT surface = rect;
-        InflateRect(&surface, -1, -1);
-        HBRUSH brush = CreateSolidBrush(ToolbarButtonBackground(pressed));
-        FillRect(item.hDC, &surface, brush);
-        DeleteObject(brush);
-    }
-
-    // Thin group dividers keep the row readable without adding large gaps.
-    if (id == kIdToolbarNew || id == kIdToolbarUndo || id == kIdToolbarFind ||
-        id == kIdToolbarFormat || id == kIdToolbarEncoding || id == kIdToolbarTheme) {
-        HPEN separator = CreatePen(PS_SOLID, 1, palette.panelBorder);
-        HPEN previousPen = static_cast<HPEN>(SelectObject(item.hDC, separator));
-        MoveToEx(item.hDC, rect.left, rect.top + 5, nullptr);
-        LineTo(item.hDC, rect.left, rect.bottom - 5);
-        SelectObject(item.hDC, previousPen);
-        DeleteObject(separator);
-    }
-
-    SetBkMode(item.hDC, TRANSPARENT);
-    if (id == kIdNewTabButton) {
-        HPEN pen = CreatePen(PS_SOLID, 1, disabled ? palette.toolbarIconDisabled : palette.toolbarIcon);
-        HPEN previousPen = static_cast<HPEN>(SelectObject(item.hDC, pen));
-        const int cx = (rect.left + rect.right) / 2;
-        const int cy = (rect.top + rect.bottom) / 2;
-        if (id == kIdNewTabButton) {
-            MoveToEx(item.hDC, cx - 7, cy, nullptr); LineTo(item.hDC, cx + 7, cy);
-            MoveToEx(item.hDC, cx, cy - 7, nullptr); LineTo(item.hDC, cx, cy + 7);
-        } else {
-            MoveToEx(item.hDC, cx - 5, cy - 5, nullptr); LineTo(item.hDC, cx + 5, cy + 5);
-            MoveToEx(item.hDC, cx + 5, cy - 5, nullptr); LineTo(item.hDC, cx - 5, cy + 5);
-        }
-        SelectObject(item.hDC, previousPen);
-        DeleteObject(pen);
-        return;
-    }
-
-    const COLORREF iconColor = disabled ? palette.toolbarIconDisabled : palette.toolbarIcon;
-    Bitmap* image = ToolbarIconImage(id);
-    if (image != nullptr && g_app.gdiplusToken != 0) {
-        Graphics graphics(item.hDC);
-        graphics.SetSmoothingMode(SmoothingModeHighQuality);
-        ImageAttributes attributes;
-        const ColorMatrix colorMatrix = {
-            0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-            static_cast<REAL>(GetRValue(iconColor)) / 255.0f,
-            static_cast<REAL>(GetGValue(iconColor)) / 255.0f,
-            static_cast<REAL>(GetBValue(iconColor)) / 255.0f,
-            1.0f, 0.0f,
-            0.0f, 0.0f, 0.0f, 0.0f, 1.0f
-        };
-        attributes.SetColorMatrix(&colorMatrix, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
-        const int size = Scale(18);
-        const int x = (item.rcItem.left + item.rcItem.right - size) / 2;
-        const int y = (item.rcItem.top + item.rcItem.bottom - size) / 2;
-        graphics.DrawImage(image, Rect(x, y, size, size), 0, 0,
-            static_cast<INT>(image->GetWidth()), static_cast<INT>(image->GetHeight()),
-            UnitPixel, &attributes);
-    } else {
-        RECT iconRect = item.rcItem;
-        InflateRect(&iconRect, -2, -2);
-        DrawToolbarIcon(item.hDC, iconRect, id, iconColor);
-    }
-}
-
-void DrawTabItem(const DRAWITEMSTRUCT& item) {
-    if (!g_app.tabs || item.itemID < 0) return;
-    const ThemePalette& palette = CurrentPalette();
-    RECT rect = item.rcItem;
-    const bool active = g_app.activeIndex == static_cast<int>(item.itemID);
-    HBRUSH background = CreateSolidBrush(active ? palette.tabActiveBackground : palette.tabBackground);
-    FillRect(item.hDC, &rect, background);
-    DeleteObject(background);
-    if (active) {
-        HBRUSH accent = CreateSolidBrush(palette.accent);
-        RECT strip{rect.left, rect.bottom - 3, rect.right, rect.bottom};
-        FillRect(item.hDC, &strip, accent);
-        DeleteObject(accent);
-    }
-    wchar_t title[256]{};
-    TCITEMW tab{};
-    tab.mask = TCIF_TEXT;
-    tab.pszText = title;
-    tab.cchTextMax = static_cast<int>(std::size(title));
-    TabCtrl_GetItem(g_app.tabs, item.itemID, &tab);
-    SetBkMode(item.hDC, TRANSPARENT);
-    SetTextColor(item.hDC, active ? palette.tabActiveText : palette.tabText);
-    HFONT font = g_app.uiFont ? g_app.uiFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    HFONT oldFont = static_cast<HFONT>(SelectObject(item.hDC, font));
-    RECT textRect = rect;
-    textRect.left += Scale(16);
-    textRect.right -= Scale(24);
-    DrawTextW(item.hDC, title, -1, &textRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-    HPEN pen = CreatePen(PS_SOLID, 1, active ? palette.tabClose : palette.gutterText);
-    HPEN oldPen = static_cast<HPEN>(SelectObject(item.hDC, pen));
-    const int cx = rect.right - Scale(12);
-    const int cy = (rect.top + rect.bottom) / 2;
-    MoveToEx(item.hDC, cx - Scale(kTabCloseIconHalf), cy - Scale(kTabCloseIconHalf), nullptr);
-    LineTo(item.hDC, cx + Scale(kTabCloseIconHalf), cy + Scale(kTabCloseIconHalf));
-    MoveToEx(item.hDC, cx + Scale(kTabCloseIconHalf), cy - Scale(kTabCloseIconHalf), nullptr);
-    LineTo(item.hDC, cx - Scale(kTabCloseIconHalf), cy + Scale(kTabCloseIconHalf));
-    SelectObject(item.hDC, oldPen);
-    DeleteObject(pen);
-    SelectObject(item.hDC, oldFont);
 }
 
 void DrawComboItem(const DRAWITEMSTRUCT& item) {
@@ -1573,16 +1440,8 @@ void UpdateTabTitle(int index) {
         return;
     }
 
-    TabDocument& document = g_app.documents[static_cast<size_t>(index)];
-    std::wstring title = document.title;
-    if (document.modified) {
-        title += L" *";
-    }
 
-    TCITEMW item{};
-    item.mask = TCIF_TEXT;
-    item.pszText = title.data();
-    TabCtrl_SetItem(g_app.tabs, index, &item);
+    if (g_app.tabs) InvalidateRect(g_app.tabs, nullptr, FALSE);
     UpdateWindowTitle();
 }
 
@@ -1611,61 +1470,8 @@ void RestoreEditorState(const TabDocument& document) {
 }
 
 void UpdateStatusBar() {
-    if (g_app.statusBar == nullptr) {
-        return;
-    }
-
-    int line = 1;
-    int column = 1;
-    int selected = 0;
-    bool modified = false;
-    const wchar_t* encodingName = kEncodingNames[0];
-    const wchar_t* lineEndingName = kLineEndingNames[0];
-    const wchar_t* languageName = L"纯文本";
-    if (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size())) {
-        const TabDocument& document = g_app.documents[static_cast<size_t>(g_app.activeIndex)];
-        DWORD anchor = 0;
-        DWORD caret = 0;
-        SendMessageW(document.editor, EM_GETSEL,
-            reinterpret_cast<WPARAM>(&anchor), reinterpret_cast<LPARAM>(&caret));
-        // Real line/column (paragraphs), not wrapped visual rows.
-        TextDocumentRef tom(document.editor);
-        LONG lineStart = 0;
-        if (tom) {
-            line = static_cast<int>(tom.ParagraphIndex(static_cast<LONG>(caret)));
-            lineStart = tom.ParagraphStart(static_cast<LONG>(caret));
-        } else {
-            const int lineIndex = static_cast<int>(SendMessageW(
-                document.editor, EM_LINEFROMCHAR, static_cast<WPARAM>(caret), 0));
-            lineStart = static_cast<LONG>(SendMessageW(document.editor, EM_LINEINDEX, lineIndex, 0));
-            line = lineIndex + 1;
-        }
-        column = std::max(1, static_cast<int>(caret) - static_cast<int>(lineStart) + 1);
-        modified = document.modified;
-        selected = static_cast<int>(anchor > caret ? anchor - caret : caret - anchor);
-        encodingName = kEncodingNames[std::clamp(document.encoding, 0, kEncodingCount - 1)];
-        lineEndingName = kLineEndingNames[std::clamp(document.lineEnding, 0, kLineEndingCount - 1)];
-        const int language = EffectiveLanguage(document);
-        languageName = language == kLanguagePlain ? L"纯文本" : kLanguageNames[language];
-    }
-
-    wchar_t position[64]{};
-    swprintf_s(position, L"行 %d，列 %d", line, column);
-    wchar_t state[64]{};
-    swprintf_s(state, L"%s", modified ? L"未保存" : L"已保存");
-
-    RECT client{};
-    GetClientRect(g_app.window, &client);
-    int parts[] = { Scale(90), Scale(260), Scale(380), client.right - Scale(270), client.right - Scale(170), -1 };
-    SendMessageW(g_app.statusBar, SB_SETPARTS, 6, reinterpret_cast<LPARAM>(parts));
-    wchar_t selection[64]{};
-    swprintf_s(selection, L"选中 %d", selected);
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(state));
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 1, reinterpret_cast<LPARAM>(position));
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 2, reinterpret_cast<LPARAM>(selection));
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 3, reinterpret_cast<LPARAM>(encodingName));
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 4, reinterpret_cast<LPARAM>(lineEndingName));
-    SendMessageW(g_app.statusBar, SB_SETTEXTW, 5, reinterpret_cast<LPARAM>(languageName));
+    if (g_app.statusBar) InvalidateRect(g_app.statusBar, nullptr, FALSE);
+    InvalidateToolbar();  // undo/redo availability follows edits
 }
 
 void LayoutChildren(HWND window) {
@@ -1673,38 +1479,22 @@ void LayoutChildren(HWND window) {
     GetClientRect(window, &client);
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
+    const int menuHeight = Scale(kMenuBarHeight);
     const int toolbarHeight = Scale(kToolbarHeight);
     const int tabHeight = Scale(kTabHeight);
     const int statusHeight = Scale(kStatusHeight);
-    const int newTabWidth = Scale(kNewTabButtonWidth);
-    const int tabY = toolbarHeight;
+    const int tabY = menuHeight + toolbarHeight;
     const int contentY = tabY + tabHeight;
     const int contentHeight = std::max(0, height - contentY - statusHeight);
     const int editorWidth = width;
-    const int tabsWidth = std::max(0, width - newTabWidth);
     HWND activeEditor = (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size()))
         ? g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor : nullptr;
     g_app.gutterWidth = GutterWidthFor(activeEditor);
     const int gutterWidth = g_app.showLineNumbers ? g_app.gutterWidth : 0;
 
-    if (g_app.toolbar) MoveWindow(g_app.toolbar, 0, 0, width, toolbarHeight, TRUE);
-    static constexpr int toolbarIds[] = {
-        kIdToolbarNew, kIdToolbarOpen, kIdToolbarSave, kIdToolbarSaveAs, kIdToolbarClose,
-        kIdToolbarUndo, kIdToolbarRedo, kIdToolbarFind, kIdToolbarReplace, kIdToolbarGoto,
-        kIdToolbarFormat, kIdToolbarRun, kIdToolbarEncoding, kIdToolbarLineNumbers,
-        kIdToolbarWrap, kIdToolbarTheme
-    };
-    const int buttonCount = static_cast<int>(g_app.toolbarButtons.size());
-    int toolbarX = 0;
-    for (int index = 0; index < buttonCount; ++index) {
-        const int id = toolbarIds[std::min(index, static_cast<int>(std::size(toolbarIds)) - 1)];
-        const int buttonWidth = Scale(ToolbarButtonWidth(id));
-        MoveWindow(g_app.toolbarButtons[static_cast<size_t>(index)], toolbarX, 0,
-            buttonWidth, toolbarHeight, TRUE);
-        toolbarX += buttonWidth;
-    }
-    MoveWindow(g_app.tabs, 0, tabY, tabsWidth, tabHeight, TRUE);
-    MoveWindow(g_app.newTabButton, tabsWidth, tabY, newTabWidth, tabHeight, TRUE);
+    if (g_app.menuBar) MoveWindow(g_app.menuBar, 0, 0, width, menuHeight, TRUE);
+    if (g_app.toolbar) MoveWindow(g_app.toolbar, 0, menuHeight, width, toolbarHeight, TRUE);
+    if (g_app.tabs) MoveWindow(g_app.tabs, 0, tabY, width, tabHeight, TRUE);
     if (g_app.gutter) {
         MoveWindow(g_app.gutter, 0, contentY, gutterWidth, contentHeight, TRUE);
         ShowWindow(g_app.gutter, g_app.showLineNumbers ? SW_SHOW : SW_HIDE);
@@ -1717,28 +1507,6 @@ void LayoutChildren(HWND window) {
     UpdateStatusBar();
     RefreshGutter();
 }
-
-void CreateToolbarControls(HWND window) {
-    static constexpr int ids[] = {
-        kIdToolbarNew, kIdToolbarOpen, kIdToolbarSave, kIdToolbarSaveAs, kIdToolbarClose,
-        kIdToolbarUndo, kIdToolbarRedo, kIdToolbarFind, kIdToolbarReplace, kIdToolbarGoto,
-        kIdToolbarFormat, kIdToolbarRun, kIdToolbarEncoding, kIdToolbarLineNumbers,
-        kIdToolbarWrap, kIdToolbarTheme
-    };
-    g_app.toolbar = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE,
-        0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
-    g_app.toolbarButtons.clear();
-    for (int id : ids) {
-        HWND button = CreateWindowExW(0, L"BUTTON", ToolbarLabel(id).c_str(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-            0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-            g_app.instance, nullptr);
-        SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
-        g_app.toolbarButtons.push_back(button);
-
-    }
-}
-
 
 void SelectTab(int index) {
     if (index < 0 || index >= static_cast<int>(g_app.documents.size())) {
@@ -1755,7 +1523,8 @@ void SelectTab(int index) {
     ShowWindow(document.editor, SW_SHOW);
     SetFocus(document.editor);
     RestoreEditorState(document);
-    TabCtrl_SetCurSel(g_app.tabs, index);
+    EnsureTabVisible(index);
+    InvalidateToolbar();
     if (g_app.showLineNumbers && GutterWidthFor(document.editor) != g_app.gutterWidth) LayoutChildren(g_app.window);
     g_app.stateDirty = true;
     UpdateWindowTitle();
@@ -1910,15 +1679,15 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
     } else if (message == WM_MOUSEWHEEL || message == WM_KEYDOWN) {
         // EN_VSCROLL is not sent for wheel or keyboard scrolling.
         RefreshGutter();
+    } else if (message == WM_SIZE || message == WM_SHOWWINDOW) {
+        UpdateHorizontalScrollbar(editor);
     }
     return result;
 }
 
 void AddTabToControl(const std::wstring& title) {
-    TCITEMW item{};
-    item.mask = TCIF_TEXT;
-    item.pszText = const_cast<wchar_t*>(title.c_str());
-    TabCtrl_InsertItem(g_app.tabs, static_cast<int>(g_app.documents.size()), &item);
+    (void)title;
+    if (g_app.tabs) InvalidateRect(g_app.tabs, nullptr, FALSE);
 }
 
 bool SamePath(const fs::path& left, const fs::path& right) {
@@ -1990,8 +1759,29 @@ void ApplyWordWrap(HWND editor) {
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
+// RichEdit's no-wrap mode keeps a placeholder horizontal scrollbar (range
+// 0-100, page 0) even when every line fits. Show it only when there is
+// something to scroll.
+void UpdateHorizontalScrollbar(HWND editor) {
+    static bool updating = false;
+    if (!editor || updating) return;
+    updating = true;
+    bool needed = false;
+    if (!g_app.wordWrap) {
+        SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE};
+        if (GetScrollInfo(editor, SB_HORZ, &info)) {
+            needed = info.nPage > 0 && info.nMax - info.nMin + 1 > static_cast<int>(info.nPage);
+        }
+    }
+    ShowScrollBar(editor, SB_HORZ, needed ? TRUE : FALSE);
+    updating = false;
+}
+
 void ApplyWordWrapAll() {
-    for (const TabDocument& document : g_app.documents) ApplyWordWrap(document.editor);
+    for (const TabDocument& document : g_app.documents) {
+        ApplyWordWrap(document.editor);
+        UpdateHorizontalScrollbar(document.editor);
+    }
     RefreshGutter();
 }
 
@@ -2190,18 +1980,18 @@ bool PrepareDocumentClose(TabDocument& document) {
     return true;
 }
 
-void CloseDocument(int index) {
+bool CloseDocument(int index) {
     if (index < 0 || index >= static_cast<int>(g_app.documents.size())) {
-        return;
+        return false;
     }
 
     TabDocument& document = g_app.documents[static_cast<size_t>(index)];
-    if (!PrepareDocumentClose(document)) return;
+    if (!PrepareDocumentClose(document)) return false;
 
     const fs::path snapshot = document.snapshotPath;
     DestroyWindow(document.editor);
     g_app.documents.erase(g_app.documents.begin() + index);
-    TabCtrl_DeleteItem(g_app.tabs, index);
+    if (g_app.tabs) InvalidateRect(g_app.tabs, nullptr, FALSE);
 
     std::error_code error;
     fs::remove(snapshot, error);
@@ -2209,7 +1999,7 @@ void CloseDocument(int index) {
     if (g_app.documents.empty()) {
         g_app.activeIndex = -1;
         NewDocument();
-        return;
+        return true;
     }
 
     const int nextIndex = std::min(index, static_cast<int>(g_app.documents.size()) - 1);
@@ -2217,6 +2007,7 @@ void CloseDocument(int index) {
     SelectTab(nextIndex);
     g_app.stateDirty = true;
     PersistAll(false);
+    return true;
 }
 
 bool PrepareApplicationClose() {
@@ -2281,7 +2072,7 @@ void OpenFileDialog() {
 void SetMenuState() {
     const bool hasActive = g_app.activeIndex >= 0 &&
         g_app.activeIndex < static_cast<int>(g_app.documents.size());
-    HMENU menu = GetMenu(g_app.window);
+    HMENU menu = g_app.mainMenu;
     if (!menu) {
         return;
     }
@@ -2797,49 +2588,35 @@ void HandleEditCommand(int command) {
     }
 }
 
-LRESULT CALLBACK TabProc(HWND tab, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_ERASEBKGND) {
-        HDC dc = reinterpret_cast<HDC>(wParam);
-        RECT client{};
-        GetClientRect(tab, &client);
-        HBRUSH brush = CreateSolidBrush(CurrentPalette().tabBarBackground);
-        FillRect(dc, &client, brush);
-        DeleteObject(brush);
-        return 1;
-    }
-    if (message == WM_LBUTTONDOWN) {
-        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        const int index = TabCtrl_HitTest(tab, &point);
-        if (index >= 0) {
-            RECT rect{};
-            TabCtrl_GetItemRect(tab, index, &rect);
-            const int centerY = (rect.top + rect.bottom) / 2;
-            if (point.x >= rect.right - Scale(kTabCloseHitWidth) &&
-                point.y >= centerY - Scale(10) && point.y <= centerY + Scale(10)) {
-                CloseDocument(index);
-                return 0;
-            }
-        }
-    }
-    return CallWindowProcW(g_app.oldTabProc, tab, message, wParam, lParam);
+bool FontFamilyExists(const wchar_t* family) {
+    HDC dc = GetDC(nullptr);
+    LOGFONTW query{};
+    query.lfCharSet = DEFAULT_CHARSET;
+    wcsncpy_s(query.lfFaceName, family, _TRUNCATE);
+    bool found = false;
+    EnumFontFamiliesExW(dc, &query, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM flag) -> int {
+        *reinterpret_cast<bool*>(flag) = true;
+        return 0;
+    }, reinterpret_cast<LPARAM>(&found), 0);
+    ReleaseDC(nullptr, dc);
+    return found;
 }
 
-// 9 pt Segoe UI at the window's DPI (the old -9 px font was about 7 pt).
+// 9 pt UI font at the window's DPI (the old -9 px font was about 7 pt).
 void CreateUiFonts() {
     HFONT oldFont = g_app.uiFont;
     HFONT oldBold = g_app.uiBoldFont;
     const int height = -MulDiv(9, static_cast<int>(g_app.dpi), 72);
+    // Microsoft YaHei UI is designed for Chinese UI text and has good Latin
+    // glyphs; Segoe UI (no CJK) is the fallback on systems without it.
+    const wchar_t* face = FontFamilyExists(L"Microsoft YaHei UI") ? L"Microsoft YaHei UI" : L"Segoe UI";
+    g_app.uiFontFace = face;
     g_app.uiFont = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        DEFAULT_PITCH | FF_SWISS, face);
     g_app.uiBoldFont = CreateFontW(height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    std::vector<HWND> controls = g_app.toolbarButtons;
-    controls.insert(controls.end(), {g_app.tabs, g_app.newTabButton, g_app.statusBar});
-    for (HWND control : controls) {
-        if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
-    }
+        DEFAULT_PITCH | FF_SWISS, face);
     if (oldFont) DeleteObject(oldFont);
     if (oldBold) DeleteObject(oldBold);
 }
@@ -3098,15 +2875,15 @@ void CheckDocumentMenuItems(HMENU menu) {
         kIdLanguageFirst + document->language, MF_BYCOMMAND);
 }
 
-void ShowEncodingMenu(HWND anchor) {
+void ShowEncodingMenu(const RECT& anchor) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     AppendEncodingItems(menu);
     CheckDocumentMenuItems(menu);
-    RECT rect{};
-    GetWindowRect(anchor ? anchor : g_app.toolbar, &rect);
-    const int command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN,
-        rect.left, rect.bottom, g_app.window, nullptr);
+    TPMPARAMS params{sizeof(params), anchor};
+    const int command = TrackPopupMenuEx(menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_VERTICAL,
+        anchor.left, anchor.bottom, g_app.window, &params);
     DestroyMenu(menu);
     if (command != 0) SendMessageW(g_app.window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
 }
@@ -3474,6 +3251,1162 @@ void RunActiveDocument() {
     CloseHandle(process.hProcess);
 }
 
+// ===========================================================================
+// Window chrome: menu bar, toolbar, tab strip and status bar.
+// All four are custom-drawn so they follow the theme exactly (the Win32 menu
+// bar and tab control can't be recoloured). They share the helpers below and
+// paint through a memory DC to avoid flicker.
+// ===========================================================================
+
+constexpr int kToolButtonWidth = 30;
+constexpr int kToolButtonHeight = 28;
+
+class BufferedPaint {
+public:
+    explicit BufferedPaint(HWND window) : window_(window) {
+        target_ = BeginPaint(window_, &paint_);
+        GetClientRect(window_, &client_);
+        dc_ = CreateCompatibleDC(target_);
+        bitmap_ = CreateCompatibleBitmap(target_, std::max(1L, client_.right), std::max(1L, client_.bottom));
+        previous_ = SelectObject(dc_, bitmap_);
+        SetBkMode(dc_, TRANSPARENT);
+        previousFont_ = SelectObject(dc_, g_app.uiFont ? g_app.uiFont : GetStockObject(DEFAULT_GUI_FONT));
+    }
+    ~BufferedPaint() {
+        BitBlt(target_, 0, 0, client_.right, client_.bottom, dc_, 0, 0, SRCCOPY);
+        SelectObject(dc_, previousFont_);
+        SelectObject(dc_, previous_);
+        DeleteObject(bitmap_);
+        DeleteDC(dc_);
+        EndPaint(window_, &paint_);
+    }
+    BufferedPaint(const BufferedPaint&) = delete;
+    BufferedPaint& operator=(const BufferedPaint&) = delete;
+    HDC dc() const { return dc_; }
+    const RECT& client() const { return client_; }
+
+private:
+    HWND window_;
+    PAINTSTRUCT paint_{};
+    HDC target_ = nullptr;
+    HDC dc_ = nullptr;
+    HBITMAP bitmap_ = nullptr;
+    HGDIOBJ previous_ = nullptr;
+    HGDIOBJ previousFont_ = nullptr;
+    RECT client_{};
+};
+
+void FillSolid(HDC dc, const RECT& rect, COLORREF color) {
+    SetDCBrushColor(dc, color);
+    FillRect(dc, &rect, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+}
+
+Color ToGdiplus(COLORREF color) {
+    return Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
+}
+
+// Anti-aliased rounded rectangle; topOnly keeps the bottom corners square
+// (used for the active tab, which joins the editor below it).
+void FillRounded(HDC dc, const RECT& rect, int radius, COLORREF color, bool topOnly = false) {
+    Graphics graphics(dc);
+    graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+    graphics.SetPixelOffsetMode(PixelOffsetModeHalf);
+    const REAL x = static_cast<REAL>(rect.left);
+    const REAL y = static_cast<REAL>(rect.top);
+    const REAL w = static_cast<REAL>(rect.right - rect.left);
+    const REAL h = static_cast<REAL>(rect.bottom - rect.top);
+    const REAL d = static_cast<REAL>(std::min({radius * 2, static_cast<int>(rect.right - rect.left),
+        static_cast<int>(rect.bottom - rect.top)}));
+    SolidBrush brush(ToGdiplus(color));
+    if (d <= 1) {
+        graphics.FillRectangle(&brush, x, y, w, h);
+        return;
+    }
+    GraphicsPath path;
+    path.AddArc(x, y, d, d, 180, 90);
+    path.AddArc(x + w - d, y, d, d, 270, 90);
+    if (topOnly) {
+        path.AddLine(x + w, y + h, x, y + h);
+    } else {
+        path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+        path.AddArc(x, y + h - d, d, d, 90, 90);
+    }
+    path.CloseFigure();
+    graphics.FillPath(&brush, &path);
+}
+
+void FillDot(HDC dc, int cx, int cy, int radius, COLORREF color) {
+    Graphics graphics(dc);
+    graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+    SolidBrush brush(ToGdiplus(color));
+    graphics.FillEllipse(&brush, static_cast<REAL>(cx - radius), static_cast<REAL>(cy - radius),
+        static_cast<REAL>(radius * 2), static_cast<REAL>(radius * 2));
+}
+
+void DrawCross(HDC dc, int cx, int cy, int half, COLORREF color) {
+    Graphics graphics(dc);
+    graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+    Pen pen(ToGdiplus(color), static_cast<REAL>(std::max(1, Scale(1))) * 1.2f);
+    const REAL x = static_cast<REAL>(cx), y = static_cast<REAL>(cy), h = static_cast<REAL>(half);
+    graphics.DrawLine(&pen, x - h, y - h, x + h, y + h);
+    graphics.DrawLine(&pen, x + h, y - h, x - h, y + h);
+}
+
+void DrawPlus(HDC dc, int cx, int cy, int half, COLORREF color) {
+    Graphics graphics(dc);
+    graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+    Pen pen(ToGdiplus(color), static_cast<REAL>(std::max(1, Scale(1))) * 1.3f);
+    const REAL x = static_cast<REAL>(cx), y = static_cast<REAL>(cy), h = static_cast<REAL>(half);
+    graphics.DrawLine(&pen, x - h, y, x + h, y);
+    graphics.DrawLine(&pen, x, y - h, x, y + h);
+}
+
+void DrawHairline(HDC dc, int x1, int y1, int x2, int y2, COLORREF color) {
+    RECT line{std::min(x1, x2), std::min(y1, y2), std::max(x1, x2) + (x1 == x2 ? 1 : 0),
+        std::max(y1, y2) + (y1 == y2 ? 1 : 0)};
+    FillSolid(dc, line, color);
+}
+
+int TextWidth(HDC dc, const std::wstring& text) {
+    SIZE size{};
+    GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &size);
+    return size.cx;
+}
+
+void DrawLabel(HDC dc, const std::wstring& text, RECT rect, COLORREF color, UINT format = DT_LEFT) {
+    SetTextColor(dc, color);
+    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &rect,
+        format | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+}
+
+// Glyph-based icons for actions that are about text itself: "{ }" for JSON
+// formatting and "文A" for character encoding read better than pictograms.
+void DrawGlyphIcon(HDC dc, const RECT& cell, const wchar_t* text, const wchar_t* face, int pointSize,
+    int weight, COLORREF color) {
+    HFONT font = CreateFontW(-MulDiv(pointSize, static_cast<int>(g_app.dpi), 72), 0, 0, 0, weight,
+        FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+    HGDIOBJ previous = SelectObject(dc, font);
+    RECT box = cell;
+    SetTextColor(dc, color);
+    DrawTextW(dc, text, -1, &box, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, previous);
+    DeleteObject(font);
+}
+
+// Word wrap: two text lines, the second bending back with an arrow.
+void DrawWrapIcon(HDC dc, const RECT& cell, COLORREF color) {
+    Graphics graphics(dc);
+    graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+    const REAL unit = static_cast<REAL>(Scale(16)) / 16.0f;
+    const REAL ox = (cell.left + cell.right) / 2.0f - 8 * unit;
+    const REAL oy = (cell.top + cell.bottom) / 2.0f - 8 * unit;
+    Pen pen(ToGdiplus(color), 1.6f * unit);
+    pen.SetStartCap(LineCapRound);
+    pen.SetEndCap(LineCapRound);
+    pen.SetLineJoin(LineJoinRound);
+    const auto P = [&](REAL x, REAL y) { return PointF(ox + x * unit, oy + y * unit); };
+    graphics.DrawLine(&pen, P(2, 3.5f), P(14, 3.5f));
+    GraphicsPath hook;
+    hook.AddLine(P(2, 8), P(11, 8));
+    hook.AddBezier(P(11, 8), P(15, 8), P(15, 12.5f), P(11, 12.5f));
+    hook.AddLine(P(11, 12.5f), P(7.5f, 12.5f));
+    graphics.DrawPath(&pen, &hook);
+    graphics.DrawLine(&pen, P(7.5f, 12.5f), P(9.5f, 10.5f));
+    graphics.DrawLine(&pen, P(7.5f, 12.5f), P(9.5f, 14.5f));
+    graphics.DrawLine(&pen, P(2, 12.5f), P(4.5f, 12.5f));
+}
+
+// Tinted toolbar icon: the PNGs are white-on-transparent masks.
+void DrawToolIcon(HDC dc, int id, const RECT& cell, COLORREF color) {
+    if (id == kIdToolbarWrap) {
+        DrawWrapIcon(dc, cell, color);
+        return;
+    }
+    if (id == kIdToolbarFormat) {
+        DrawGlyphIcon(dc, cell, L"{}", L"Consolas", 10, FW_BOLD, color);
+        return;
+    }
+    if (id == kIdToolbarEncoding) {
+        DrawGlyphIcon(dc, cell, L"文A", g_app.uiFontFace.c_str(), 8, FW_SEMIBOLD, color);
+        return;
+    }
+    const int size = Scale(16);
+    const int x = (cell.left + cell.right - size) / 2;
+    const int y = (cell.top + cell.bottom - size) / 2;
+    Bitmap* image = ToolbarIconImage(id);
+    if (image == nullptr || g_app.gdiplusToken == 0) {
+        RECT box{x - Scale(2), y - Scale(2), x + size + Scale(2), y + size + Scale(2)};
+        DrawToolbarIcon(dc, box, id, color);
+        return;
+    }
+    Graphics graphics(dc);
+    graphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    graphics.SetPixelOffsetMode(PixelOffsetModeHalf);
+    ImageAttributes attributes;
+    const ColorMatrix matrix = {
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 1, 0,
+        GetRValue(color) / 255.0f, GetGValue(color) / 255.0f, GetBValue(color) / 255.0f, 0, 1
+    };
+    attributes.SetColorMatrix(&matrix, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
+    graphics.DrawImage(image, Rect(x, y, size, size), 0, 0,
+        static_cast<INT>(image->GetWidth()), static_cast<INT>(image->GetHeight()), UnitPixel, &attributes);
+}
+
+void TrackLeave(HWND window) {
+    TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
+    TrackMouseEvent(&track);
+}
+
+RECT ToScreen(HWND window, RECT rect) {
+    MapWindowPoints(window, nullptr, reinterpret_cast<POINT*>(&rect), 2);
+    return rect;
+}
+
+HWND CreateTooltip(HWND owner) {
+    HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT,
+        CW_USEDEFAULT, CW_USEDEFAULT, owner, nullptr, g_app.instance, nullptr);
+    if (tip) {
+        SendMessageW(tip, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), FALSE);
+        SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, Scale(480));
+        SetWindowTheme(tip, g_app.darkTheme ? L"DarkMode_Explorer" : nullptr, nullptr);
+    }
+    return tip;
+}
+
+// Popup menus (context menus, the menu bar's drop-downs) follow the theme via
+// uxtheme's app-wide preferred mode (ordinals 135/136, Windows 10 1903+). This
+// API is not documented; when it is missing, menus simply stay light.
+void ApplyMenuColorMode() {
+    using SetPreferredAppModeFn = int(WINAPI*)(int);
+    using FlushMenuThemesFn = void(WINAPI*)();
+    static SetPreferredAppModeFn setMode = nullptr;
+    static FlushMenuThemesFn flush = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+        OSVERSIONINFOW version{sizeof(version)};
+        if (auto getVersion = reinterpret_cast<RtlGetVersionFn>(
+                GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"))) {
+            getVersion(&version);
+        }
+        if (version.dwMajorVersion >= 10 && version.dwBuildNumber >= 18362) {
+            if (HMODULE uxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+                setMode = reinterpret_cast<SetPreferredAppModeFn>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(135)));
+                flush = reinterpret_cast<FlushMenuThemesFn>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(136)));
+            }
+        }
+    }
+    if (setMode && flush) {
+        setMode(g_app.darkTheme ? 2 /* ForceDark */ : 3 /* ForceLight */);
+        flush();
+    }
+}
+
+// ---- Menu bar ---------------------------------------------------------------
+
+struct MenuBarItem {
+    std::wstring text;
+    wchar_t mnemonic = 0;
+    RECT rect{};
+};
+
+std::vector<MenuBarItem> g_menuItems;
+int g_menuHot = -1;
+int g_menuOpen = -1;
+int g_menuSwitchTo = -1;
+bool g_menuSelectionHasPopup = false;
+HHOOK g_menuHook = nullptr;
+POINT g_menuCursorAtOpen{};
+
+void BuildMenuBarItems() {
+    g_menuItems.clear();
+    const int count = GetMenuItemCount(g_app.mainMenu);
+    for (int index = 0; index < count; ++index) {
+        wchar_t buffer[64]{};
+        GetMenuStringW(g_app.mainMenu, index, buffer, static_cast<int>(std::size(buffer)), MF_BYPOSITION);
+        MenuBarItem item;
+        std::wstring label = buffer;
+        // "文件(F)" -> label "文件", Alt+F opens it.
+        const size_t open = label.find(L'(');
+        if (open != std::wstring::npos && open + 1 < label.size()) {
+            item.mnemonic = static_cast<wchar_t>(towupper(label[open + 1]));
+            label.resize(open);
+        }
+        item.text = label;
+        g_menuItems.push_back(std::move(item));
+    }
+}
+
+void LayoutMenuBarItems(HWND bar) {
+    HDC dc = GetDC(bar);
+    HGDIOBJ previous = SelectObject(dc, g_app.uiFont);
+    int x = Scale(4);
+    RECT client{};
+    GetClientRect(bar, &client);
+    for (MenuBarItem& item : g_menuItems) {
+        const int width = TextWidth(dc, item.text) + Scale(20);
+        item.rect = RECT{x, Scale(3), x + width, client.bottom - Scale(3)};
+        x += width;
+    }
+    SelectObject(dc, previous);
+    ReleaseDC(bar, dc);
+}
+
+int MenuBarHitTest(POINT point) {
+    for (size_t index = 0; index < g_menuItems.size(); ++index) {
+        if (PtInRect(&g_menuItems[index].rect, point)) return static_cast<int>(index);
+    }
+    return -1;
+}
+
+// While a drop-down is open, hovering another title or pressing Left/Right
+// moves to the neighbouring menu, like a native menu bar.
+LRESULT CALLBACK MenuBarHook(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == MSGF_MENU && g_app.menuBar) {
+        const MSG* message = reinterpret_cast<const MSG*>(lParam);
+        const int count = static_cast<int>(g_menuItems.size());
+        if (message->message == WM_MOUSEMOVE) {
+            // Windows sends a synthetic move when a menu opens; only a real
+            // move of the pointer may switch menus (keyboard users would
+            // otherwise land on whatever title the idle pointer rests over).
+            POINT point{};
+            GetCursorPos(&point);
+            if (point.x == g_menuCursorAtOpen.x && point.y == g_menuCursorAtOpen.y) {
+                return CallNextHookEx(g_menuHook, code, wParam, lParam);
+            }
+            g_menuCursorAtOpen = point;
+            ScreenToClient(g_app.menuBar, &point);
+            const int hit = MenuBarHitTest(point);
+            if (hit >= 0 && hit != g_menuOpen) {
+                g_menuSwitchTo = hit;
+                EndMenu();
+            }
+        } else if (message->message == WM_KEYDOWN && count > 0) {
+            if (message->wParam == VK_LEFT) {
+                g_menuSwitchTo = (g_menuOpen + count - 1) % count;
+                EndMenu();
+                return TRUE;
+            }
+            if (message->wParam == VK_RIGHT && !g_menuSelectionHasPopup) {
+                g_menuSwitchTo = (g_menuOpen + 1) % count;
+                EndMenu();
+                return TRUE;
+            }
+        }
+    }
+    return CallNextHookEx(g_menuHook, code, wParam, lParam);
+}
+
+void OpenMenuBarItem(int index) {
+    if (!g_app.menuBar || index < 0 || index >= static_cast<int>(g_menuItems.size())) return;
+    SetMenuState();
+    int command = 0;
+    while (index >= 0) {
+        g_menuOpen = index;
+        g_menuSwitchTo = -1;
+        g_menuSelectionHasPopup = false;
+        InvalidateRect(g_app.menuBar, nullptr, FALSE);
+        UpdateWindow(g_app.menuBar);
+        const RECT anchor = ToScreen(g_app.menuBar, g_menuItems[static_cast<size_t>(index)].rect);
+        TPMPARAMS params{sizeof(params), anchor};
+        GetCursorPos(&g_menuCursorAtOpen);
+        g_menuHook = SetWindowsHookExW(WH_MSGFILTER, MenuBarHook, nullptr, GetCurrentThreadId());
+        command = TrackPopupMenuEx(GetSubMenu(g_app.mainMenu, index),
+            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_VERTICAL | TPM_RETURNCMD,
+            anchor.left, anchor.bottom, g_app.window, &params);
+        if (g_menuHook) UnhookWindowsHookEx(g_menuHook);
+        g_menuHook = nullptr;
+        index = command == 0 ? g_menuSwitchTo : -1;
+    }
+    g_menuOpen = -1;
+    g_menuHot = -1;
+    InvalidateRect(g_app.menuBar, nullptr, FALSE);
+    if (command != 0) SendMessageW(g_app.window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+}
+
+// Alt / Alt+letter / F10 arrive as SC_KEYMENU because the window has no
+// native menu bar. Returns true when handled.
+bool HandleMenuKey(LPARAM character) {
+    if (character == L' ') return false;  // Alt+Space: system menu
+    int index = -1;
+    if (character == 0) {
+        index = 0;
+    } else {
+        const wchar_t key = static_cast<wchar_t>(towupper(static_cast<wint_t>(character)));
+        for (size_t i = 0; i < g_menuItems.size(); ++i) {
+            if (g_menuItems[i].mnemonic == key) index = static_cast<int>(i);
+        }
+    }
+    if (index < 0) {
+        MessageBeep(0);
+        return true;
+    }
+    // Open after the key message finishes, so the menu loop starts cleanly.
+    PostMessageW(g_app.window, kMessageOpenMenuBar, static_cast<WPARAM>(index), 0);
+    return true;
+}
+
+LRESULT CALLBACK MenuBarProc(HWND bar, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        LayoutMenuBarItems(bar);
+        return 0;
+    case WM_PAINT: {
+        BufferedPaint paint(bar);
+        const ThemePalette& palette = CurrentPalette();
+        FillSolid(paint.dc(), paint.client(), palette.toolbarBackground);
+        for (size_t index = 0; index < g_menuItems.size(); ++index) {
+            const MenuBarItem& item = g_menuItems[index];
+            const bool open = static_cast<int>(index) == g_menuOpen;
+            const bool hot = static_cast<int>(index) == g_menuHot;
+            if (open || hot) {
+                FillRounded(paint.dc(), item.rect, Scale(5),
+                    open ? palette.toolbarButtonPressed : palette.toolbarButtonBackground);
+            }
+            DrawLabel(paint.dc(), item.text, item.rect, palette.toolbarText, DT_CENTER);
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        const int hit = MenuBarHitTest(POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+        if (hit != g_menuHot) {
+            g_menuHot = hit;
+            InvalidateRect(bar, nullptr, FALSE);
+        }
+        TrackLeave(bar);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (g_menuHot != -1) {
+            g_menuHot = -1;
+            InvalidateRect(bar, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        const int hit = MenuBarHitTest(POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+        if (hit >= 0) OpenMenuBarItem(hit);
+        return 0;
+    }
+    default:
+        return DefWindowProcW(bar, message, wParam, lParam);
+    }
+}
+
+// ---- Toolbar ----------------------------------------------------------------
+
+struct ToolbarItem {
+    int id;
+    bool groupStart;
+    bool alignRight = false;
+    RECT rect{};
+};
+
+// Grouped by task; groups are separated by space rather than divider lines.
+std::vector<ToolbarItem> g_toolItems = {
+    {kIdToolbarNew, true}, {kIdToolbarOpen, false}, {kIdToolbarSave, false}, {kIdToolbarSaveAs, false},
+    {kIdToolbarUndo, true}, {kIdToolbarRedo, false},
+    {kIdToolbarFind, true}, {kIdToolbarReplace, false}, {kIdToolbarGoto, false},
+    {kIdToolbarFormat, true}, {kIdToolbarRun, false},
+    {kIdToolbarEncoding, true}, {kIdToolbarLineNumbers, false}, {kIdToolbarWrap, false},
+    {kIdToolbarTheme, true, true},
+};
+int g_toolHot = -1;
+int g_toolPressed = -1;
+HWND g_toolTip = nullptr;
+
+std::wstring ToolTipText(int id) {
+    switch (id) {
+    case kIdToolbarNew: return L"新建 (Ctrl+N)";
+    case kIdToolbarOpen: return L"打开 (Ctrl+O)";
+    case kIdToolbarSave: return L"保存 (Ctrl+S)";
+    case kIdToolbarSaveAs: return L"另存为 (Ctrl+Shift+S)";
+    case kIdToolbarUndo: return L"撤销 (Ctrl+Z)";
+    case kIdToolbarRedo: return L"重做 (Ctrl+Y)";
+    case kIdToolbarFind: return L"查找 (Ctrl+F)";
+    case kIdToolbarReplace: return L"替换 (Ctrl+H)";
+    case kIdToolbarGoto: return L"跳转到行 (Ctrl+G)";
+    case kIdToolbarFormat: return L"格式化 JSON (Ctrl+Shift+F)";
+    case kIdToolbarRun: return L"运行当前文件 (F5)";
+    case kIdToolbarEncoding: return L"编码和换行符";
+    case kIdToolbarLineNumbers: return L"显示行号";
+    case kIdToolbarWrap: return L"自动换行";
+    case kIdToolbarTheme: return L"切换主题";
+    default: return {};
+    }
+}
+
+bool ToolEnabled(int id) {
+    const TabDocument* document = ActiveDocument();
+    if (!document) return id == kIdToolbarNew || id == kIdToolbarOpen || id == kIdToolbarTheme;
+    if (id == kIdToolbarUndo) return SendMessageW(document->editor, EM_CANUNDO, 0, 0) != 0;
+    if (id == kIdToolbarRedo) return SendMessageW(document->editor, EM_CANREDO, 0, 0) != 0;
+    return true;
+}
+
+bool ToolChecked(int id) {
+    if (id == kIdToolbarLineNumbers) return g_app.showLineNumbers;
+    if (id == kIdToolbarWrap) return g_app.wordWrap;
+    return false;
+}
+
+void LayoutToolbarItems(HWND bar) {
+    RECT client{};
+    GetClientRect(bar, &client);
+    const int width = Scale(kToolButtonWidth);
+    const int height = Scale(kToolButtonHeight);
+    const int top = (client.bottom - height) / 2;
+    int x = Scale(6);
+    int right = client.right - Scale(6);
+    for (size_t index = 0; index < g_toolItems.size(); ++index) {
+        ToolbarItem& item = g_toolItems[index];
+        if (item.alignRight) {
+            item.rect = RECT{right - width, top, right, top + height};
+            right -= width + Scale(2);
+        } else {
+            if (item.groupStart && index > 0) x += Scale(12);
+            item.rect = RECT{x, top, x + width, top + height};
+            x += width + Scale(2);
+        }
+        if (g_toolTip) {
+            TOOLINFOW tool{sizeof(tool)};
+            tool.hwnd = bar;
+            tool.uId = index;
+            tool.rect = item.rect;
+            SendMessageW(g_toolTip, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&tool));
+        }
+    }
+}
+
+int ToolbarHitTest(POINT point) {
+    for (size_t index = 0; index < g_toolItems.size(); ++index) {
+        if (PtInRect(&g_toolItems[index].rect, point)) return static_cast<int>(index);
+    }
+    return -1;
+}
+
+RECT ToolbarItemScreenRect(int id) {
+    for (const ToolbarItem& item : g_toolItems) {
+        if (item.id == id) return ToScreen(g_app.toolbar, item.rect);
+    }
+    RECT fallback{};
+    GetWindowRect(g_app.toolbar, &fallback);
+    return fallback;
+}
+
+void InvalidateToolbar() {
+    if (g_app.toolbar) InvalidateRect(g_app.toolbar, nullptr, FALSE);
+}
+
+LRESULT CALLBACK ToolbarProc(HWND bar, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        g_toolTip = CreateTooltip(bar);
+        for (size_t index = 0; index < g_toolItems.size(); ++index) {
+            std::wstring text = ToolTipText(g_toolItems[index].id);
+            TOOLINFOW tool{sizeof(tool)};
+            tool.uFlags = TTF_SUBCLASS;
+            tool.hwnd = bar;
+            tool.uId = index;
+            tool.lpszText = text.data();
+            SendMessageW(g_toolTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+        }
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        LayoutToolbarItems(bar);
+        return 0;
+    case WM_PAINT: {
+        BufferedPaint paint(bar);
+        const ThemePalette& palette = CurrentPalette();
+        FillSolid(paint.dc(), paint.client(), palette.toolbarBackground);
+        for (size_t index = 0; index < g_toolItems.size(); ++index) {
+            const ToolbarItem& item = g_toolItems[index];
+            const bool enabled = ToolEnabled(item.id);
+            const bool checked = ToolChecked(item.id);
+            const bool hot = enabled && static_cast<int>(index) == g_toolHot;
+            const bool pressed = hot && static_cast<int>(index) == g_toolPressed;
+            if (pressed) FillRounded(paint.dc(), item.rect, Scale(5), palette.toolbarButtonPressed);
+            else if (hot) FillRounded(paint.dc(), item.rect, Scale(5), palette.toolbarButtonBackground);
+            else if (checked) FillRounded(paint.dc(), item.rect, Scale(5), palette.accentSoft);
+            const COLORREF color = !enabled ? palette.toolbarIconDisabled
+                : checked ? palette.accent : palette.toolbarIcon;
+            DrawToolIcon(paint.dc(), item.id, item.rect, color);
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        const int hit = ToolbarHitTest(POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+        if (hit != g_toolHot) {
+            g_toolHot = hit;
+            InvalidateRect(bar, nullptr, FALSE);
+        }
+        TrackLeave(bar);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_toolHot = -1;
+        InvalidateRect(bar, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        const int hit = ToolbarHitTest(POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+        if (hit >= 0 && ToolEnabled(g_toolItems[static_cast<size_t>(hit)].id)) {
+            g_toolPressed = hit;
+            SetCapture(bar);
+            InvalidateRect(bar, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        const int pressed = g_toolPressed;
+        g_toolPressed = -1;
+        if (GetCapture() == bar) ReleaseCapture();
+        InvalidateRect(bar, nullptr, FALSE);
+        const int hit = ToolbarHitTest(POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+        if (pressed >= 0 && hit == pressed) {
+            SendMessageW(g_app.window, WM_COMMAND, MAKEWPARAM(g_toolItems[static_cast<size_t>(hit)].id, 0), 0);
+        }
+        return 0;
+    }
+    default:
+        return DefWindowProcW(bar, message, wParam, lParam);
+    }
+}
+
+// ---- Tab strip ----------------------------------------------------------------
+
+constexpr int kTabPlus = -2;
+int g_tabHot = -1;
+bool g_tabCloseHot = false;
+int g_tabPressedClose = -1;
+int g_tabScroll = 0;
+HWND g_tabTip = nullptr;
+
+struct TabLayout {
+    std::vector<RECT> tabs;
+    RECT plus{};
+    int visibleRight = 0;  // tabs are clipped here when they overflow
+};
+
+TabLayout ComputeTabLayout() {
+    TabLayout layout;
+    if (!g_app.tabs) return layout;
+    RECT client{};
+    GetClientRect(g_app.tabs, &client);
+    HDC dc = GetDC(g_app.tabs);
+    HGDIOBJ previous = SelectObject(dc, g_app.uiFont);
+    std::vector<int> widths;
+    int total = 0;
+    for (const TabDocument& document : g_app.documents) {
+        const int width = std::clamp(TextWidth(dc, document.title) + Scale(14 + 30), Scale(96), Scale(240));
+        widths.push_back(width);
+        total += width;
+    }
+    SelectObject(dc, previous);
+    ReleaseDC(g_app.tabs, dc);
+
+    const int left = Scale(6);
+    const int plusWidth = Scale(30);
+    layout.visibleRight = client.right - plusWidth - Scale(8);
+    const int available = std::max(0, layout.visibleRight - left);
+    g_tabScroll = std::clamp(g_tabScroll, 0, std::max(0, total - available));
+    const int top = Scale(5);
+    int x = left - g_tabScroll;
+    for (const int width : widths) {
+        layout.tabs.push_back(RECT{x, top, x + width, client.bottom});
+        x += width;
+    }
+    // "+" follows the last tab; when tabs overflow it stays pinned on the right.
+    const int plusLeft = total <= available ? x + Scale(4) : layout.visibleRight + Scale(4);
+    const int plusTop = top + (client.bottom - top - plusWidth) / 2;
+    layout.plus = RECT{plusLeft, plusTop, plusLeft + plusWidth, plusTop + plusWidth};
+    if (total <= available) layout.visibleRight = client.right;
+    return layout;
+}
+
+RECT TabCloseRect(const RECT& tab) {
+    const int cy = (tab.top + tab.bottom) / 2;
+    return RECT{tab.right - Scale(28), cy - Scale(10), tab.right - Scale(8), cy + Scale(10)};
+}
+
+void EnsureTabVisible(int index) {
+    if (!g_app.tabs) return;
+    const TabLayout layout = ComputeTabLayout();
+    if (index < 0 || index >= static_cast<int>(layout.tabs.size())) return;
+    const RECT& tab = layout.tabs[static_cast<size_t>(index)];
+    if (tab.left < Scale(6)) g_tabScroll -= Scale(6) - tab.left;
+    else if (tab.right > layout.visibleRight) g_tabScroll += tab.right - layout.visibleRight;
+    InvalidateRect(g_app.tabs, nullptr, FALSE);
+}
+
+void InvalidateTabs() {
+    if (g_app.tabs) InvalidateRect(g_app.tabs, nullptr, FALSE);
+}
+
+// Returns a tab index, kTabPlus, or -1; sets onClose when over a close box.
+int TabHitTest(const TabLayout& layout, POINT point, bool* onClose) {
+    if (onClose) *onClose = false;
+    if (PtInRect(&layout.plus, point)) return kTabPlus;
+    if (point.x >= layout.visibleRight) return -1;
+    for (size_t index = 0; index < layout.tabs.size(); ++index) {
+        if (!PtInRect(&layout.tabs[index], point)) continue;
+        if (onClose) {
+            const RECT close = TabCloseRect(layout.tabs[index]);
+            *onClose = PtInRect(&close, point) != FALSE;
+        }
+        return static_cast<int>(index);
+    }
+    return -1;
+}
+
+bool CloseDocument(int index);
+
+void CopyTextToClipboard(const std::wstring& text) {
+    if (!OpenClipboard(g_app.window)) return;
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        memcpy(GlobalLock(memory), text.c_str(), bytes);
+        GlobalUnlock(memory);
+        if (!SetClipboardData(CF_UNICODETEXT, memory)) GlobalFree(memory);
+    }
+    CloseClipboard();
+}
+
+int IndexOfEditor(HWND editor) {
+    for (size_t index = 0; index < g_app.documents.size(); ++index) {
+        if (g_app.documents[index].editor == editor) return static_cast<int>(index);
+    }
+    return -1;
+}
+
+void ShowTabContextMenu(int index, POINT screen) {
+    if (index < 0 || index >= static_cast<int>(g_app.documents.size())) return;
+    const TabDocument& document = g_app.documents[static_cast<size_t>(index)];
+    const bool hasFile = !document.untitled && !document.path.empty();
+    const int last = static_cast<int>(g_app.documents.size()) - 1;
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, L"关闭\tCtrl+W");
+    AppendMenuW(menu, MF_STRING | (last == 0 ? MF_GRAYED : 0), 2, L"关闭其他标签");
+    AppendMenuW(menu, MF_STRING | (index == last ? MF_GRAYED : 0), 3, L"关闭右侧标签");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (hasFile ? 0 : MF_GRAYED), 4, L"复制文件路径");
+    AppendMenuW(menu, MF_STRING | (hasFile ? 0 : MF_GRAYED), 5, L"在资源管理器中显示");
+    const int command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, g_app.window, nullptr);
+    DestroyMenu(menu);
+
+    const HWND target = document.editor;
+    const std::wstring path = document.path;
+    switch (command) {
+    case 1:
+        CloseDocument(index);
+        break;
+    case 2:
+        // From the end, so earlier indices stay valid; stop if the user cancels.
+        for (int i = static_cast<int>(g_app.documents.size()) - 1; i >= 0; --i) {
+            if (i < static_cast<int>(g_app.documents.size()) && g_app.documents[static_cast<size_t>(i)].editor != target) {
+                if (!CloseDocument(i)) break;
+            }
+        }
+        break;
+    case 3:
+        while (IndexOfEditor(target) >= 0 && IndexOfEditor(target) < static_cast<int>(g_app.documents.size()) - 1) {
+            if (!CloseDocument(static_cast<int>(g_app.documents.size()) - 1)) break;
+        }
+        break;
+    case 4:
+        CopyTextToClipboard(path);
+        break;
+    case 5:
+        ShellExecuteW(g_app.window, L"open", L"explorer.exe", (L"/select,\"" + path + L"\"").c_str(),
+            nullptr, SW_SHOWNORMAL);
+        break;
+    default:
+        break;
+    }
+    SetMenuState();
+}
+
+LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        g_tabTip = CreateTooltip(strip);
+        TOOLINFOW tool{sizeof(tool)};
+        tool.uFlags = TTF_SUBCLASS;
+        tool.hwnd = strip;
+        tool.uId = 0;
+        tool.lpszText = LPSTR_TEXTCALLBACKW;
+        SendMessageW(g_tabTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        InvalidateRect(strip, nullptr, FALSE);
+        return 0;
+    case WM_PAINT: {
+        BufferedPaint paint(strip);
+        HDC dc = paint.dc();
+        const RECT& client = paint.client();
+        const ThemePalette& palette = CurrentPalette();
+        FillSolid(dc, client, palette.tabBarBackground);
+        const TabLayout layout = ComputeTabLayout();
+        const int bottom = client.bottom - 1;
+        int activeLeft = -1;
+        int activeRight = -1;
+
+        const int saved = SaveDC(dc);
+        IntersectClipRect(dc, 0, 0, layout.visibleRight, client.bottom);
+        for (size_t index = 0; index < layout.tabs.size(); ++index) {
+            const TabDocument& document = g_app.documents[index];
+            const RECT& tab = layout.tabs[index];
+            const bool active = static_cast<int>(index) == g_app.activeIndex;
+            const bool hot = static_cast<int>(index) == g_tabHot;
+            if (active) {
+                FillRounded(dc, tab, Scale(7), palette.tabActiveBackground, true);
+                RECT accent{tab.left + Scale(7), tab.top, tab.right - Scale(7), tab.top + Scale(2)};
+                FillSolid(dc, accent, palette.accent);
+                activeLeft = tab.left;
+                activeRight = tab.right;
+            } else if (hot) {
+                RECT surface{tab.left + Scale(2), tab.top + Scale(2), tab.right - Scale(2), tab.bottom - Scale(4)};
+                FillRounded(dc, surface, Scale(6), palette.toolbarButtonBackground);
+            } else {
+                // Hairline between neighbouring idle tabs.
+                const bool nextIsQuiet = index + 1 < layout.tabs.size() &&
+                    static_cast<int>(index + 1) != g_app.activeIndex && static_cast<int>(index + 1) != g_tabHot;
+                if (nextIsQuiet) {
+                    DrawHairline(dc, tab.right - 1, tab.top + Scale(8), tab.right - 1, tab.bottom - Scale(9),
+                        palette.panelBorder);
+                }
+            }
+            RECT text{tab.left + Scale(14), tab.top, tab.right - Scale(30), tab.bottom - Scale(1)};
+            DrawLabel(dc, document.title, text, active ? palette.tabActiveText : palette.tabText);
+
+            // Close box on hover/active; otherwise an amber dot marks unsaved work.
+            const RECT close = TabCloseRect(tab);
+            const int cx = (close.left + close.right) / 2;
+            const int cy = (close.top + close.bottom) / 2;
+            if (hot && g_tabCloseHot) FillRounded(dc, close, Scale(4), palette.toolbarButtonPressed);
+            if (hot) {
+                DrawCross(dc, cx, cy, Scale(4), active ? palette.tabActiveText : palette.tabClose);
+            } else if (document.modified) {
+                FillDot(dc, cx, cy, Scale(4), palette.attention);
+            } else if (active) {
+                DrawCross(dc, cx, cy, Scale(4), palette.tabClose);
+            }
+        }
+        RestoreDC(dc, saved);
+
+        // Bottom hairline everywhere except under the active tab, so the active
+        // tab and the editor read as one sheet.
+        if (activeLeft >= 0) {
+            DrawHairline(dc, 0, bottom, std::max(0, activeLeft), bottom, palette.panelBorder);
+            DrawHairline(dc, std::min(activeRight, static_cast<int>(layout.visibleRight)), bottom,
+                client.right, bottom, palette.panelBorder);
+        } else {
+            DrawHairline(dc, 0, bottom, client.right, bottom, palette.panelBorder);
+        }
+
+        if (g_tabHot == kTabPlus) FillRounded(dc, layout.plus, Scale(5), palette.toolbarButtonBackground);
+        DrawPlus(dc, (layout.plus.left + layout.plus.right) / 2, (layout.plus.top + layout.plus.bottom) / 2,
+            Scale(6), palette.toolbarIcon);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        const TabLayout layout = ComputeTabLayout();
+        bool onClose = false;
+        const int hit = TabHitTest(layout, POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, &onClose);
+        if (hit != g_tabHot || onClose != g_tabCloseHot) {
+            if (hit != g_tabHot && g_tabTip) {
+                TOOLINFOW tool{sizeof(tool)};
+                tool.hwnd = strip;
+                tool.uId = 0;
+                tool.rect = hit >= 0 ? layout.tabs[static_cast<size_t>(hit)] : RECT{};
+                SendMessageW(g_tabTip, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&tool));
+            }
+            g_tabHot = hit;
+            g_tabCloseHot = onClose;
+            InvalidateRect(strip, nullptr, FALSE);
+        }
+        TrackLeave(strip);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_tabHot = -1;
+        g_tabCloseHot = false;
+        InvalidateRect(strip, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        bool onClose = false;
+        const int hit = TabHitTest(ComputeTabLayout(), POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, &onClose);
+        if (hit == kTabPlus) {
+            NewDocument();
+        } else if (hit >= 0 && onClose) {
+            g_tabPressedClose = hit;
+            SetCapture(strip);
+        } else if (hit >= 0) {
+            SelectTab(hit);
+        }
+        SetMenuState();
+        InvalidateRect(strip, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        const int pressed = g_tabPressedClose;
+        g_tabPressedClose = -1;
+        if (GetCapture() == strip) ReleaseCapture();
+        bool onClose = false;
+        const int hit = TabHitTest(ComputeTabLayout(), POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, &onClose);
+        if (pressed >= 0 && hit == pressed && onClose) {
+            CloseDocument(pressed);
+            SetMenuState();
+        }
+        return 0;
+    }
+    case WM_MBUTTONUP: {
+        const int hit = TabHitTest(ComputeTabLayout(), POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, nullptr);
+        if (hit >= 0) {
+            CloseDocument(hit);
+            SetMenuState();
+        }
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: {
+        const int hit = TabHitTest(ComputeTabLayout(), POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, nullptr);
+        if (hit == -1) NewDocument();  // double-click empty space: new tab
+        return 0;
+    }
+    case WM_RBUTTONUP: {
+        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const int hit = TabHitTest(ComputeTabLayout(), point, nullptr);
+        if (hit >= 0) {
+            POINT screen = point;
+            ClientToScreen(strip, &screen);
+            ShowTabContextMenu(hit, screen);
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        g_tabScroll -= GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA * Scale(80);
+        InvalidateRect(strip, nullptr, FALSE);
+        return 0;
+    }
+    case WM_NOTIFY: {
+        auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (header && header->code == TTN_GETDISPINFOW) {
+            auto* info = reinterpret_cast<NMTTDISPINFOW*>(lParam);
+            static std::wstring text;
+            text.clear();
+            if (g_tabHot >= 0 && g_tabHot < static_cast<int>(g_app.documents.size())) {
+                const TabDocument& document = g_app.documents[static_cast<size_t>(g_tabHot)];
+                text = document.untitled || document.path.empty() ? L"尚未保存到磁盘的新文件" : document.path;
+            }
+            info->lpszText = text.data();
+            return 0;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(strip, message, wParam, lParam);
+}
+
+// ---- Status bar -------------------------------------------------------------
+
+enum StatusField { kStatusEncoding = 0, kStatusLineEnding = 1, kStatusLanguage = 2, kStatusFieldCount = 3 };
+int g_statusHot = -1;
+RECT g_statusFields[kStatusFieldCount]{};
+
+// Real line/column and selection length of the active document.
+void CaretInfo(const TabDocument& document, int& line, int& column, int& selected) {
+    CHARRANGE selection{};
+    SendMessageW(document.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    selected = selection.cpMax - selection.cpMin;
+    TextDocumentRef tom(document.editor);
+    LONG lineStart = 0;
+    if (tom) {
+        line = static_cast<int>(tom.ParagraphIndex(selection.cpMax));
+        lineStart = tom.ParagraphStart(selection.cpMax);
+    } else {
+        const LRESULT lineIndex = SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, selection.cpMax);
+        lineStart = static_cast<LONG>(SendMessageW(document.editor, EM_LINEINDEX, lineIndex, 0));
+        line = static_cast<int>(lineIndex) + 1;
+    }
+    column = std::max(1, static_cast<int>(selection.cpMax - lineStart) + 1);
+}
+
+void ShowDocumentFieldMenu(int field, const RECT& anchor) {
+    const TabDocument* document = ActiveDocument();
+    if (!document) return;
+    HMENU menu = CreatePopupMenu();
+    if (field == kStatusEncoding) {
+        for (int i = 0; i < kEncodingCount; ++i) AppendMenuW(menu, MF_STRING, kIdEncodingFirst + i, kEncodingNames[i]);
+        CheckMenuRadioItem(menu, kIdEncodingFirst, kIdEncodingFirst + kEncodingCount - 1,
+            kIdEncodingFirst + document->encoding, MF_BYCOMMAND);
+    } else if (field == kStatusLineEnding) {
+        for (int i = 0; i < kLineEndingCount; ++i) AppendMenuW(menu, MF_STRING, kIdLineEndingFirst + i, kLineEndingMenuNames[i]);
+        CheckMenuRadioItem(menu, kIdLineEndingFirst, kIdLineEndingFirst + kLineEndingCount - 1,
+            kIdLineEndingFirst + document->lineEnding, MF_BYCOMMAND);
+    } else {
+        for (int i = 0; i < kLanguageCount; ++i) AppendMenuW(menu, MF_STRING, kIdLanguageFirst + i, kLanguageNames[i]);
+        CheckMenuRadioItem(menu, kIdLanguageFirst, kIdLanguageFirst + kLanguageCount - 1,
+            kIdLanguageFirst + document->language, MF_BYCOMMAND);
+    }
+    TPMPARAMS params{sizeof(params), anchor};
+    const int command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_VERTICAL,
+        anchor.left, anchor.top, g_app.window, &params);
+    DestroyMenu(menu);
+    if (command != 0) SendMessageW(g_app.window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+}
+
+LRESULT CALLBACK StatusBarProc(HWND bar, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        BufferedPaint paint(bar);
+        HDC dc = paint.dc();
+        const RECT& client = paint.client();
+        const ThemePalette& palette = CurrentPalette();
+        FillSolid(dc, client, palette.statusBackground);
+        DrawHairline(dc, 0, 0, client.right, 0, palette.panelBorder);
+        const TabDocument* document = ActiveDocument();
+        if (!document) return 0;
+
+        // Save state first: the app's promise is that nothing is lost.
+        int x = Scale(12);
+        const int cy = client.bottom / 2;
+        if (document->modified) {
+            FillDot(dc, x + Scale(4), cy, Scale(4), palette.attention);
+            x += Scale(14);
+            const std::wstring state = L"未保存";
+            DrawLabel(dc, state, RECT{x, 0, x + Scale(80), client.bottom}, palette.toolbarText);
+            x += TextWidth(dc, state);
+            if (!document->recoveryDirty) {
+                const std::wstring backup = L"  ·  已自动备份";
+                DrawLabel(dc, backup, RECT{x, 0, x + Scale(140), client.bottom}, palette.statusText);
+                x += TextWidth(dc, backup);
+            }
+        } else {
+            const std::wstring state = document->untitled ? L"新文件" : L"已保存";
+            DrawLabel(dc, state, RECT{x, 0, x + Scale(80), client.bottom}, palette.statusText);
+            x += TextWidth(dc, state);
+        }
+
+        int line = 1, column = 1, selected = 0;
+        CaretInfo(*document, line, column, selected);
+        wchar_t position[96]{};
+        if (selected > 0) swprintf_s(position, L"行 %d，列 %d    已选 %d 个字符", line, column, selected);
+        else swprintf_s(position, L"行 %d，列 %d", line, column);
+        x += Scale(28);
+        DrawLabel(dc, position, RECT{x, 0, x + Scale(320), client.bottom}, palette.statusText);
+
+        // Right side: clickable document properties.
+        const int language = EffectiveLanguage(*document);
+        const std::wstring fields[kStatusFieldCount] = {
+            kEncodingNames[std::clamp(document->encoding, 0, kEncodingCount - 1)],
+            kLineEndingNames[std::clamp(document->lineEnding, 0, kLineEndingCount - 1)],
+            language == kLanguagePlain ? std::wstring(L"纯文本") : std::wstring(kLanguageNames[language]),
+        };
+        int right = client.right - Scale(8);
+        for (int field = kStatusFieldCount - 1; field >= 0; --field) {
+            const int width = TextWidth(dc, fields[field]) + Scale(20);
+            g_statusFields[field] = RECT{right - width, Scale(3), right, client.bottom - Scale(3)};
+            if (field == g_statusHot) FillRounded(dc, g_statusFields[field], Scale(5), palette.toolbarButtonBackground);
+            DrawLabel(dc, fields[field], g_statusFields[field],
+                field == g_statusHot ? palette.toolbarText : palette.statusText, DT_CENTER);
+            right -= width + Scale(2);
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        int hit = -1;
+        for (int field = 0; field < kStatusFieldCount; ++field) {
+            if (PtInRect(&g_statusFields[field], point)) hit = field;
+        }
+        if (hit != g_statusHot) {
+            g_statusHot = hit;
+            InvalidateRect(bar, nullptr, FALSE);
+        }
+        TrackLeave(bar);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_statusHot = -1;
+        InvalidateRect(bar, nullptr, FALSE);
+        return 0;
+    case WM_SETCURSOR:
+        if (g_statusHot >= 0) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (g_statusHot >= 0) {
+            const int field = g_statusHot;
+            ShowDocumentFieldMenu(field, ToScreen(bar, g_statusFields[field]));
+        }
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(bar, message, wParam, lParam);
+}
+
+void RegisterChromeClasses() {
+    const struct { const wchar_t* name; WNDPROC proc; UINT style; } classes[] = {
+        {L"MCMenuBar", MenuBarProc, 0},
+        {L"MCToolbar", ToolbarProc, 0},
+        {L"MCTabStrip", TabStripProc, CS_DBLCLKS},
+        {L"MCStatusBar", StatusBarProc, 0},
+    };
+    for (const auto& entry : classes) {
+        WNDCLASSW klass{};
+        klass.style = entry.style;
+        klass.hInstance = g_app.instance;
+        klass.lpfnWndProc = entry.proc;
+        klass.lpszClassName = entry.name;
+        klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        RegisterClassW(&klass);
+    }
+}
+
+void CreateChrome(HWND window) {
+    RegisterChromeClasses();
+    BuildMenuBarItems();
+    const DWORD style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS;
+    g_app.menuBar = CreateWindowExW(0, L"MCMenuBar", nullptr, style, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
+    g_app.toolbar = CreateWindowExW(0, L"MCToolbar", nullptr, style, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
+    g_app.tabs = CreateWindowExW(0, L"MCTabStrip", nullptr, style, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
+    g_app.statusBar = CreateWindowExW(0, L"MCStatusBar", nullptr, style, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
+}
+
+void RefreshChrome() {
+    for (HWND window : {g_app.menuBar, g_app.toolbar, g_app.tabs, g_app.statusBar}) {
+        if (window) InvalidateRect(window, nullptr, FALSE);
+    }
+    for (HWND tip : {g_toolTip, g_tabTip}) {
+        if (tip) {
+            SetWindowTheme(tip, g_app.darkTheme ? L"DarkMode_Explorer" : nullptr, nullptr);
+            SendMessageW(tip, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), FALSE);
+        }
+    }
+    if (g_app.menuBar) LayoutMenuBarItems(g_app.menuBar);
+    if (g_app.toolbar) LayoutToolbarItems(g_app.toolbar);
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     if (g_app.findReplaceMessage != 0 && message == g_app.findReplaceMessage) {
         HandleFindReplaceMessage(lParam);
@@ -3482,7 +4415,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     switch (message) {
     case WM_CREATE: {
         g_app.window = window;
-        SetMenu(window, CreateApplicationMenu());
+        g_app.mainMenu = CreateApplicationMenu();
         g_app.dpi = GetDpiForWindow(window);
         CreateUiFonts();
         GdiplusStartupInput gdiplusInput;
@@ -3495,37 +4428,16 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         g_app.controlBrush = CreateSolidBrush(CurrentPalette().controlBackground);
         g_app.statusBrush = CreateSolidBrush(CurrentPalette().statusBackground);
 
-        CreateToolbarControls(window);
-        g_app.tabs = CreateWindowExW(0, WC_TABCONTROLW, nullptr,
-            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_TABS | TCS_SINGLELINE |
-                TCS_FOCUSNEVER | TCS_OWNERDRAWFIXED,
-            0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
-        TabCtrl_SetItemSize(g_app.tabs, Scale(184), Scale(kTabHeight - 6));
-        // Tabs size to their text; the padding makes room for the left margin
-        // and the close button that DrawTabItem paints.
-        TabCtrl_SetPadding(g_app.tabs, Scale(22), Scale(3));
-        SendMessageW(g_app.tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
-        g_app.oldTabProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-            g_app.tabs, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(TabProc)));
-
-        g_app.newTabButton = CreateWindowExW(0, L"BUTTON", L"＋",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-            0, 0, 0, 0, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdNewTabButton)),
-            g_app.instance, nullptr);
-        SendMessageW(g_app.newTabButton, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
-
+        CreateChrome(window);
         g_app.gutter = CreateWindowExW(0, L"MCGutter", nullptr,
             WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
-        g_app.statusBar = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr,
-            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
-        SendMessageW(g_app.statusBar, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
-        g_app.oldStatusProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-            g_app.statusBar, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(StatusProc)));
         g_app.sidebarVisible = false;
         LoadLibraryW(L"Msftedit.dll");
         LoadPersistedSession();
         g_app.darkTheme = g_app.theme == ThemeKind::Dark || g_app.theme == ThemeKind::Blue;
         ApplyWindowFrameTheme(window);
+        ApplyMenuColorMode();
+        RefreshChrome();
         LayoutChildren(window);
         SetMenuState();
         SetTimer(window, kTimerAutosave, 2000, nullptr);
@@ -3566,6 +4478,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     if (!wasModified) UpdateTabTitle(static_cast<int>(index));
                     UpdateStatusBar();
                     if (g_app.showLineNumbers && GutterWidthFor(source) != g_app.gutterWidth) LayoutChildren(window);
+                    UpdateHorizontalScrollbar(source);
                     RefreshGutter();
                     const int language = EffectiveLanguage(g_app.documents[index]);
                     if (language != kLanguagePlain && language != kLanguageMarkdown) {
@@ -3614,7 +4527,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToolbarFormat: FormatActiveDocument(); break;
         case kIdToolbarRun: RunActiveDocument(); break;
         case kIdToolbarEncoding:
-            ShowEncodingMenu(source ? source : g_app.toolbar);
+            ShowEncodingMenu(ToolbarItemScreenRect(kIdToolbarEncoding));
             break;
         case kIdToolbarLineNumbers:
             g_app.showLineNumbers = !g_app.showLineNumbers;
@@ -3628,7 +4541,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             LayoutChildren(window);
             break;
         case kIdToolbarTheme:
-            ShowThemeMenu(source ? source : g_app.toolbar);
+            ShowThemeMenu(ToolbarItemScreenRect(kIdToolbarTheme));
             break;
         case kIdToolbarSettings:
             OpenSettingsDialog();
@@ -3673,9 +4586,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_DRAWITEM: {
         const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
         if (item != nullptr) {
-            if (item->CtlType == ODT_TAB) DrawTabItem(*item);
-            else if (item->CtlType == ODT_COMBOBOX) DrawComboItem(*item);
-            else DrawToolbarItem(*item);
+            if (item->CtlType == ODT_COMBOBOX) DrawComboItem(*item);
         }
         return TRUE;
     }
@@ -3727,10 +4638,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             UpdateStatusBar();
             RefreshGutter();  // current-line number follows the caret
             return 0;
-        }
-        if (header != nullptr && header->hwndFrom == g_app.tabs && header->code == TCN_SELCHANGE) {
-            SelectTab(TabCtrl_GetCurSel(g_app.tabs));
-            SetMenuState();
         }
         return 0;
     }
@@ -3787,11 +4694,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         // then take the size Windows suggests for the new DPI.
         g_app.dpi = HIWORD(wParam);
         CreateUiFonts();
-        if (g_app.tabs) {
-            TabCtrl_SetItemSize(g_app.tabs, Scale(184), Scale(kTabHeight - 6));
-            TabCtrl_SetPadding(g_app.tabs, Scale(22), Scale(3));
-        }
         ApplyEditorFont();
+        RefreshChrome();
         const auto* suggested = reinterpret_cast<const RECT*>(lParam);
         SetWindowPos(window, nullptr, suggested->left, suggested->top,
             suggested->right - suggested->left, suggested->bottom - suggested->top,
@@ -3800,6 +4704,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         InvalidateRect(window, nullptr, TRUE);
         return 0;
     }
+    case WM_SYSCOMMAND:
+        // No native menu bar: route Alt / Alt+letter / F10 to the custom one.
+        if ((wParam & 0xFFF0) == SC_KEYMENU && HandleMenuKey(lParam)) return 0;
+        return DefWindowProcW(window, message, wParam, lParam);
+    case kMessageOpenMenuBar:
+        OpenMenuBarItem(static_cast<int>(wParam));
+        return 0;
+    case WM_MENUSELECT:
+        // Lets Right-arrow open a submenu instead of jumping to the next menu.
+        g_menuSelectionHasPopup = (HIWORD(wParam) & MF_POPUP) != 0 && HIWORD(wParam) != 0xFFFF;
+        return 0;
     case WM_QUERYENDSESSION:
         // Windows is shutting down / restarting / logging off. WM_CLOSE will not
         // arrive, so flush every snapshot now without blocking on prompts.
