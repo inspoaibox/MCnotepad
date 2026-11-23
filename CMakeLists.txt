@@ -11,7 +11,7 @@ add_executable(MCnotepad WIN32
 )
 
 target_compile_definitions(MCnotepad PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(MCnotepad PRIVATE comctl32 comdlg32 shlwapi advapi32)
+target_link_libraries(MCnotepad PRIVATE comctl32 comdlg32 shlwapi advapi32 dwmapi uxtheme)
 
 target_include_directories(MCnotepad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 

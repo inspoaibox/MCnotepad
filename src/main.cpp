@@ -1,12 +1,18 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <dlgs.h>
 #include <richedit.h>
+#include <ole2.h>
+#include <richole.h>
+#include <tom.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>
 #include <winreg.h>
 #include <gdiplus.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
 
 #include <algorithm>
 #include <cmath>
@@ -31,6 +37,8 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "uxtheme.lib")
 #pragma comment(linker, "\"/manifestdependency:type=\'win32\' name=\'Microsoft.Windows.Common-Controls\' version=\'6.0.0.0\' processorArchitecture=\'*\' publicKeyToken=\'6595b64144ccf1df\' language=\'*\'\"")
 
 namespace fs = std::filesystem;
@@ -67,6 +75,8 @@ constexpr int kIdEditCopy = 1104;
 constexpr int kIdEditPaste = 1105;
 constexpr int kIdEditSelectAll = 1106;
 constexpr int kIdHelpAbout = 1201;
+constexpr int kIdFindNext = 1206;
+constexpr int kIdFindPrevious = 1207;
 constexpr int kIdNewTabButton = 1301;
 constexpr int kIdToolbarNew = 1401;
 constexpr int kIdToolbarOpen = 1402;
@@ -174,9 +184,13 @@ struct AppState {
     HWND findDialog = nullptr;
     FINDREPLACEW findReplace{};
     wchar_t findBuffer[256]{};
+    DWORD findFlags = FR_DOWN;
+    bool findDialogIsReplace = false;
     wchar_t replaceBuffer[256]{};
     std::vector<TabDocument> documents;
     std::vector<std::wstring> pendingOpenFiles;
+    UINT dpi = 96;
+    int gutterWidth = 42;
     RECT savedWindowRect{};
     bool savedWindowMaximized = false;
     bool hasSavedWindow = false;
@@ -207,6 +221,12 @@ struct AppState {
 };
 
 AppState g_app;
+
+// All layout constants are in 96-DPI pixels; scale them for the window's
+// current monitor (the process is per-monitor DPI aware).
+int Scale(int value) {
+    return MulDiv(value, static_cast<int>(g_app.dpi), 96);
+}
 
 
 // RichEdit controls normally handle the standard edit shortcuts themselves,
@@ -386,9 +406,20 @@ COLORREF ToolbarButtonBackground(bool pressed) {
 }
 COLORREF ToolbarTextColor() { return CurrentPalette().toolbarText; }
 
+// Dark title bar for dark themes (Windows 10 20H1+ / 11; ignored elsewhere).
+void ApplyWindowFrameTheme(HWND window) {
+    if (!window) return;
+    const BOOL dark = g_app.darkTheme ? TRUE : FALSE;
+    constexpr DWORD kUseImmersiveDarkMode = 20;  // DWMWA_USE_IMMERSIVE_DARK_MODE
+    if (SUCCEEDED(DwmSetWindowAttribute(window, kUseImmersiveDarkMode, &dark, sizeof(dark)))) {
+        RedrawWindow(window, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW);
+    }
+}
+
 void ApplyThemeToEditors(bool rehighlight = true) {
     const ThemePalette& palette = CurrentPalette();
-    g_app.darkTheme = g_app.theme != ThemeKind::Light;
+    // Green is a light theme; only Dark and Blue get dark window chrome.
+    g_app.darkTheme = g_app.theme == ThemeKind::Dark || g_app.theme == ThemeKind::Blue;
     DeleteObject(g_app.editorBrush);
     DeleteObject(g_app.toolbarBrush);
     DeleteObject(g_app.sidebarBrush);
@@ -416,6 +447,7 @@ void ApplyThemeToEditors(bool rehighlight = true) {
     }
     if (g_app.newTabButton) InvalidateRect(g_app.newTabButton, nullptr, TRUE);
     if (g_app.settingsThemeCombo) SendMessageW(g_app.settingsThemeCombo, CB_SETCURSEL, static_cast<int>(g_app.theme), 0);
+    for (HWND window : {g_app.window, g_app.settingsWindow, g_app.gotoWindow}) ApplyWindowFrameTheme(window);
     if (g_app.window) {
         InvalidateRect(g_app.window, nullptr, TRUE);
         g_app.stateDirty = true;
@@ -509,6 +541,8 @@ private:
 void ApplyEditorTheme(HWND editor) {
     if (!editor) return;
     EditorEventMute mute(editor);
+    // Dark scrollbars in dark themes (system theme class on Windows 10 1809+).
+    SetWindowTheme(editor, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
     const COLORREF background = EditorBackground();
     const COLORREF foreground = EditorForeground();
     SendMessageW(editor, EM_SETBKGNDCOLOR, 0, background);
@@ -527,6 +561,59 @@ void ApplyEditorTheme(HWND editor) {
 void RefreshGutter() {
     if (g_app.gutter) InvalidateRect(g_app.gutter, nullptr, TRUE);
 }
+
+// Text Object Model access for colouring without moving the selection and
+// without creating undo entries. Released automatically.
+class TextDocumentRef {
+public:
+    explicit TextDocumentRef(HWND editor) {
+        IRichEditOle* ole = nullptr;
+        SendMessageW(editor, EM_GETOLEINTERFACE, 0, reinterpret_cast<LPARAM>(&ole));
+        if (ole) {
+            ole->QueryInterface(__uuidof(ITextDocument), reinterpret_cast<void**>(&document_));
+            ole->Release();
+        }
+        if (document_) document_->Range(0, 0, &range_);
+    }
+    ~TextDocumentRef() {
+        if (range_) range_->Release();
+        if (document_) document_->Release();
+    }
+    TextDocumentRef(const TextDocumentRef&) = delete;
+    TextDocumentRef& operator=(const TextDocumentRef&) = delete;
+    explicit operator bool() const { return document_ != nullptr && range_ != nullptr; }
+    ITextDocument* document() const { return document_; }
+
+    // 1-based number of the real line (paragraph) containing the position.
+    long ParagraphIndex(LONG position) {
+        long index = 0;
+        if (range_ && SUCCEEDED(range_->SetRange(position, position))) range_->GetIndex(tomParagraph, &index);
+        return index;
+    }
+
+    // Character position where the real line containing `position` starts.
+    LONG ParagraphStart(LONG position) {
+        long start = 0;
+        if (range_ && SUCCEEDED(range_->SetRange(position, position)) &&
+            SUCCEEDED(range_->StartOf(tomParagraph, tomMove, nullptr))) {
+            range_->GetStart(&start);
+        }
+        return static_cast<LONG>(start);
+    }
+
+    void SetColor(LONG start, LONG end, COLORREF color) {
+        if (!range_ || FAILED(range_->SetRange(start, end))) return;
+        ITextFont* font = nullptr;
+        if (SUCCEEDED(range_->GetFont(&font)) && font) {
+            font->SetForeColor(static_cast<long>(color));
+            font->Release();
+        }
+    }
+
+private:
+    ITextDocument* document_ = nullptr;
+    ITextRange* range_ = nullptr;
+};
 
 void SetSelectionColor(HWND editor, LONG start, LONG end, COLORREF color) {
     CHARRANGE range{start, end};
@@ -564,16 +651,26 @@ void ApplySimpleSyntaxHighlight(HWND editor, int language) {
     const std::wstring text = GetEditorRawText(editor);
     if (text.empty()) return;
     EditorEventMute mute(editor);
-    SendMessageW(editor, WM_SETREDRAW, FALSE, 0);
+    TextDocumentRef tom(editor);
+    long freezeCount = 0;
+    if (tom) {
+        // Colour changes are not edits: keep them off the undo stack, and
+        // repaint once at the end instead of per token.
+        tom.document()->Undo(tomSuspend, nullptr);
+        tom.document()->Freeze(&freezeCount);
+    } else {
+        SendMessageW(editor, WM_SETREDRAW, FALSE, 0);
+    }
     CHARRANGE saved{};
     SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&saved));
     POINT scroll{};
     SendMessageW(editor, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
-    SetSelectionColor(editor, 0, -1, EditorForeground());
     const ThemePalette& palette = CurrentPalette();
     const auto color = [&](size_t start, size_t end, COLORREF value) {
-        SetSelectionColor(editor, static_cast<LONG>(start), static_cast<LONG>(end), value);
+        if (tom) tom.SetColor(static_cast<LONG>(start), static_cast<LONG>(end), value);
+        else SetSelectionColor(editor, static_cast<LONG>(start), static_cast<LONG>(end), value);
     };
+    color(0, text.size() + 1, EditorForeground());
     const auto lineEnd = [&](size_t from) {
         const size_t end = text.find_first_of(L"\r\n", from);
         return end == std::wstring::npos ? text.size() : end;
@@ -617,11 +714,24 @@ void ApplySimpleSyntaxHighlight(HWND editor, int language) {
         }
     }
 
+    if (tom) {
+        // The selection was never touched, so the caret (and the direction of
+        // a Shift-selection) stays exactly as the user left it.
+        tom.document()->Unfreeze(&freezeCount);
+        tom.document()->Undo(tomResume, nullptr);
+        return;
+    }
     SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&saved));
     SendMessageW(editor, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
     SendMessageW(editor, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(editor, nullptr, TRUE);
 }
+
+// Re-colouring after typing pauses. Very large documents are skipped to keep
+// typing responsive; they are still coloured when opened.
+constexpr UINT kTimerHighlight = 4102;
+constexpr UINT kHighlightDelayMs = 300;
+constexpr LONG kLiveHighlightLimit = 300000;
 
 void HighlightDocument(const TabDocument& document) {
     ApplySimpleSyntaxHighlight(document.editor, EffectiveLanguage(document));
@@ -672,6 +782,24 @@ LRESULT CALLBACK StatusProc(HWND status, UINT message, WPARAM wParam, LPARAM lPa
         : DefWindowProcW(status, message, wParam, lParam);
 }
 
+// Width needed for the active document's line numbers (at least 3 digits).
+int GutterWidthFor(HWND editor) {
+    const int lines = editor ? static_cast<int>(SendMessageW(editor, EM_GETLINECOUNT, 0, 0)) : 1;
+    int digits = 3;
+    for (int value = lines; value >= 1000; value /= 10) ++digits;
+    HDC dc = GetDC(g_app.window);
+    HFONT previous = static_cast<HFONT>(SelectObject(dc, g_app.editorFont ? g_app.editorFont
+        : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))));
+    SIZE digit{};
+    GetTextExtentPoint32W(dc, L"0", 1, &digit);
+    SelectObject(dc, previous);
+    ReleaseDC(g_app.window, dc);
+    return digits * digit.cx + Scale(20);
+}
+
+// Numbers are drawn where RichEdit actually places each visible line, so they
+// line up for any font size. With word wrap a long line spans several visual
+// rows; only its first row gets a number, and numbers count real lines.
 LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_ERASEBKGND:
@@ -685,21 +813,48 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         FillRect(dc, &client, brush);
         DeleteObject(brush);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, GutterForeground());
         HFONT font = g_app.editorFont ? g_app.editorFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         HFONT previous = static_cast<HFONT>(SelectObject(dc, font));
-        int first = 0;
+        TEXTMETRICW metrics{};
+        GetTextMetricsW(dc, &metrics);
+
+        HWND editor = nullptr;
         if (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size())) {
-            HWND editor = g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor;
-            first = static_cast<int>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+            editor = g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor;
         }
-        const int lineHeight = 20;
-        const int firstLine = std::max(0, first);
-        for (int row = 0; row * lineHeight < client.bottom + lineHeight; ++row) {
-            wchar_t number[32]{};
-            swprintf_s(number, L"%d", firstLine + row + 1);
-            RECT lineRect{0, row * lineHeight + 3, client.right - 10, row * lineHeight + lineHeight};
-            DrawTextW(dc, number, -1, &lineRect, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        if (editor) {
+            POINT origin{0, 0};
+            MapWindowPoints(editor, window, &origin, 1);  // editor client -> gutter coordinates
+            TextDocumentRef tom(editor);
+            const auto paragraphOf = [&](LONG position) -> long {
+                return tom ? tom.ParagraphIndex(position)
+                           : static_cast<long>(SendMessageW(editor, EM_EXLINEFROMCHAR, 0, position)) + 1;
+            };
+            CHARRANGE selection{};
+            SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+            const long caretParagraph = paragraphOf(selection.cpMax);
+            const int lineCount = static_cast<int>(SendMessageW(editor, EM_GETLINECOUNT, 0, 0));
+            const int firstVisual = static_cast<int>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+            const LONG firstChar = static_cast<LONG>(SendMessageW(editor, EM_LINEINDEX, firstVisual, 0));
+            long previousParagraph = firstChar > 0 ? paragraphOf(firstChar - 1) : 0;
+            const int right = client.right - Scale(8);
+            for (int visual = firstVisual; visual < lineCount; ++visual) {
+                const LRESULT start = SendMessageW(editor, EM_LINEINDEX, visual, 0);
+                if (start < 0) break;
+                POINTL position{};
+                SendMessageW(editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&position), start);
+                const int y = position.y + origin.y;
+                if (y > client.bottom) break;
+                const long paragraph = paragraphOf(static_cast<LONG>(start));
+                if (paragraph != previousParagraph) {
+                    wchar_t number[16]{};
+                    swprintf_s(number, L"%ld", paragraph);
+                    SetTextColor(dc, paragraph == caretParagraph ? CurrentPalette().tabActiveText : GutterForeground());
+                    RECT lineRect{0, y, right, y + metrics.tmHeight};
+                    DrawTextW(dc, number, -1, &lineRect, DT_RIGHT | DT_SINGLELINE | DT_TOP | DT_NOCLIP);
+                }
+                previousParagraph = paragraph;
+            }
         }
         SelectObject(dc, previous);
         EndPaint(window, &paint);
@@ -878,7 +1033,7 @@ void DrawToolbarItem(const DRAWITEMSTRUCT& item) {
             0.0f, 0.0f, 0.0f, 0.0f, 1.0f
         };
         attributes.SetColorMatrix(&colorMatrix, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
-        const int size = 18;
+        const int size = Scale(18);
         const int x = (item.rcItem.left + item.rcItem.right - size) / 2;
         const int y = (item.rcItem.top + item.rcItem.bottom - size) / 2;
         graphics.DrawImage(image, Rect(x, y, size, size), 0, 0,
@@ -916,17 +1071,17 @@ void DrawTabItem(const DRAWITEMSTRUCT& item) {
     HFONT font = g_app.uiFont ? g_app.uiFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     HFONT oldFont = static_cast<HFONT>(SelectObject(item.hDC, font));
     RECT textRect = rect;
-    textRect.left += 16;
-    textRect.right -= 24;
+    textRect.left += Scale(16);
+    textRect.right -= Scale(24);
     DrawTextW(item.hDC, title, -1, &textRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     HPEN pen = CreatePen(PS_SOLID, 1, active ? palette.tabClose : palette.gutterText);
     HPEN oldPen = static_cast<HPEN>(SelectObject(item.hDC, pen));
-    const int cx = rect.right - 12;
+    const int cx = rect.right - Scale(12);
     const int cy = (rect.top + rect.bottom) / 2;
-    MoveToEx(item.hDC, cx - kTabCloseIconHalf, cy - kTabCloseIconHalf, nullptr);
-    LineTo(item.hDC, cx + kTabCloseIconHalf, cy + kTabCloseIconHalf);
-    MoveToEx(item.hDC, cx + kTabCloseIconHalf, cy - kTabCloseIconHalf, nullptr);
-    LineTo(item.hDC, cx - kTabCloseIconHalf, cy + kTabCloseIconHalf);
+    MoveToEx(item.hDC, cx - Scale(kTabCloseIconHalf), cy - Scale(kTabCloseIconHalf), nullptr);
+    LineTo(item.hDC, cx + Scale(kTabCloseIconHalf), cy + Scale(kTabCloseIconHalf));
+    MoveToEx(item.hDC, cx + Scale(kTabCloseIconHalf), cy - Scale(kTabCloseIconHalf), nullptr);
+    LineTo(item.hDC, cx - Scale(kTabCloseIconHalf), cy + Scale(kTabCloseIconHalf));
     SelectObject(item.hDC, oldPen);
     DeleteObject(pen);
     SelectObject(item.hDC, oldFont);
@@ -1473,12 +1628,19 @@ void UpdateStatusBar() {
         DWORD caret = 0;
         SendMessageW(document.editor, EM_GETSEL,
             reinterpret_cast<WPARAM>(&anchor), reinterpret_cast<LPARAM>(&caret));
-        const int lineIndex = static_cast<int>(SendMessageW(
-            document.editor, EM_LINEFROMCHAR, static_cast<WPARAM>(caret), 0));
-        const int lineStart = static_cast<int>(SendMessageW(
-            document.editor, EM_LINEINDEX, static_cast<WPARAM>(lineIndex), 0));
-        line = lineIndex + 1;
-        column = std::max(1, static_cast<int>(caret) - lineStart + 1);
+        // Real line/column (paragraphs), not wrapped visual rows.
+        TextDocumentRef tom(document.editor);
+        LONG lineStart = 0;
+        if (tom) {
+            line = static_cast<int>(tom.ParagraphIndex(static_cast<LONG>(caret)));
+            lineStart = tom.ParagraphStart(static_cast<LONG>(caret));
+        } else {
+            const int lineIndex = static_cast<int>(SendMessageW(
+                document.editor, EM_LINEFROMCHAR, static_cast<WPARAM>(caret), 0));
+            lineStart = static_cast<LONG>(SendMessageW(document.editor, EM_LINEINDEX, lineIndex, 0));
+            line = lineIndex + 1;
+        }
+        column = std::max(1, static_cast<int>(caret) - static_cast<int>(lineStart) + 1);
         modified = document.modified;
         selected = static_cast<int>(anchor > caret ? anchor - caret : caret - anchor);
         encodingName = kEncodingNames[std::clamp(document.encoding, 0, kEncodingCount - 1)];
@@ -1494,7 +1656,7 @@ void UpdateStatusBar() {
 
     RECT client{};
     GetClientRect(g_app.window, &client);
-    int parts[] = { 90, 260, 380, client.right - 270, client.right - 170, -1 };
+    int parts[] = { Scale(90), Scale(260), Scale(380), client.right - Scale(270), client.right - Scale(170), -1 };
     SendMessageW(g_app.statusBar, SB_SETPARTS, 6, reinterpret_cast<LPARAM>(parts));
     wchar_t selection[64]{};
     swprintf_s(selection, L"选中 %d", selected);
@@ -1511,13 +1673,21 @@ void LayoutChildren(HWND window) {
     GetClientRect(window, &client);
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
-    const int tabY = kToolbarHeight;
-    const int contentY = tabY + kTabHeight;
-    const int contentHeight = std::max(0, height - contentY - kStatusHeight);
+    const int toolbarHeight = Scale(kToolbarHeight);
+    const int tabHeight = Scale(kTabHeight);
+    const int statusHeight = Scale(kStatusHeight);
+    const int newTabWidth = Scale(kNewTabButtonWidth);
+    const int tabY = toolbarHeight;
+    const int contentY = tabY + tabHeight;
+    const int contentHeight = std::max(0, height - contentY - statusHeight);
     const int editorWidth = width;
-    const int tabsWidth = std::max(0, width - kNewTabButtonWidth);
+    const int tabsWidth = std::max(0, width - newTabWidth);
+    HWND activeEditor = (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size()))
+        ? g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor : nullptr;
+    g_app.gutterWidth = GutterWidthFor(activeEditor);
+    const int gutterWidth = g_app.showLineNumbers ? g_app.gutterWidth : 0;
 
-    if (g_app.toolbar) MoveWindow(g_app.toolbar, 0, 0, width, kToolbarHeight, TRUE);
+    if (g_app.toolbar) MoveWindow(g_app.toolbar, 0, 0, width, toolbarHeight, TRUE);
     static constexpr int toolbarIds[] = {
         kIdToolbarNew, kIdToolbarOpen, kIdToolbarSave, kIdToolbarSaveAs, kIdToolbarClose,
         kIdToolbarUndo, kIdToolbarRedo, kIdToolbarFind, kIdToolbarReplace, kIdToolbarGoto,
@@ -1528,22 +1698,22 @@ void LayoutChildren(HWND window) {
     int toolbarX = 0;
     for (int index = 0; index < buttonCount; ++index) {
         const int id = toolbarIds[std::min(index, static_cast<int>(std::size(toolbarIds)) - 1)];
-        const int buttonWidth = ToolbarButtonWidth(id);
+        const int buttonWidth = Scale(ToolbarButtonWidth(id));
         MoveWindow(g_app.toolbarButtons[static_cast<size_t>(index)], toolbarX, 0,
-            buttonWidth, kToolbarHeight, TRUE);
+            buttonWidth, toolbarHeight, TRUE);
         toolbarX += buttonWidth;
     }
-    MoveWindow(g_app.tabs, 0, tabY, tabsWidth, kTabHeight, TRUE);
-    MoveWindow(g_app.newTabButton, tabsWidth, tabY, kNewTabButtonWidth, kTabHeight, TRUE);
+    MoveWindow(g_app.tabs, 0, tabY, tabsWidth, tabHeight, TRUE);
+    MoveWindow(g_app.newTabButton, tabsWidth, tabY, newTabWidth, tabHeight, TRUE);
     if (g_app.gutter) {
-        MoveWindow(g_app.gutter, 0, contentY, kGutterWidth, contentHeight, TRUE);
+        MoveWindow(g_app.gutter, 0, contentY, gutterWidth, contentHeight, TRUE);
         ShowWindow(g_app.gutter, g_app.showLineNumbers ? SW_SHOW : SW_HIDE);
     }
     for (TabDocument& document : g_app.documents) {
-        MoveWindow(document.editor, g_app.showLineNumbers ? kGutterWidth : 0, contentY,
-            std::max(0, editorWidth - (g_app.showLineNumbers ? kGutterWidth : 0)), contentHeight, TRUE);
+        MoveWindow(document.editor, gutterWidth, contentY,
+            std::max(0, editorWidth - gutterWidth), contentHeight, TRUE);
     }
-    MoveWindow(g_app.statusBar, 0, std::max(0, height - kStatusHeight), width, kStatusHeight, TRUE);
+    MoveWindow(g_app.statusBar, 0, std::max(0, height - statusHeight), width, statusHeight, TRUE);
     UpdateStatusBar();
     RefreshGutter();
 }
@@ -1586,6 +1756,7 @@ void SelectTab(int index) {
     SetFocus(document.editor);
     RestoreEditorState(document);
     TabCtrl_SetCurSel(g_app.tabs, index);
+    if (g_app.showLineNumbers && GutterWidthFor(document.editor) != g_app.gutterWidth) LayoutChildren(g_app.window);
     g_app.stateDirty = true;
     UpdateWindowTitle();
 }
@@ -1692,6 +1863,18 @@ void RemoveRunningMarker() {
 LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lParam) {
     const auto oldIt = g_editorProcs.find(editor);
     const WNDPROC oldProc = oldIt != g_editorProcs.end() ? oldIt->second : nullptr;
+
+    // This is a plain-text editor: every paste (menu, Ctrl+V, Shift+Insert)
+    // takes only the clipboard's Unicode text, never rich formatting or images.
+    if (message == WM_PASTE) {
+        SendMessageW(editor, EM_PASTESPECIAL, CF_UNICODETEXT, 0);
+        return 0;
+    }
+    if (message == WM_KEYDOWN && wParam == VK_INSERT && (GetKeyState(VK_SHIFT) & 0x8000) != 0 &&
+        (GetKeyState(VK_CONTROL) & 0x8000) == 0) {
+        SendMessageW(editor, WM_PASTE, 0, 0);
+        return 0;
+    }
 
     if (message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
         (GetKeyState(VK_MENU) & 0x8000) == 0) {
@@ -1845,7 +2028,7 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
         : AllocateSnapshotPath();
 
     document.editor = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
+        0,  // no 3D client edge: it drew a bright frame in dark themes
         L"RICHEDIT50W",
         nullptr,
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_LEFT | ES_MULTILINE |
@@ -1871,10 +2054,18 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
         reinterpret_cast<WPARAM>(g_app.editorFont != nullptr
             ? g_app.editorFont : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     ApplyEditorTheme(document.editor);
+    SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
+    // With an Asian keyboard layout active (e.g. a Chinese IME), RichEdit's
+    // auto-font / dual-font modes switch typed text to a proportional UI font.
+    // Keep the editor font; CJK characters still render through font fallback.
+    const LRESULT languageOptions = SendMessageW(document.editor, EM_GETLANGOPTIONS, 0, 0);
+    SendMessageW(document.editor, EM_SETLANGOPTIONS, 0,
+        languageOptions & ~static_cast<LRESULT>(IMF_AUTOFONT | IMF_DUALFONT | IMF_AUTOFONTSIZEADJUST));
     SetWindowTextW(document.editor, text.c_str());
     ApplyWordWrap(document.editor);
     const int language = EffectiveLanguage(document);
     if (language != kLanguagePlain && language != kLanguageMarkdown) HighlightDocument(document);
+    SendMessageW(document.editor, EM_EMPTYUNDOBUFFER, 0, 0);  // loading is not an undoable edit
     SendMessageW(document.editor, EM_SETMODIFY, modified ? TRUE : FALSE, 0);
     // Enable change/scroll notifications only after the initial text is in,
     // so loading a file does not mark it as modified.
@@ -2139,6 +2330,9 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(edit, MF_STRING, kIdEditSelectAll, L"全选\tCtrl+A");
 
     AppendMenuW(search, MF_STRING, kIdToolbarFind, L"查找\tCtrl+F");
+    AppendMenuW(search, MF_STRING, kIdFindNext, L"查找下一个\tF3");
+    AppendMenuW(search, MF_STRING, kIdFindPrevious, L"查找上一个\tShift+F3");
+    AppendMenuW(search, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(search, MF_STRING, kIdToolbarReplace, L"替换\tCtrl+H");
     AppendMenuW(search, MF_STRING, kIdToolbarGoto, L"跳转\tCtrl+G");
     AppendMenuW(view, MF_STRING, kIdToolbarLineNumbers, L"行号");
@@ -2381,34 +2575,138 @@ void OpenCommandLineFiles() {
     LocalFree(arguments);
 }
 
-void FindNextText(const wchar_t* needle) {
-    if (!needle || !*needle || g_app.activeIndex < 0 || g_app.activeIndex >= static_cast<int>(g_app.documents.size())) return;
-    HWND editor = g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor;
+HWND ActiveEditor() {
+    if (g_app.activeIndex < 0 || g_app.activeIndex >= static_cast<int>(g_app.documents.size())) return nullptr;
+    return g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor;
+}
+
+void ReportNotFound(const wchar_t* needle) {
+    const std::wstring message = L"找不到“" + std::wstring(needle) + L"”";
+    MessageBoxW(g_app.findDialog ? g_app.findDialog : g_app.window, message.c_str(), kWindowTitle, MB_ICONINFORMATION);
+}
+
+// Searches from the current selection in the given direction, wrapping around
+// the document once. Honors FR_MATCHCASE / FR_WHOLEWORD / FR_DOWN.
+bool FindNextText(const wchar_t* needle, DWORD flags, bool reportMissing = true) {
+    HWND editor = ActiveEditor();
+    if (!needle || !*needle || !editor) return false;
+    const WPARAM searchFlags = flags & (FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD);
+    const bool down = (flags & FR_DOWN) != 0;
     CHARRANGE selection{};
     SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-    const LONG length = GetWindowTextLengthW(editor);
+
     FINDTEXTEXW query{};
-    query.chrg.cpMin = selection.cpMax;
-    query.chrg.cpMax = length;
-    query.lpstrText = const_cast<wchar_t*>(needle);
-    LRESULT found = SendMessageW(editor, EM_FINDTEXTEXW, FR_DOWN, reinterpret_cast<LPARAM>(&query));
-    if (found < 0 && selection.cpMax > 0) {
-        query.chrg.cpMin = 0;
-        found = SendMessageW(editor, EM_FINDTEXTEXW, FR_DOWN, reinterpret_cast<LPARAM>(&query));
+    query.lpstrText = needle;
+    // Down: from the end of the selection to the end. Up: from the start of the
+    // selection back to the beginning (cpMax < cpMin means "search backwards").
+    query.chrg = down ? CHARRANGE{selection.cpMax, -1} : CHARRANGE{selection.cpMin, 0};
+    LRESULT found = SendMessageW(editor, EM_FINDTEXTEXW, searchFlags, reinterpret_cast<LPARAM>(&query));
+    if (found < 0) {
+        query.chrg = down ? CHARRANGE{0, -1} : CHARRANGE{-1, 0};
+        if (!down) {
+            GETTEXTLENGTHEX lengthQuery{GTL_NUMCHARS | GTL_PRECISE, 1200};
+            query.chrg.cpMin = static_cast<LONG>(SendMessageW(editor, EM_GETTEXTLENGTHEX,
+                reinterpret_cast<WPARAM>(&lengthQuery), 0));
+        }
+        found = SendMessageW(editor, EM_FINDTEXTEXW, searchFlags, reinterpret_cast<LPARAM>(&query));
     }
-    if (found >= 0) {
-        SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&query.chrgText));
-        SetFocus(editor);
+    if (found < 0) {
+        if (reportMissing) ReportNotFound(needle);
+        return false;
     }
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&query.chrgText));
+    SendMessageW(editor, EM_SCROLLCARET, 0, 0);
+    RefreshGutter();
+    return true;
+}
+
+bool SelectionMatches(HWND editor, const wchar_t* needle, DWORD flags) {
+    CHARRANGE selection{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const LONG length = selection.cpMax - selection.cpMin;
+    if (length <= 0 || length != static_cast<LONG>(wcslen(needle))) return false;
+    std::wstring selected(static_cast<size_t>(length) + 1, L'\0');
+    const LRESULT copied = SendMessageW(editor, EM_GETSELTEXT, 0, reinterpret_cast<LPARAM>(selected.data()));
+    selected.resize(static_cast<size_t>(std::max<LRESULT>(0, copied)));
+    return CompareStringOrdinal(selected.c_str(), static_cast<int>(selected.size()),
+        needle, -1, (flags & FR_MATCHCASE) ? FALSE : TRUE) == CSTR_EQUAL;
+}
+
+// Builds the replaced text in memory and applies it as one edit, so a single
+// Ctrl+Z undoes the whole "replace all" and large files stay fast.
+int ReplaceAllText(const wchar_t* needle, const wchar_t* replacement, DWORD flags) {
+    HWND editor = ActiveEditor();
+    if (!needle || !*needle || !editor) return 0;
+    const std::wstring text = GetEditorRawText(editor);
+    const WPARAM searchFlags = FR_DOWN | (flags & (FR_MATCHCASE | FR_WHOLEWORD));
+    std::vector<CHARRANGE> matches;
+    FINDTEXTEXW query{};
+    query.lpstrText = needle;
+    query.chrg = CHARRANGE{0, -1};
+    while (SendMessageW(editor, EM_FINDTEXTEXW, searchFlags, reinterpret_cast<LPARAM>(&query)) >= 0) {
+        if (query.chrgText.cpMax <= query.chrgText.cpMin) break;
+        matches.push_back(query.chrgText);
+        query.chrg.cpMin = query.chrgText.cpMax;
+    }
+    if (matches.empty()) return 0;
+
+    std::wstring result;
+    result.reserve(text.size());
+    size_t cursor = 0;
+    for (const CHARRANGE& match : matches) {
+        const size_t start = std::min(static_cast<size_t>(match.cpMin), text.size());
+        const size_t end = std::min(static_cast<size_t>(match.cpMax), text.size());
+        result.append(text, cursor, start - cursor);
+        result += replacement;
+        cursor = end;
+    }
+    result.append(text, cursor, std::wstring::npos);
+
+    POINT scroll{};
+    SendMessageW(editor, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    SendMessageW(editor, EM_SETSEL, 0, -1);
+    SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(result.c_str()));
+    SendMessageW(editor, EM_SETSEL, 0, 0);
+    SendMessageW(editor, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    RefreshGutter();
+    return static_cast<int>(matches.size());
 }
 
 void OpenFindDialog(bool replace) {
+    // Seed the search box with a short single-line selection, like Notepad.
+    if (HWND editor = ActiveEditor()) {
+        CHARRANGE selection{};
+        SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+        const LONG length = selection.cpMax - selection.cpMin;
+        if (length > 0 && length < static_cast<LONG>(std::size(g_app.findBuffer))) {
+            std::wstring selected(static_cast<size_t>(length) + 1, L'\0');
+            const LRESULT copied = SendMessageW(editor, EM_GETSELTEXT, 0, reinterpret_cast<LPARAM>(selected.data()));
+            selected.resize(static_cast<size_t>(std::max<LRESULT>(0, copied)));
+            if (!selected.empty() && selected.find_first_of(L"\r\n") == std::wstring::npos) {
+                wcsncpy_s(g_app.findBuffer, selected.c_str(), _TRUNCATE);
+            }
+        }
+    }
+
+    // Reuse an open dialog of the same kind; switch kinds by recreating it.
+    if (g_app.findDialog) {
+        if (g_app.findDialogIsReplace == replace) {
+            SetDlgItemTextW(g_app.findDialog, edt1, g_app.findBuffer);
+            SetForegroundWindow(g_app.findDialog);
+            SetFocus(GetDlgItem(g_app.findDialog, edt1));
+            return;
+        }
+        DestroyWindow(g_app.findDialog);
+        g_app.findDialog = nullptr;
+    }
+
     ZeroMemory(&g_app.findReplace, sizeof(g_app.findReplace));
     g_app.findReplace.lStructSize = sizeof(g_app.findReplace);
     g_app.findReplace.hwndOwner = g_app.window;
     g_app.findReplace.lpstrFindWhat = g_app.findBuffer;
     g_app.findReplace.wFindWhatLen = static_cast<WORD>(std::size(g_app.findBuffer));
-    g_app.findReplace.Flags = FR_DOWN;
+    g_app.findReplace.Flags = g_app.findFlags;
+    g_app.findDialogIsReplace = replace;
     if (replace) {
         g_app.findReplace.lpstrReplaceWith = g_app.replaceBuffer;
         g_app.findReplace.wReplaceWithLen = static_cast<WORD>(std::size(g_app.replaceBuffer));
@@ -2418,6 +2716,17 @@ void OpenFindDialog(bool replace) {
     }
 }
 
+// F3 / Shift+F3: repeat the last search without the dialog.
+void FindAgain(bool forward) {
+    if (g_app.findBuffer[0] == L'\0') {
+        OpenFindDialog(false);
+        return;
+    }
+    DWORD flags = g_app.findFlags & (FR_MATCHCASE | FR_WHOLEWORD);
+    if (forward) flags |= FR_DOWN;
+    FindNextText(g_app.findBuffer, flags);
+}
+
 void HandleFindReplaceMessage(LPARAM lParam) {
     auto* data = reinterpret_cast<FINDREPLACEW*>(lParam);
     if (!data) return;
@@ -2425,37 +2734,25 @@ void HandleFindReplaceMessage(LPARAM lParam) {
         g_app.findDialog = nullptr;
         return;
     }
+    g_app.findFlags = data->Flags & (FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD);
     if (data->Flags & FR_FINDNEXT) {
-        FindNextText(data->lpstrFindWhat);
+        FindNextText(data->lpstrFindWhat, data->Flags);
     }
     if (data->Flags & FR_REPLACE) {
-        if (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size())) {
-            HWND editor = g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor;
-            CHARRANGE selection{};
-            SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+        // Replace only if the selection really is a match; otherwise the first
+        // press just finds the next match (same as Notepad).
+        HWND editor = ActiveEditor();
+        if (editor && SelectionMatches(editor, data->lpstrFindWhat, data->Flags)) {
             SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(data->lpstrReplaceWith));
-            FindNextText(data->lpstrFindWhat);
         }
+        FindNextText(data->lpstrFindWhat, data->Flags | FR_DOWN);
     }
     if (data->Flags & FR_REPLACEALL) {
-        if (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size())) {
-            HWND editor = g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor;
-            SendMessageW(editor, EM_SETSEL, 0, 0);
-            int count = 0;
-            while (count < 100000) {
-                CHARRANGE selection{};
-                SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-                FINDTEXTEXW query{};
-                query.chrg.cpMin = selection.cpMin;
-                query.chrg.cpMax = GetWindowTextLengthW(editor);
-                query.lpstrText = data->lpstrFindWhat;
-                const LRESULT found = SendMessageW(editor, EM_FINDTEXTEXW, FR_DOWN, reinterpret_cast<LPARAM>(&query));
-                if (found < 0) break;
-                SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&query.chrgText));
-                SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(data->lpstrReplaceWith));
-                ++count;
-            }
-        }
+        const int count = ReplaceAllText(data->lpstrFindWhat, data->lpstrReplaceWith, data->Flags);
+        const std::wstring message = count > 0
+            ? L"已替换 " + std::to_wstring(count) + L" 处。"
+            : L"找不到“" + std::wstring(data->lpstrFindWhat) + L"”";
+        MessageBoxW(g_app.findDialog ? g_app.findDialog : g_app.window, message.c_str(), kWindowTitle, MB_ICONINFORMATION);
     }
 }
 
@@ -2477,7 +2774,9 @@ HACCEL CreateAccelerators() {
         { FCONTROL | FVIRTKEY, 'G', kIdToolbarGoto },
         { FCONTROL | FSHIFT | FVIRTKEY, 'F', kIdToolbarFormat },
         { FVIRTKEY, VK_F5, kIdToolbarRun },
-        { FCONTROL | FVIRTKEY, VK_OEM_COMMA, kIdToolbarSettings }
+        { FCONTROL | FVIRTKEY, VK_OEM_COMMA, kIdToolbarSettings },
+        { FVIRTKEY, VK_F3, kIdFindNext },
+        { FSHIFT | FVIRTKEY, VK_F3, kIdFindPrevious }
     };
     return CreateAcceleratorTableW(accelerators, static_cast<int>(std::size(accelerators)));
 }
@@ -2515,8 +2814,8 @@ LRESULT CALLBACK TabProc(HWND tab, UINT message, WPARAM wParam, LPARAM lParam) {
             RECT rect{};
             TabCtrl_GetItemRect(tab, index, &rect);
             const int centerY = (rect.top + rect.bottom) / 2;
-            if (point.x >= rect.right - kTabCloseHitWidth &&
-                point.y >= centerY - 10 && point.y <= centerY + 10) {
+            if (point.x >= rect.right - Scale(kTabCloseHitWidth) &&
+                point.y >= centerY - Scale(10) && point.y <= centerY + Scale(10)) {
                 CloseDocument(index);
                 return 0;
             }
@@ -2525,11 +2824,29 @@ LRESULT CALLBACK TabProc(HWND tab, UINT message, WPARAM wParam, LPARAM lParam) {
     return CallWindowProcW(g_app.oldTabProc, tab, message, wParam, lParam);
 }
 
+// 9 pt Segoe UI at the window's DPI (the old -9 px font was about 7 pt).
+void CreateUiFonts() {
+    HFONT oldFont = g_app.uiFont;
+    HFONT oldBold = g_app.uiBoldFont;
+    const int height = -MulDiv(9, static_cast<int>(g_app.dpi), 72);
+    g_app.uiFont = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    g_app.uiBoldFont = CreateFontW(height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    std::vector<HWND> controls = g_app.toolbarButtons;
+    controls.insert(controls.end(), {g_app.tabs, g_app.newTabButton, g_app.statusBar});
+    for (HWND control : controls) {
+        if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+    }
+    if (oldFont) DeleteObject(oldFont);
+    if (oldBold) DeleteObject(oldBold);
+}
+
 void ApplyEditorFont() {
     DeleteObject(g_app.editorFont);
-    HDC dc = GetDC(g_app.window);
-    const int dpi = GetDeviceCaps(dc, LOGPIXELSY);
-    ReleaseDC(g_app.window, dc);
+    const int dpi = static_cast<int>(g_app.dpi);
     const int fontHeight = -MulDiv(g_app.fontSize, dpi, 72);
     g_app.editorFont = CreateFontW(fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -2537,6 +2854,7 @@ void ApplyEditorFont() {
     for (const TabDocument& document : g_app.documents) {
         EditorEventMute mute(document.editor);
         SendMessageW(document.editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+        SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
         InvalidateRect(document.editor, nullptr, TRUE);
     }
     RefreshGutter();
@@ -2545,7 +2863,7 @@ void ApplyEditorFont() {
 void CreateSettingsControl(HWND parent, const wchar_t* className, const wchar_t* text,
     DWORD style, int id, int x, int y, int width, int height) {
     HWND control = CreateWindowExW(0, className, text, WS_CHILD | WS_VISIBLE | style,
-        x, y, width, height, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+        Scale(x), Scale(y), Scale(width), Scale(height), parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
         g_app.instance, nullptr);
     if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
     if (id == kIdSettingsFont) g_app.settingsFontCombo = control;
@@ -2673,7 +2991,7 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
     case WM_MEASUREITEM: {
         auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
         if (measure != nullptr && measure->CtlType == ODT_COMBOBOX) {
-            measure->itemHeight = 24;
+            measure->itemHeight = static_cast<UINT>(Scale(24));
             return TRUE;
         }
         return FALSE;
@@ -2710,9 +3028,10 @@ void OpenSettingsDialog() {
     RegisterClassW(&klass);
     g_app.settingsWindow = CreateWindowExW(WS_EX_DLGMODALFRAME, klass.lpszClassName,
         L"MCnotepad 偏好设置", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 470, 350, g_app.window, nullptr, g_app.instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, Scale(470), Scale(350), g_app.window, nullptr, g_app.instance, nullptr);
     if (!g_app.settingsWindow) return;
     EnableWindow(g_app.window, FALSE);
+    ApplyWindowFrameTheme(g_app.settingsWindow);
     ShowWindow(g_app.settingsWindow, SW_SHOW);
     UpdateWindow(g_app.settingsWindow);
 }
@@ -2815,6 +3134,7 @@ void ReloadDocumentFromDisk(int index) {
     document.fileTimestamp = FileTimestamp(document.path);
     MarkRecoveryDirty(index);
     HighlightDocument(document);
+    SendMessageW(document.editor, EM_EMPTYUNDOBUFFER, 0, 0);
     const LONG length = GetWindowTextLengthW(document.editor);
     selection.cpMin = std::min(selection.cpMin, length);
     selection.cpMax = std::min(selection.cpMax, length);
@@ -2894,15 +3214,15 @@ LRESULT CALLBACK GotoProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         wchar_t label[64]{};
         swprintf_s(label, L"行号（1 - %d）：", lineCount);
         HWND text = CreateWindowExW(0, L"STATIC", label, WS_CHILD | WS_VISIBLE,
-            16, 18, 260, 20, window, nullptr, g_app.instance, nullptr);
+            Scale(16), Scale(18), Scale(260), Scale(20), window, nullptr, g_app.instance, nullptr);
         g_app.gotoEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", std::to_wstring(currentLine).c_str(),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL,
-            16, 42, 280, 26, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdGotoEdit)),
+            Scale(16), Scale(42), Scale(280), Scale(26), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdGotoEdit)),
             g_app.instance, nullptr);
         HWND ok = CreateWindowExW(0, L"BUTTON", L"跳转", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            126, 82, 82, 28, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_app.instance, nullptr);
+            Scale(126), Scale(82), Scale(82), Scale(28), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_app.instance, nullptr);
         HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            214, 82, 82, 28, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
+            Scale(214), Scale(82), Scale(82), Scale(28), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
         for (HWND control : {text, g_app.gotoEdit, ok, cancel}) {
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
         }
@@ -2981,14 +3301,15 @@ void OpenGotoDialog() {
     }
     RECT owner{};
     GetWindowRect(g_app.window, &owner);
-    const int width = 330;
-    const int height = 170;
+    const int width = Scale(330);
+    const int height = Scale(170);
     g_app.gotoWindow = CreateWindowExW(WS_EX_DLGMODALFRAME, L"MCnotepadGoto", L"跳转到行",
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        owner.left + (owner.right - owner.left - width) / 2, owner.top + 120, width, height,
+        owner.left + (owner.right - owner.left - width) / 2, owner.top + Scale(120), width, height,
         g_app.window, nullptr, g_app.instance, nullptr);
     if (!g_app.gotoWindow) return;
     EnableWindow(g_app.window, FALSE);
+    ApplyWindowFrameTheme(g_app.gotoWindow);
     ShowWindow(g_app.gotoWindow, SW_SHOW);
     SetFocus(g_app.gotoEdit);
 }
@@ -3162,15 +3483,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_CREATE: {
         g_app.window = window;
         SetMenu(window, CreateApplicationMenu());
-        g_app.uiFont = CreateFontW(-9, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        g_app.uiBoldFont = CreateFontW(-9, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        g_app.editorFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            FIXED_PITCH | FF_MODERN, L"Consolas");
+        g_app.dpi = GetDpiForWindow(window);
+        CreateUiFonts();
         GdiplusStartupInput gdiplusInput;
         GdiplusStartup(&g_app.gdiplusToken, &gdiplusInput, nullptr);
         LoadToolbarIconImages();
@@ -3186,7 +3500,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_TABS | TCS_SINGLELINE |
                 TCS_FOCUSNEVER | TCS_OWNERDRAWFIXED,
             0, 0, 0, 0, window, nullptr, g_app.instance, nullptr);
-        TabCtrl_SetItemSize(g_app.tabs, 184, kTabHeight - 6);
+        TabCtrl_SetItemSize(g_app.tabs, Scale(184), Scale(kTabHeight - 6));
+        // Tabs size to their text; the padding makes room for the left margin
+        // and the close button that DrawTabItem paints.
+        TabCtrl_SetPadding(g_app.tabs, Scale(22), Scale(3));
         SendMessageW(g_app.tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
         g_app.oldTabProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
             g_app.tabs, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(TabProc)));
@@ -3207,6 +3524,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         g_app.sidebarVisible = false;
         LoadLibraryW(L"Msftedit.dll");
         LoadPersistedSession();
+        g_app.darkTheme = g_app.theme == ThemeKind::Dark || g_app.theme == ThemeKind::Blue;
+        ApplyWindowFrameTheme(window);
         LayoutChildren(window);
         SetMenuState();
         SetTimer(window, kTimerAutosave, 2000, nullptr);
@@ -3227,6 +3546,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 PersistAll(false);
             }
             UpdateStatusBar();
+        } else if (wParam == kTimerHighlight) {
+            KillTimer(window, kTimerHighlight);
+            if (const TabDocument* document = ActiveDocument()) {
+                if (GetWindowTextLengthW(document->editor) <= kLiveHighlightLimit) HighlightDocument(*document);
+            }
         }
         return 0;
     case WM_COMMAND: {
@@ -3241,7 +3565,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     MarkRecoveryDirty(static_cast<int>(index));
                     if (!wasModified) UpdateTabTitle(static_cast<int>(index));
                     UpdateStatusBar();
+                    if (g_app.showLineNumbers && GutterWidthFor(source) != g_app.gutterWidth) LayoutChildren(window);
                     RefreshGutter();
+                    const int language = EffectiveLanguage(g_app.documents[index]);
+                    if (language != kLanguagePlain && language != kLanguageMarkdown) {
+                        SetTimer(window, kTimerHighlight, kHighlightDelayMs, nullptr);  // restarts on each keystroke
+                    }
                     break;
                 }
             }
@@ -3278,6 +3607,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToolbarUndo: HandleEditCommand(kIdEditUndo); break;
         case kIdToolbarRedo: HandleEditCommand(kIdEditRedo); break;
         case kIdToolbarFind: OpenFindDialog(false); break;
+        case kIdFindNext: FindAgain(true); break;
+        case kIdFindPrevious: FindAgain(false); break;
         case kIdToolbarReplace: OpenFindDialog(true); break;
         case kIdToolbarGoto: OpenGotoDialog(); break;
         case kIdToolbarFormat: FormatActiveDocument(); break;
@@ -3351,7 +3682,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_MEASUREITEM: {
         auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
         if (measure != nullptr && measure->CtlType == ODT_COMBOBOX) {
-            measure->itemHeight = 24;
+            measure->itemHeight = static_cast<UINT>(Scale(24));
             return TRUE;
         }
         return FALSE;
@@ -3394,6 +3725,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         const NMHDR* header = reinterpret_cast<const NMHDR*>(lParam);
         if (header != nullptr && header->code == EN_SELCHANGE) {
             UpdateStatusBar();
+            RefreshGutter();  // current-line number follows the caret
             return 0;
         }
         if (header != nullptr && header->hwndFrom == g_app.tabs && header->code == TCN_SELCHANGE) {
@@ -3448,6 +3780,24 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         files.swap(g_app.pendingOpenFiles);
         for (const std::wstring& file : files) OpenFileInNewTab(fs::path(file));
         SetMenuState();
+        return 0;
+    }
+    case WM_DPICHANGED: {
+        // Moved to a monitor with a different scale: rebuild fonts and sizes,
+        // then take the size Windows suggests for the new DPI.
+        g_app.dpi = HIWORD(wParam);
+        CreateUiFonts();
+        if (g_app.tabs) {
+            TabCtrl_SetItemSize(g_app.tabs, Scale(184), Scale(kTabHeight - 6));
+            TabCtrl_SetPadding(g_app.tabs, Scale(22), Scale(3));
+        }
+        ApplyEditorFont();
+        const auto* suggested = reinterpret_cast<const RECT*>(lParam);
+        SetWindowPos(window, nullptr, suggested->left, suggested->top,
+            suggested->right - suggested->left, suggested->bottom - suggested->top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        LayoutChildren(window);
+        InvalidateRect(window, nullptr, TRUE);
         return 0;
     }
     case WM_QUERYENDSESSION:
@@ -3576,8 +3926,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        1100,
-        760,
+        MulDiv(1100, static_cast<int>(GetDpiForSystem()), 96),
+        MulDiv(760, static_cast<int>(GetDpiForSystem()), 96),
         nullptr,
         nullptr,
         instance,
