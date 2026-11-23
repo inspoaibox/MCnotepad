@@ -32,6 +32,9 @@
 
 #include "../resources/resource.h"
 
+#include <cpp-pinyin/Pinyin.h>
+#include <cpp-pinyin/G2pglobal.h>
+
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -79,6 +82,21 @@ constexpr int kIdEditSelectAll = 1106;
 constexpr int kIdHelpAbout = 1201;
 constexpr int kIdFindNext = 1206;
 constexpr int kIdFindPrevious = 1207;
+constexpr int kIdFileRename = 1007;
+// Text tools (Tools menu and editor right-click menu).
+enum TextToolId : int {
+    kIdTextToolFirst = 2001,
+    kIdJoinLines = kIdTextToolFirst, kIdJoinLinesSpace, kIdJoinLinesCustom, kIdJoinEveryN,
+    kIdSplitByDelimiter, kIdBreakAfter, kIdWrapWidth,
+    kIdRemoveEmptyLines, kIdCollapseEmptyLines, kIdRemoveDuplicateLines,
+    kIdSortAscending, kIdSortDescending, kIdReverseLines,
+    kIdAddPrefix, kIdAddSuffix, kIdNumberLines,
+    kIdTrimLeading, kIdTrimTrailing, kIdTrimBoth, kIdCollapseSpaces, kIdRemoveAllSpaces, kIdTabsToSpaces,
+    kIdFullToHalf, kIdHalfToFull, kIdChinesePunctToAscii, kIdAsciiPunctToChinese, kIdRemoveInvisible,
+    kIdUpperCase, kIdLowerCase, kIdTitleCase,
+    kIdPinyinTone, kIdPinyinPlain, kIdPinyinInitials,
+    kIdTextToolLast = kIdPinyinInitials
+};
 constexpr int kIdNewTabButton = 1301;
 constexpr int kIdToolbarNew = 1401;
 constexpr int kIdToolbarOpen = 1402;
@@ -194,6 +212,8 @@ struct AppState {
     wchar_t replaceBuffer[256]{};
     std::vector<TabDocument> documents;
     std::vector<std::wstring> pendingOpenFiles;
+    std::wstring statusNotice;
+    ULONGLONG statusNoticeUntil = 0;
     UINT dpi = 96;
     int gutterWidth = 42;
     RECT savedWindowRect{};
@@ -249,6 +269,9 @@ void AppendEncodingItems(HMENU menu);
 void CheckDocumentMenuItems(HMENU menu);
 void ApplyWordWrapAll();
 bool CloseDocument(int index);
+void RenameDocument(int index);
+void AppendTextToolMenus(HMENU menu);
+void ShowEditorContextMenu(HWND editor, POINT screen);
 void UpdateHorizontalScrollbar(HWND editor);
 void RefreshChrome();
 void ApplyMenuColorMode();
@@ -1635,6 +1658,10 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
 
     // This is a plain-text editor: every paste (menu, Ctrl+V, Shift+Insert)
     // takes only the clipboard's Unicode text, never rich formatting or images.
+    if (message == WM_CONTEXTMENU) {
+        ShowEditorContextMenu(editor, POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+        return 0;
+    }
     if (message == WM_PASTE) {
         SendMessageW(editor, EM_PASTESPECIAL, CF_UNICODETEXT, 0);
         return 0;
@@ -1881,6 +1908,8 @@ bool SaveDocument(int index, bool saveAs) {
         wchar_t fileName[MAX_PATH]{};
         if (!document.path.empty()) {
             wcsncpy_s(fileName, MAX_PATH, document.path.c_str(), _TRUNCATE);
+        } else if (document.title.rfind(L"Untitled-", 0) != 0) {
+            wcsncpy_s(fileName, MAX_PATH, document.title.c_str(), _TRUNCATE);
         }
 
         OPENFILENAMEW dialog{};
@@ -2109,6 +2138,7 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(file, MF_STRING, kIdFileSave, L"保存\tCtrl+S");
     AppendMenuW(file, MF_STRING, kIdFileSaveAs, L"另存为...\tCtrl+Shift+S");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING, kIdFileRename, L"重命名...\tF2");
     AppendMenuW(file, MF_STRING, kIdFileClose, L"关闭标签\tCtrl+W");
     AppendMenuW(file, MF_STRING, kIdFileExit, L"退出");
 
@@ -2133,6 +2163,8 @@ HMENU CreateApplicationMenu() {
         AppendMenuW(language, MF_STRING, kIdLanguageFirst + index, kLanguageNames[index]);
     }
     AppendMenuW(run, MF_STRING, kIdToolbarRun, L"运行当前文件\tF5");
+    AppendTextToolMenus(tools);
+    AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(tools, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tCtrl+Shift+F");
     AppendMenuW(theme, MF_STRING, kIdThemeDark, L"深色");
     AppendMenuW(theme, MF_STRING, kIdThemeLight, L"浅色");
@@ -2565,6 +2597,7 @@ HACCEL CreateAccelerators() {
         { FCONTROL | FVIRTKEY, 'G', kIdToolbarGoto },
         { FCONTROL | FSHIFT | FVIRTKEY, 'F', kIdToolbarFormat },
         { FVIRTKEY, VK_F5, kIdToolbarRun },
+        { FVIRTKEY, VK_F2, kIdFileRename },
         { FCONTROL | FVIRTKEY, VK_OEM_COMMA, kIdToolbarSettings },
         { FVIRTKEY, VK_F3, kIdFindNext },
         { FSHIFT | FVIRTKEY, VK_F3, kIdFindPrevious }
@@ -3995,6 +4028,8 @@ void ShowTabContextMenu(int index, POINT screen) {
     const bool hasFile = !document.untitled && !document.path.empty();
     const int last = static_cast<int>(g_app.documents.size()) - 1;
     HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 6, hasFile ? L"重命名文件...\tF2" : L"重命名标签...\tF2");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 1, L"关闭\tCtrl+W");
     AppendMenuW(menu, MF_STRING | (last == 0 ? MF_GRAYED : 0), 2, L"关闭其他标签");
     AppendMenuW(menu, MF_STRING | (index == last ? MF_GRAYED : 0), 3, L"关闭右侧标签");
@@ -4029,6 +4064,9 @@ void ShowTabContextMenu(int index, POINT screen) {
     case 5:
         ShellExecuteW(g_app.window, L"open", L"explorer.exe", (L"/select,\"" + path + L"\"").c_str(),
             nullptr, SW_SHOWNORMAL);
+        break;
+    case 6:
+        RenameDocument(index);
         break;
     default:
         break;
@@ -4184,6 +4222,7 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
     case WM_LBUTTONDBLCLK: {
         const int hit = TabHitTest(ComputeTabLayout(), POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, nullptr);
         if (hit == -1) NewDocument();  // double-click empty space: new tab
+        else if (hit >= 0) RenameDocument(hit);
         return 0;
     }
     case WM_RBUTTONUP: {
@@ -4310,7 +4349,12 @@ LRESULT CALLBACK StatusBarProc(HWND bar, UINT message, WPARAM wParam, LPARAM lPa
         if (selected > 0) swprintf_s(position, L"行 %d，列 %d    已选 %d 个字符", line, column, selected);
         else swprintf_s(position, L"行 %d，列 %d", line, column);
         x += Scale(28);
-        DrawLabel(dc, position, RECT{x, 0, x + Scale(320), client.bottom}, palette.statusText);
+        if (!g_app.statusNotice.empty() && GetTickCount64() < g_app.statusNoticeUntil) {
+            DrawLabel(dc, g_app.statusNotice, RECT{x, 0, x + Scale(420), client.bottom}, palette.accent);
+        } else {
+            g_app.statusNotice.clear();
+            DrawLabel(dc, position, RECT{x, 0, x + Scale(320), client.bottom}, palette.statusText);
+        }
 
         // Right side: clickable document properties.
         const int language = EffectiveLanguage(*document);
@@ -4405,6 +4449,828 @@ void RefreshChrome() {
     }
     if (g_app.menuBar) LayoutMenuBarItems(g_app.menuBar);
     if (g_app.toolbar) LayoutToolbarItems(g_app.toolbar);
+}
+
+// ===========================================================================
+// Input dialog, tab rename, text tools and Chinese -> pinyin.
+// ===========================================================================
+
+// ---- Small modal input dialog (1-2 text fields) ------------------------------
+
+struct PromptState {
+    std::vector<std::wstring> labels;
+    std::vector<std::wstring>* values = nullptr;
+    std::vector<HWND> edits;
+    bool done = false;
+    bool accepted = false;
+};
+
+LRESULT CALLBACK PromptProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<PromptState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE: {
+        state = static_cast<PromptState*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        int y = 16;
+        for (size_t i = 0; i < state->labels.size(); ++i) {
+            HWND label = CreateWindowExW(0, L"STATIC", state->labels[i].c_str(), WS_CHILD | WS_VISIBLE,
+                Scale(16), Scale(y), Scale(340), Scale(20), window, nullptr, g_app.instance, nullptr);
+            HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", (*state->values)[i].c_str(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                Scale(16), Scale(y + 22), Scale(340), Scale(26), window, nullptr, g_app.instance, nullptr);
+            for (HWND control : {label, edit}) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            state->edits.push_back(edit);
+            y += 58;
+        }
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            Scale(186), Scale(y + 4), Scale(82), Scale(28), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_app.instance, nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(274), Scale(y + 4), Scale(82), Scale(28), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
+        for (HWND control : {ok, cancel}) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (state && (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)) {
+            if (LOWORD(wParam) == IDOK) {
+                for (size_t i = 0; i < state->edits.size(); ++i) (*state->values)[i] = GetWindowTextValue(state->edits[i]);
+                state->accepted = true;
+            }
+            state->done = true;
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        if (state) state->done = true;
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.windowBrush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, CurrentPalette().controlText);
+        SetBkColor(dc, CurrentPalette().windowBackground);
+        return reinterpret_cast<LRESULT>(g_app.windowBrush);
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+// Shows a modal dialog; returns false if cancelled. `values` holds the initial
+// text of each field and receives the result.
+bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels, std::vector<std::wstring>& values) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{};
+        klass.hInstance = g_app.instance;
+        klass.lpfnWndProc = PromptProc;
+        klass.lpszClassName = L"MCnotepadPrompt";
+        klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        registered = RegisterClassW(&klass) != 0;
+    }
+    values.resize(labels.size());
+    PromptState state;
+    state.labels = labels;
+    state.values = &values;
+    RECT owner{};
+    GetWindowRect(g_app.window, &owner);
+    RECT frame{0, 0, Scale(372), Scale(16 + 58 * static_cast<int>(labels.size()) + 48)};
+    AdjustWindowRectExForDpi(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME, g_app.dpi);
+    const int width = frame.right - frame.left;
+    const int height = frame.bottom - frame.top;
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"MCnotepadPrompt", title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        owner.left + (owner.right - owner.left - width) / 2, owner.top + Scale(120), width, height,
+        g_app.window, nullptr, g_app.instance, &state);
+    if (!dialog) return false;
+    ApplyWindowFrameTheme(dialog);
+    EnableWindow(g_app.window, FALSE);
+    ShowWindow(dialog, SW_SHOW);
+    if (!state.edits.empty()) {
+        SetFocus(state.edits[0]);
+        SendMessageW(state.edits[0], EM_SETSEL, 0, -1);
+    }
+    MSG message{};
+    while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dialog, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    if (message.message == WM_QUIT) PostQuitMessage(static_cast<int>(message.wParam));
+    EnableWindow(g_app.window, TRUE);
+    DestroyWindow(dialog);
+    SetForegroundWindow(g_app.window);
+    if (TabDocument* document = ActiveDocument()) SetFocus(document->editor);
+    return state.accepted;
+}
+
+// ---- Transient status-bar notice ------------------------------------------------
+
+void ShowNotice(const std::wstring& text) {
+    g_app.statusNotice = text;
+    g_app.statusNoticeUntil = GetTickCount64() + 4000;
+    UpdateStatusBar();
+}
+
+// ---- Tab rename -----------------------------------------------------------------
+
+std::wstring TrimCopy(std::wstring_view text) {
+    const size_t first = text.find_first_not_of(L" \t　");
+    if (first == std::wstring_view::npos) return {};
+    const size_t last = text.find_last_not_of(L" \t　");
+    return std::wstring(text.substr(first, last - first + 1));
+}
+
+// Untitled tabs just get a new label (used as the suggested name when saving).
+// Saved files are renamed on disk, in the same folder.
+void RenameDocument(int index) {
+    if (index < 0 || index >= static_cast<int>(g_app.documents.size())) return;
+    const bool onDisk = !g_app.documents[static_cast<size_t>(index)].untitled &&
+        !g_app.documents[static_cast<size_t>(index)].path.empty();
+    std::vector<std::wstring> values{g_app.documents[static_cast<size_t>(index)].title};
+    if (!PromptForText(onDisk ? L"重命名文件" : L"重命名标签",
+            {onDisk ? L"新文件名（文件会在原文件夹中改名）：" : L"标签名称："}, values)) {
+        return;
+    }
+    TabDocument& document = g_app.documents[static_cast<size_t>(index)];
+    const std::wstring name = TrimCopy(values[0]);
+    if (name.empty() || name == document.title) return;
+    if (name.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) {
+        MessageBoxW(g_app.window, L"名称不能包含以下字符：\\ / : * ? \" < > |", kWindowTitle, MB_ICONWARNING);
+        return;
+    }
+    if (!onDisk) {
+        document.title = name;
+    } else {
+        const fs::path source = document.path;
+        const fs::path target = source.parent_path() / name;
+        std::error_code error;
+        // A case-only rename (readme.md -> README.md) targets the same file.
+        if (fs::exists(target, error) && !SamePath(source, target)) {
+            MessageBoxW(g_app.window, (L"同一文件夹中已有名为“" + name + L"”的文件。").c_str(), kWindowTitle, MB_ICONWARNING);
+            return;
+        }
+        if (!MoveFileExW(source.c_str(), target.c_str(), 0)) {
+            const DWORD code = GetLastError();
+            const std::wstring reason = code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
+                ? L"原文件已不存在，可以用“另存为”保存到新位置。"
+                : code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED
+                ? L"文件正被其他程序使用，或没有修改权限。"
+                : L"错误代码 " + std::to_wstring(code) + L"。";
+            MessageBoxW(g_app.window, (L"重命名失败：" + reason).c_str(), kWindowTitle, MB_ICONWARNING);
+            return;
+        }
+        document.path = target.wstring();
+        document.title = FileTitle(target);
+        document.fileTimestamp = FileTimestamp(target);
+        if (document.language == kLanguageAuto) HighlightDocument(document);
+    }
+    UpdateTabTitle(index);
+    UpdateStatusBar();
+    g_app.stateDirty = true;
+    PersistAll(false);
+    ShowNotice(L"已重命名为 " + document.title);
+}
+
+// ---- Text tools -------------------------------------------------------------------
+
+std::vector<std::wstring> SplitLines(std::wstring_view text) {
+    std::vector<std::wstring> lines;
+    size_t start = 0;
+    for (size_t i = 0; i <= text.size(); ++i) {
+        if (i == text.size() || text[i] == L'\r' || text[i] == L'\n') {
+            lines.emplace_back(text.substr(start, i - start));
+            if (i < text.size() && text[i] == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') ++i;
+            start = i + 1;
+        }
+    }
+    return lines;
+}
+
+std::wstring JoinLines(const std::vector<std::wstring>& lines, std::wstring_view separator = L"\r") {
+    std::wstring result;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (i > 0) result += separator;
+        result += lines[i];
+    }
+    return result;
+}
+
+// "\t", "\n" and "\\" typed in a prompt mean tab, line break and backslash.
+std::wstring UnescapeInput(std::wstring_view input) {
+    std::wstring result;
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == L'\\' && i + 1 < input.size()) {
+            const wchar_t next = input[i + 1];
+            if (next == L't') { result += L'\t'; ++i; continue; }
+            if (next == L'n') { result += L'\r'; ++i; continue; }
+            if (next == L'\\') { result += L'\\'; ++i; continue; }
+        }
+        result += input[i];
+    }
+    return result;
+}
+
+bool IsBlankChar(wchar_t c) { return c == L' ' || c == L'\t' || c == 0x3000 || c == 0x00A0; }
+bool IsCjk(wchar_t c) { return (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF00 && c <= 0xFFEF); }
+
+std::wstring TrimLeft(std::wstring_view s) { size_t i = 0; while (i < s.size() && IsBlankChar(s[i])) ++i; return std::wstring(s.substr(i)); }
+std::wstring TrimRight(std::wstring_view s) { size_t n = s.size(); while (n > 0 && IsBlankChar(s[n - 1])) --n; return std::wstring(s.substr(0, n)); }
+
+std::wstring MapCase(std::wstring_view text, DWORD flags) {
+    if (text.empty()) return {};
+    const int size = LCMapStringEx(LOCALE_NAME_USER_DEFAULT, flags, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr, 0);
+    if (size <= 0) return std::wstring(text);
+    std::wstring result(static_cast<size_t>(size), L'\0');
+    LCMapStringEx(LOCALE_NAME_USER_DEFAULT, flags, text.data(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr, 0);
+    return result;
+}
+
+// Mandarin pinyin, loaded on first use from <exe dir>/dict/mandarin.
+Pinyin::Pinyin* PinyinConverter(std::wstring& error) {
+    static std::unique_ptr<Pinyin::Pinyin> converter;
+    static bool tried = false;
+    if (converter) return converter.get();
+    if (tried) {
+        error = L"拼音词典加载失败。";
+        return nullptr;
+    }
+    tried = true;
+    const fs::path directory = fs::path(CurrentExecutablePath()).parent_path() / L"dict";
+    std::error_code ec;
+    if (!fs::exists(directory / L"mandarin" / L"word.txt", ec)) {
+        error = L"找不到拼音词典：" + (directory / L"mandarin").wstring() + L"\n请确认程序目录下的 dict 文件夹完整。";
+        tried = false;
+        return nullptr;
+    }
+    try {
+        Pinyin::setDictionaryPath(directory);
+        converter = std::make_unique<Pinyin::Pinyin>();
+    } catch (...) {
+        error = L"拼音词典加载失败。";
+        return nullptr;
+    }
+    return converter.get();
+}
+
+enum class PinyinMode { Tone, Plain, Initials };
+
+// Converts Chinese characters (polyphones resolved by phrase) and keeps all
+// other text. Syllables are separated by spaces; initials are run together.
+bool ConvertToPinyin(std::wstring_view text, PinyinMode mode, std::wstring& output, int& converted, std::wstring& error) {
+    Pinyin::Pinyin* converter = PinyinConverter(error);
+    if (!converter) return false;
+    const auto style = mode == PinyinMode::Tone ? Pinyin::ManTone::Style::TONE : Pinyin::ManTone::Style::NORMAL;
+    Pinyin::PinyinResVector results;
+    try {
+        results = converter->hanziToPinyin(WideToUtf8(text), style, Pinyin::Error::Default, false, true, false);
+    } catch (...) {
+        error = L"拼音转换失败。";
+        return false;
+    }
+    output.clear();
+    converted = 0;
+    bool previousWasPinyin = false;
+    for (const Pinyin::PinyinRes& item : results) {
+        if (item.error) {
+            const std::wstring raw = Utf8ToWide(item.hanzi);
+            // Keep "拼音 word" readable: a space between a syllable and a following word.
+            if (mode != PinyinMode::Initials && previousWasPinyin && !raw.empty() && iswalnum(raw[0])) output += L' ';
+            output += raw;
+            previousWasPinyin = false;
+            continue;
+        }
+        std::wstring syllable = Utf8ToWide(item.pinyin);
+        if (mode == PinyinMode::Initials) {
+            output += syllable.substr(0, 1);
+        } else {
+            if (!output.empty() && (previousWasPinyin || iswalnum(output.back()))) output += L' ';
+            output += syllable;
+        }
+        previousWasPinyin = true;
+        ++converted;
+    }
+    return true;
+}
+
+// Every tool works on the selection, or on the whole document when nothing is
+// selected. Line tools first widen the range to whole lines.
+bool ToolRange(HWND editor, bool wholeLines, CHARRANGE& range, std::wstring& text, bool& wholeDocument) {
+    const std::wstring all = GetEditorRawText(editor);
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&range));
+    const LONG length = static_cast<LONG>(all.size());
+    wholeDocument = range.cpMin == range.cpMax;
+    if (wholeDocument) {
+        range = CHARRANGE{0, length};
+        // RichEdit keeps a final paragraph mark; leave it alone.
+        if (length > 0 && all[static_cast<size_t>(length - 1)] == L'\r') range.cpMax = length - 1;
+    } else if (wholeLines) {
+        range.cpMin = std::clamp(range.cpMin, 0L, length);
+        range.cpMax = std::clamp(range.cpMax, 0L, length);
+        // A selection ending at the start of a line does not include that line.
+        if (range.cpMax > range.cpMin && all[static_cast<size_t>(range.cpMax - 1)] == L'\r') --range.cpMax;
+        while (range.cpMin > 0 && all[static_cast<size_t>(range.cpMin - 1)] != L'\r') --range.cpMin;
+        while (range.cpMax < length && all[static_cast<size_t>(range.cpMax)] != L'\r') ++range.cpMax;
+    }
+    range.cpMin = std::clamp(range.cpMin, 0L, length);
+    range.cpMax = std::clamp(range.cpMax, range.cpMin, length);
+    text = all.substr(static_cast<size_t>(range.cpMin), static_cast<size_t>(range.cpMax - range.cpMin));
+    return true;
+}
+
+// Values remembered between uses of the prompts.
+std::wstring g_joinSeparator = L"";
+std::wstring g_groupSize = L"2";
+std::wstring g_splitDelimiter = L",";
+std::wstring g_breakAfter = L"。！？";
+std::wstring g_wrapWidth = L"80";
+std::wstring g_linePrefix = L"- ";
+std::wstring g_lineSuffix = L";";
+
+bool IsTextToolCommand(int command) {
+    return command >= kIdTextToolFirst && command <= kIdTextToolLast;
+}
+
+void AppendTextToolMenus(HMENU menu) {
+    HMENU lines = CreatePopupMenu();
+    AppendMenuW(lines, MF_STRING, kIdJoinLines, L"合并为一行");
+    AppendMenuW(lines, MF_STRING, kIdJoinLinesSpace, L"合并为一行（用空格连接）");
+    AppendMenuW(lines, MF_STRING, kIdJoinLinesCustom, L"合并为一行（自定义连接符）...");
+    AppendMenuW(lines, MF_STRING, kIdJoinEveryN, L"每 N 行合并为一行...");
+    AppendMenuW(lines, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(lines, MF_STRING, kIdSplitByDelimiter, L"按分隔符拆分为多行...");
+    AppendMenuW(lines, MF_STRING, kIdBreakAfter, L"在指定字符后换行...");
+    AppendMenuW(lines, MF_STRING, kIdWrapWidth, L"按长度换行...");
+    AppendMenuW(lines, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(lines, MF_STRING, kIdRemoveEmptyLines, L"删除空行");
+    AppendMenuW(lines, MF_STRING, kIdCollapseEmptyLines, L"合并连续空行");
+    AppendMenuW(lines, MF_STRING, kIdRemoveDuplicateLines, L"删除重复行");
+    AppendMenuW(lines, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(lines, MF_STRING, kIdSortAscending, L"排序（升序）");
+    AppendMenuW(lines, MF_STRING, kIdSortDescending, L"排序（降序）");
+    AppendMenuW(lines, MF_STRING, kIdReverseLines, L"反转行顺序");
+    AppendMenuW(lines, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(lines, MF_STRING, kIdAddPrefix, L"每行开头添加...");
+    AppendMenuW(lines, MF_STRING, kIdAddSuffix, L"每行末尾添加...");
+    AppendMenuW(lines, MF_STRING, kIdNumberLines, L"添加行号");
+
+    HMENU blanks = CreatePopupMenu();
+    AppendMenuW(blanks, MF_STRING, kIdTrimLeading, L"去除行首空白");
+    AppendMenuW(blanks, MF_STRING, kIdTrimTrailing, L"去除行尾空白");
+    AppendMenuW(blanks, MF_STRING, kIdTrimBoth, L"去除行首和行尾空白");
+    AppendMenuW(blanks, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(blanks, MF_STRING, kIdCollapseSpaces, L"连续空格合并为一个");
+    AppendMenuW(blanks, MF_STRING, kIdRemoveAllSpaces, L"删除所有空格");
+    AppendMenuW(blanks, MF_STRING, kIdTabsToSpaces, L"制表符转为空格");
+
+    HMENU symbols = CreatePopupMenu();
+    AppendMenuW(symbols, MF_STRING, kIdFullToHalf, L"全角转半角");
+    AppendMenuW(symbols, MF_STRING, kIdHalfToFull, L"半角转全角");
+    AppendMenuW(symbols, MF_STRING, kIdChinesePunctToAscii, L"中文标点转英文标点");
+    AppendMenuW(symbols, MF_STRING, kIdAsciiPunctToChinese, L"英文标点转中文标点");
+    AppendMenuW(symbols, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(symbols, MF_STRING, kIdRemoveInvisible, L"清除不可见字符");
+    AppendMenuW(symbols, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(symbols, MF_STRING, kIdUpperCase, L"转为大写");
+    AppendMenuW(symbols, MF_STRING, kIdLowerCase, L"转为小写");
+    AppendMenuW(symbols, MF_STRING, kIdTitleCase, L"每个单词首字母大写");
+
+    HMENU pinyin = CreatePopupMenu();
+    AppendMenuW(pinyin, MF_STRING, kIdPinyinTone, L"带声调（zhōng wén）");
+    AppendMenuW(pinyin, MF_STRING, kIdPinyinPlain, L"不带声调（zhong wen）");
+    AppendMenuW(pinyin, MF_STRING, kIdPinyinInitials, L"首字母（zw）");
+
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(lines), L"行处理");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(blanks), L"空格与空白");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(symbols), L"符号与大小写");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(pinyin), L"汉字转拼音");
+}
+
+void RunTextTool(int command) {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    HWND editor = document->editor;
+
+    const bool lineTool = (command >= kIdJoinLines && command <= kIdNumberLines) ||
+        (command >= kIdTrimLeading && command <= kIdTabsToSpaces);
+    // Ask for parameters before touching the text.
+    std::vector<std::wstring> values;
+    switch (command) {
+    case kIdJoinLinesCustom:
+        values = {g_joinSeparator};
+        if (!PromptForText(L"合并为一行", {L"连接符（可留空；\\t 表示制表符）："}, values)) return;
+        g_joinSeparator = values[0];
+        break;
+    case kIdJoinEveryN:
+        values = {g_groupSize, g_joinSeparator};
+        if (!PromptForText(L"每 N 行合并为一行", {L"每几行合并为一行：", L"连接符（可留空；\\t 表示制表符）："}, values)) return;
+        g_groupSize = values[0];
+        g_joinSeparator = values[1];
+        if (_wtoi(values[0].c_str()) < 2) {
+            MessageBoxW(g_app.window, L"请输入不小于 2 的整数。", kWindowTitle, MB_ICONWARNING);
+            return;
+        }
+        break;
+    case kIdSplitByDelimiter:
+        values = {g_splitDelimiter};
+        if (!PromptForText(L"按分隔符拆分为多行", {L"分隔符（会被删除；\\t 表示制表符）："}, values)) return;
+        g_splitDelimiter = values[0];
+        if (values[0].empty()) return;
+        break;
+    case kIdBreakAfter:
+        values = {g_breakAfter};
+        if (!PromptForText(L"在指定字符后换行", {L"在这些字符后面换行（每个字符单独生效，字符会保留）："}, values)) return;
+        g_breakAfter = values[0];
+        if (values[0].empty()) return;
+        break;
+    case kIdWrapWidth:
+        values = {g_wrapWidth};
+        if (!PromptForText(L"按长度换行", {L"每行最多多少个字符："}, values)) return;
+        g_wrapWidth = values[0];
+        if (_wtoi(values[0].c_str()) < 1) {
+            MessageBoxW(g_app.window, L"请输入正整数。", kWindowTitle, MB_ICONWARNING);
+            return;
+        }
+        break;
+    case kIdAddPrefix:
+        values = {g_linePrefix};
+        if (!PromptForText(L"每行开头添加", {L"添加的内容："}, values)) return;
+        g_linePrefix = values[0];
+        break;
+    case kIdAddSuffix:
+        values = {g_lineSuffix};
+        if (!PromptForText(L"每行末尾添加", {L"添加的内容："}, values)) return;
+        g_lineSuffix = values[0];
+        break;
+    default:
+        break;
+    }
+
+    CHARRANGE range{};
+    std::wstring text;
+    bool wholeDocument = false;
+    ToolRange(editor, lineTool, range, text, wholeDocument);
+    std::wstring result;
+    std::wstring notice;
+    int count = 0;
+    std::vector<std::wstring> lines = SplitLines(text);
+    const auto nonEmptyTrimmed = [&] {
+        std::vector<std::wstring> kept;
+        for (const std::wstring& line : lines) {
+            std::wstring trimmed = TrimRight(TrimLeft(line));
+            if (!trimmed.empty()) kept.push_back(std::move(trimmed));
+        }
+        return kept;
+    };
+
+    switch (command) {
+    case kIdJoinLines:
+    case kIdJoinLinesSpace:
+    case kIdJoinLinesCustom: {
+        const std::wstring separator = command == kIdJoinLines ? L"" : command == kIdJoinLinesSpace ? L" " : UnescapeInput(g_joinSeparator);
+        const auto kept = nonEmptyTrimmed();
+        result = JoinLines(kept, separator);
+        notice = L"已将 " + std::to_wstring(kept.size()) + L" 行合并为一行";
+        break;
+    }
+    case kIdJoinEveryN: {
+        const size_t group = static_cast<size_t>(_wtoi(g_groupSize.c_str()));
+        const std::wstring separator = UnescapeInput(g_joinSeparator);
+        const auto kept = nonEmptyTrimmed();
+        std::vector<std::wstring> merged;
+        for (size_t i = 0; i < kept.size(); i += group) {
+            std::vector<std::wstring> chunk(kept.begin() + static_cast<std::ptrdiff_t>(i),
+                kept.begin() + static_cast<std::ptrdiff_t>(std::min(kept.size(), i + group)));
+            merged.push_back(JoinLines(chunk, separator));
+        }
+        result = JoinLines(merged);
+        notice = L"已合并为 " + std::to_wstring(merged.size()) + L" 行";
+        break;
+    }
+    case kIdSplitByDelimiter: {
+        const std::wstring delimiter = UnescapeInput(g_splitDelimiter);
+        size_t start = 0;
+        for (size_t found; (found = text.find(delimiter, start)) != std::wstring::npos; start = found + delimiter.size()) {
+            result.append(text, start, found - start);
+            result += L'\r';
+            ++count;
+        }
+        result.append(text, start, std::wstring::npos);
+        notice = L"已拆分 " + std::to_wstring(count) + L" 处";
+        break;
+    }
+    case kIdBreakAfter: {
+        const std::wstring marks = UnescapeInput(g_breakAfter);
+        for (size_t i = 0; i < text.size(); ++i) {
+            result += text[i];
+            if (marks.find(text[i]) == std::wstring::npos) continue;
+            // Don't add a break where one already follows (or a closing quote).
+            size_t next = i + 1;
+            while (next < text.size() && (text[next] == L'”' || text[next] == L'’' || text[next] == L'"' || text[next] == L')' || text[next] == L'）')) {
+                result += text[next];
+                i = next++;
+            }
+            if (next < text.size() && text[next] != L'\r' && text[next] != L'\n') {
+                result += L'\r';
+                ++count;
+                while (i + 1 < text.size() && IsBlankChar(text[i + 1])) ++i;  // drop spaces at the new line start
+            }
+        }
+        notice = L"已插入 " + std::to_wstring(count) + L" 处换行";
+        break;
+    }
+    case kIdWrapWidth: {
+        const size_t width = static_cast<size_t>(_wtoi(g_wrapWidth.c_str()));
+        std::vector<std::wstring> wrapped;
+        for (const std::wstring& line : lines) {
+            std::wstring rest = line;
+            while (rest.size() > width) {
+                // Prefer breaking at the last space for Latin text.
+                size_t cut = rest.find_last_of(L' ', width);
+                if (cut == std::wstring::npos || cut == 0) cut = width;
+                wrapped.push_back(TrimRight(rest.substr(0, cut)));
+                rest = TrimLeft(rest.substr(cut));
+                ++count;
+            }
+            wrapped.push_back(rest);
+        }
+        result = JoinLines(wrapped);
+        notice = L"已插入 " + std::to_wstring(count) + L" 处换行";
+        break;
+    }
+    case kIdRemoveEmptyLines: {
+        std::vector<std::wstring> kept;
+        for (const std::wstring& line : lines) {
+            if (TrimLeft(line).empty()) ++count;
+            else kept.push_back(line);
+        }
+        result = JoinLines(kept);
+        notice = L"已删除 " + std::to_wstring(count) + L" 个空行";
+        break;
+    }
+    case kIdCollapseEmptyLines: {
+        std::vector<std::wstring> kept;
+        bool previousEmpty = false;
+        for (const std::wstring& line : lines) {
+            const bool empty = TrimLeft(line).empty();
+            if (empty && previousEmpty) { ++count; continue; }
+            kept.push_back(empty ? std::wstring() : line);
+            previousEmpty = empty;
+        }
+        result = JoinLines(kept);
+        notice = L"已删除 " + std::to_wstring(count) + L" 个多余空行";
+        break;
+    }
+    case kIdRemoveDuplicateLines: {
+        std::vector<std::wstring> kept;
+        std::unordered_map<std::wstring, bool> seen;
+        for (const std::wstring& line : lines) {
+            if (!seen.emplace(line, true).second) { ++count; continue; }
+            kept.push_back(line);
+        }
+        result = JoinLines(kept);
+        notice = L"已删除 " + std::to_wstring(count) + L" 个重复行";
+        break;
+    }
+    case kIdSortAscending:
+    case kIdSortDescending: {
+        // The user's locale order: for Chinese this sorts by pinyin.
+        const bool descending = command == kIdSortDescending;
+        std::stable_sort(lines.begin(), lines.end(), [&](const std::wstring& a, const std::wstring& b) {
+            const int order = CompareStringEx(LOCALE_NAME_USER_DEFAULT, SORT_DIGITSASNUMBERS,
+                a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), nullptr, nullptr, 0);
+            return descending ? order == CSTR_GREATER_THAN : order == CSTR_LESS_THAN;
+        });
+        result = JoinLines(lines);
+        notice = L"已排序 " + std::to_wstring(lines.size()) + L" 行";
+        break;
+    }
+    case kIdReverseLines:
+        std::reverse(lines.begin(), lines.end());
+        result = JoinLines(lines);
+        notice = L"已反转 " + std::to_wstring(lines.size()) + L" 行";
+        break;
+    case kIdAddPrefix:
+    case kIdAddSuffix: {
+        const std::wstring addition = UnescapeInput(command == kIdAddPrefix ? g_linePrefix : g_lineSuffix);
+        for (std::wstring& line : lines) line = command == kIdAddPrefix ? addition + line : line + addition;
+        result = JoinLines(lines);
+        notice = L"已处理 " + std::to_wstring(lines.size()) + L" 行";
+        break;
+    }
+    case kIdNumberLines: {
+        const int digits = static_cast<int>(std::to_wstring(lines.size()).size());
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::wstring number = std::to_wstring(i + 1);
+            number.insert(0, static_cast<size_t>(digits) - number.size(), L' ');
+            lines[i] = number + L". " + lines[i];
+        }
+        result = JoinLines(lines);
+        notice = L"已为 " + std::to_wstring(lines.size()) + L" 行添加行号";
+        break;
+    }
+    case kIdTrimLeading:
+    case kIdTrimTrailing:
+    case kIdTrimBoth:
+        for (std::wstring& line : lines) {
+            const std::wstring before = line;
+            if (command != kIdTrimTrailing) line = TrimLeft(line);
+            if (command != kIdTrimLeading) line = TrimRight(line);
+            if (line != before) ++count;
+        }
+        result = JoinLines(lines);
+        notice = L"已处理 " + std::to_wstring(count) + L" 行";
+        break;
+    case kIdCollapseSpaces:
+        for (std::wstring& line : lines) {
+            std::wstring collapsed;
+            for (const wchar_t c : line) {
+                if (IsBlankChar(c) && !collapsed.empty() && collapsed.back() == L' ') { ++count; continue; }
+                collapsed += IsBlankChar(c) ? L' ' : c;
+            }
+            line = collapsed;
+        }
+        result = JoinLines(lines);
+        notice = L"已删除 " + std::to_wstring(count) + L" 个多余空格";
+        break;
+    case kIdRemoveAllSpaces:
+        for (std::wstring& line : lines) {
+            std::wstring kept;
+            for (const wchar_t c : line) {
+                if (IsBlankChar(c)) ++count;
+                else kept += c;
+            }
+            line = kept;
+        }
+        result = JoinLines(lines);
+        notice = L"已删除 " + std::to_wstring(count) + L" 个空格";
+        break;
+    case kIdTabsToSpaces:
+        for (std::wstring& line : lines) {
+            std::wstring expanded;
+            for (const wchar_t c : line) {
+                if (c != L'\t') { expanded += c; continue; }
+                expanded.append(4 - expanded.size() % 4, L' ');
+                ++count;
+            }
+            line = expanded;
+        }
+        result = JoinLines(lines);
+        notice = L"已转换 " + std::to_wstring(count) + L" 个制表符";
+        break;
+    case kIdFullToHalf:
+        for (wchar_t c : text) {
+            if (c >= 0xFF01 && c <= 0xFF5E) { c = static_cast<wchar_t>(c - 0xFEE0); ++count; }
+            else if (c == 0x3000) { c = L' '; ++count; }
+            result += c;
+        }
+        notice = L"已转换 " + std::to_wstring(count) + L" 个字符";
+        break;
+    case kIdHalfToFull:
+        for (wchar_t c : text) {
+            if (c >= 0x21 && c <= 0x7E) { c = static_cast<wchar_t>(c + 0xFEE0); ++count; }
+            else if (c == L' ') { c = 0x3000; ++count; }
+            result += c;
+        }
+        notice = L"已转换 " + std::to_wstring(count) + L" 个字符";
+        break;
+    case kIdChinesePunctToAscii: {
+        static const std::unordered_map<wchar_t, const wchar_t*> map = {
+            {L'，', L","}, {L'。', L"."}, {L'！', L"!"}, {L'？', L"?"}, {L'；', L";"}, {L'：', L":"},
+            {L'“', L"\""}, {L'”', L"\""}, {L'‘', L"'"}, {L'’', L"'"}, {L'（', L"("}, {L'）', L")"},
+            {L'【', L"["}, {L'】', L"]"}, {L'《', L"<"}, {L'》', L">"}, {L'、', L","}, {L'…', L"..."},
+            {L'—', L"-"}, {L'～', L"~"}, {L'「', L"\""}, {L'」', L"\""},
+        };
+        for (const wchar_t c : text) {
+            const auto found = map.find(c);
+            if (found != map.end()) { result += found->second; ++count; }
+            else result += c;
+        }
+        notice = L"已转换 " + std::to_wstring(count) + L" 个标点";
+        break;
+    }
+    case kIdAsciiPunctToChinese: {
+        // Only after a Chinese character, so 3.14, URLs and code stay intact.
+        static const std::unordered_map<wchar_t, wchar_t> map = {
+            {L',', L'，'}, {L'.', L'。'}, {L'!', L'！'}, {L'?', L'？'}, {L';', L'；'}, {L':', L'：'},
+            {L'(', L'（'}, {L')', L'）'},
+        };
+        bool openParenConverted = false;
+        for (size_t i = 0; i < text.size(); ++i) {
+            const auto found = map.find(text[i]);
+            size_t back = i;
+            while (back > 0 && text[back - 1] == L' ') --back;
+            const bool afterChinese = back > 0 && IsCjk(text[back - 1]);
+            const bool closesConverted = text[i] == L')' && openParenConverted;
+            if (found != map.end() && (afterChinese || closesConverted)) {
+                if (text[i] == L'(') openParenConverted = true;
+                if (text[i] == L')') openParenConverted = false;
+                while (!result.empty() && result.back() == L' ') result.pop_back();
+                result += found->second;
+                ++count;
+                while (i + 1 < text.size() && text[i + 1] == L' ') ++i;
+            } else {
+                result += text[i];
+            }
+        }
+        notice = L"已转换 " + std::to_wstring(count) + L" 个标点";
+        break;
+    }
+    case kIdRemoveInvisible:
+        for (const wchar_t c : text) {
+            const bool zeroWidth = c == 0x200B || c == 0x200C || c == 0x200D || c == 0x2060 || c == 0xFEFF || c == 0x00AD;
+            const bool control = (c < 0x20 && c != L'\t' && c != L'\r' && c != L'\n') || c == 0x7F;
+            if (zeroWidth || control) { ++count; continue; }
+            if (c == 0x00A0) { result += L' '; ++count; continue; }
+            result += c;
+        }
+        notice = count > 0 ? L"已清除 " + std::to_wstring(count) + L" 个不可见字符" : L"没有发现不可见字符";
+        break;
+    case kIdUpperCase:
+        result = MapCase(text, LCMAP_UPPERCASE);
+        notice = L"已转为大写";
+        break;
+    case kIdLowerCase:
+        result = MapCase(text, LCMAP_LOWERCASE);
+        notice = L"已转为小写";
+        break;
+    case kIdTitleCase:
+        result = MapCase(MapCase(text, LCMAP_LOWERCASE), LCMAP_TITLECASE);
+        notice = L"已将每个单词首字母大写";
+        break;
+    case kIdPinyinTone:
+    case kIdPinyinPlain:
+    case kIdPinyinInitials: {
+        std::wstring error;
+        const PinyinMode mode = command == kIdPinyinTone ? PinyinMode::Tone
+            : command == kIdPinyinPlain ? PinyinMode::Plain : PinyinMode::Initials;
+        SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        if (!ConvertToPinyin(text, mode, result, count, error)) {
+            MessageBoxW(g_app.window, error.c_str(), kWindowTitle, MB_ICONWARNING);
+            return;
+        }
+        notice = count > 0 ? L"已转换 " + std::to_wstring(count) + L" 个汉字" : L"所选内容中没有汉字";
+        break;
+    }
+    default:
+        return;
+    }
+
+    if (wholeDocument) notice += L"（全文）";
+    if (result == text) {
+        ShowNotice(notice.empty() ? L"没有需要修改的内容" : notice);
+        return;
+    }
+    // One replace = one undo step; the result stays selected.
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+    SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(result.c_str()));
+    const std::wstring after = GetEditorRawText(editor);
+    CHARRANGE selection{range.cpMin, range.cpMin};
+    // Measure the inserted text as RichEdit stores it (CRLF becomes CR).
+    LONG insertedLength = 0;
+    for (size_t i = 0; i < result.size(); ++i) {
+        if (result[i] == L'\r' && i + 1 < result.size() && result[i + 1] == L'\n') ++i;
+        ++insertedLength;
+    }
+    selection.cpMax = std::min(static_cast<LONG>(after.size()), range.cpMin + insertedLength);
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    SendMessageW(editor, EM_SCROLLCARET, 0, 0);
+    RefreshGutter();
+    ShowNotice(notice);
+}
+
+// Right-click menu inside the editor.
+void ShowEditorContextMenu(HWND editor, POINT screen) {
+    if (screen.x == -1 && screen.y == -1) {  // Shift+F10 / menu key: open at the caret
+        CHARRANGE selection{};
+        SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+        POINTL caret{};
+        SendMessageW(editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&caret), selection.cpMax);
+        screen = POINT{caret.x, caret.y + Scale(18)};
+        ClientToScreen(editor, &screen);
+    }
+    CHARRANGE selection{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const bool hasSelection = selection.cpMax > selection.cpMin;
+    const UINT selectionState = hasSelection ? MF_ENABLED : MF_GRAYED;
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | (SendMessageW(editor, EM_CANUNDO, 0, 0) ? 0 : MF_GRAYED), kIdEditUndo, L"撤销\tCtrl+Z");
+    AppendMenuW(menu, MF_STRING | (SendMessageW(editor, EM_CANREDO, 0, 0) ? 0 : MF_GRAYED), kIdEditRedo, L"重做\tCtrl+Y");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | selectionState, kIdEditCut, L"剪切\tCtrl+X");
+    AppendMenuW(menu, MF_STRING | selectionState, kIdEditCopy, L"复制\tCtrl+C");
+    AppendMenuW(menu, MF_STRING | (IsClipboardFormatAvailable(CF_UNICODETEXT) ? 0 : MF_GRAYED), kIdEditPaste, L"粘贴\tCtrl+V");
+    AppendMenuW(menu, MF_STRING, kIdEditSelectAll, L"全选\tCtrl+A");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendTextToolMenus(menu);
+    const int command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, g_app.window, nullptr);
+    DestroyMenu(menu);
+    if (command != 0) SendMessageW(g_app.window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -4510,6 +5376,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         }
 
+        if (IsTextToolCommand(command)) {
+            RunTextTool(command);
+            SetMenuState();
+            return 0;
+        }
         switch (command) {
         case kIdNewTabButton: NewDocument(); break;
         case kIdToolbarNew: NewDocument(); break;
@@ -4525,6 +5396,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToolbarReplace: OpenFindDialog(true); break;
         case kIdToolbarGoto: OpenGotoDialog(); break;
         case kIdToolbarFormat: FormatActiveDocument(); break;
+        case kIdFileRename: RenameDocument(g_app.activeIndex); break;
         case kIdToolbarRun: RunActiveDocument(); break;
         case kIdToolbarEncoding:
             ShowEncodingMenu(ToolbarItemScreenRect(kIdToolbarEncoding));

@@ -1,0 +1,3 @@
+Vendored from https://github.com/wolfgitpr/cpp-pinyin (Apache-2.0) at commit 3ca0d99.
+Only include/, src/, cmake/ and the Mandarin dictionary are kept; tests and the Cantonese dictionary were left out.
+cpp-pinyin.pc.in is a minimal stand-in (the original is only used for installation).

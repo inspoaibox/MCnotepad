@@ -1,0 +1,4 @@
+Name: cpp-pinyin
+Description: Chinese/Cantonese to Pinyin library
+Version: @version@
+Libs: -lcpp-pinyin
