@@ -3206,6 +3206,16 @@ void RemoveRunningMarker() {
     fs::remove(g_app.runningMarkerPath, error);
 }
 
+void ChangeEditorFontSize(int delta) {
+    const int next = delta == 0 ? 13 : std::clamp(g_app.fontSize + delta, 10, 32);
+    if (next == g_app.fontSize) return;
+    g_app.fontSize = next;
+    CreateUiFonts();
+    ApplyEditorFont();
+    g_app.stateDirty = true;
+    ShowNotice(L"编辑器字号 " + std::to_wstring(g_app.fontSize) + L" px");
+}
+
 LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lParam) {
     const auto oldIt = g_editorProcs.find(editor);
     const WNDPROC oldProc = oldIt != g_editorProcs.end() ? oldIt->second : nullptr;
@@ -3230,6 +3240,18 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         (GetKeyState(VK_MENU) & 0x8000) == 0) {
         if (wParam == VK_F2) {
             SendMessageW(g_app.window, WM_COMMAND, kIdViewToggleBookmark, 0);
+            return 0;
+        }
+        if (wParam == VK_OEM_PLUS || wParam == VK_ADD) {
+            ChangeEditorFontSize(1);
+            return 0;
+        }
+        if (wParam == VK_OEM_MINUS || wParam == VK_SUBTRACT) {
+            ChangeEditorFontSize(-1);
+            return 0;
+        }
+        if (wParam == '0') {
+            ChangeEditorFontSize(13 - g_app.fontSize);
             return 0;
         }
         switch (static_cast<UINT>(wParam)) {
@@ -3268,11 +3290,7 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
     if (message == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0) {
         const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
         if (delta != 0) {
-            g_app.fontSize = std::clamp(g_app.fontSize + (delta > 0 ? 1 : -1), 10, 32);
-            CreateUiFonts();
-            ApplyEditorFont();
-            g_app.stateDirty = true;
-            ShowNotice(L"编辑器字号 " + std::to_wstring(g_app.fontSize) + L" px");
+            ChangeEditorFontSize(delta > 0 ? 1 : -1);
         }
         return 0;
     }
