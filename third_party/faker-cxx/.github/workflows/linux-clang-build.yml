@@ -1,0 +1,96 @@
+name: clang++
+
+on:
+  push:
+    branches:
+      - 'main'
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+  workflow_dispatch:
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+
+jobs:
+  build:
+    name: ci-ubuntu-24.04-clang-18-${{ matrix.type }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        type: [ static, shared ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install ccache
+        uses: hendrikmuhs/ccache-action@v1.2.23
+
+      - name: Cache Conan packages
+        id: cache-conan
+        uses: actions/cache@v6
+        env:
+          cache-name: cache-conan-packages
+        with:
+          path: ~/.conan2/p
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ env.cache-name }}-
+            ${{ runner.os }}-build-
+            ${{ runner.os }}-
+
+      - name: Configure python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: pip install -r .github/requirements.txt
+
+      - name: Configure Conan profiles
+        run: |
+          CC=clang-18 \
+          CXX=clang++-18 \
+          conan profile detect --force --name clang-18
+
+      - name: Configure Conan remote
+        run: conan remote update conancenter --url https://center2.conan.io
+
+      - name: Install Conan dependencies
+        run: |
+          conan install conanfile.txt \
+            -r conancenter \
+            -pr:b clang-18 \
+            -pr:h clang-18 \
+            -s compiler.cppstd=20 \
+            -s build_type=Debug \
+            -o "*:shared=True" \
+            -c:b tools.build:compiler_executables="{'c': '/usr/bin/clang-18', 'cpp': '/usr/bin/clang++-18'}" \
+            -c:h tools.build:compiler_executables="{'c': '/usr/bin/clang-18', 'cpp': '/usr/bin/clang++-18'}" \
+            --build=missing \
+
+      - name: Configure CMake
+        run: |
+          cmake -S ${{github.workspace}} --preset=unixlike-clang-debug-${{ matrix.type }} \
+            -DCMAKE_C_COMPILER=/usr/bin/clang-18 \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++-18 \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DFAKER_BUILD_TESTING:BOOL=ON \
+            -DUSE_SYSTEM_DEPENDENCIES:BOOL=ON \
+            -DUSE_STD_FORMAT:BOOL=ON \
+            -DCMAKE_TOOLCHAIN_FILE=build/Debug/generators/conan_toolchain.cmake \
+            -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld
+
+      - name: Build
+        run: cmake --build --preset=unixlike-clang-debug-${{ matrix.type }}
+
+      - name: Test
+        run: ctest --preset=unixlike-clang-debug-${{ matrix.type }}
+
+      - name: Install
+        run: cmake --build --preset=unixlike-clang-debug-${{ matrix.type }} --target install

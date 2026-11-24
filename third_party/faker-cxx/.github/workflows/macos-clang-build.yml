@@ -1,0 +1,102 @@
+name: apple-clang++
+
+on:
+  push:
+    branches:
+      - 'main'
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+  workflow_dispatch:
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+
+jobs:
+  build:
+    runs-on: macos-15
+    name: ci-macos-15-apple-clang-18-static
+    env:
+      CLANG18_PATH: /opt/homebrew/opt/llvm@18/bin/clang
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install ccache
+        uses: hendrikmuhs/ccache-action@v1.2.23
+
+      - name: Install clang
+        run: |
+          brew install llvm@18 \
+          && echo 'export PATH="/opt/homebrew/opt/llvm@18/bin:$PATH"' >> /Users/runner/.bash_profile \
+          && source /Users/runner/.bash_profile \
+          && which clang++
+
+      - name: Cache Conan packages
+        id: cache-conan
+        uses: actions/cache@v6
+        env:
+          cache-name: cache-conan-packages
+        with:
+          path: ~/.conan2/p
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('conanfile.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ env.cache-name }}-
+            ${{ runner.os }}-build-
+            ${{ runner.os }}-
+
+      - name: Configure python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: pip install -r .github/requirements.txt
+
+      - name: Configure Conan profile
+        run: |
+          CC=${{ env.CLANG18_PATH }} \
+          CXX=${{ env.CLANG18_PATH }}++ \
+          conan profile detect --force --name apple-clang-18
+
+      - name: Configure Conan remote
+        run: conan remote update conancenter --url https://center2.conan.io
+
+      - name: Install Conan dependencies
+        run: |
+          conan install conanfile.txt \
+            -r conancenter \
+            -pr:b apple-clang-18 \
+            -pr:h apple-clang-18 \
+            -s compiler.cppstd=20 \
+            -s build_type=Debug \
+            -o "*:shared=True" \
+            -c:b tools.build:compiler_executables="{'c': '${{ env.CLANG18_PATH }}', 'cpp': '${{ env.CLANG18_PATH }}++'}" \
+            -c:h tools.build:compiler_executables="{'c': '${{ env.CLANG18_PATH }}', 'cpp': '${{ env.CLANG18_PATH }}++'}" \
+            --build=missing
+
+
+      - name: Configure CMake
+        run: |
+          cmake -S . --preset=unixlike-clang-debug-static \
+            -DFAKER_BUILD_TESTING:BOOL=ON \
+            -DCMAKE_CXX_COMPILER=${{ env.CLANG18_PATH }}++ \
+            -DCMAKE_C_COMPILER=${{ env.CLANG18_PATH }} \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DUSE_STD_FORMAT:BOOL=ON \
+            -DUSE_SYSTEM_DEPENDENCIES:BOOL=ON \
+            -DCMAKE_TOOLCHAIN_FILE=build/Debug/generators/conan_toolchain.cmake
+
+      - name: Build
+        run: cmake --build --preset=unixlike-clang-debug-static
+
+      - name: Test
+        run: ctest --preset=unixlike-clang-debug-static
+
+      - name: Install
+        run: cmake --build --preset=unixlike-clang-debug-static --target install
