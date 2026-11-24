@@ -6427,6 +6427,9 @@ constexpr int kTabScrollRight = -4;
 int g_tabHot = -1;
 bool g_tabCloseHot = false;
 int g_tabPressedClose = -1;
+int g_tabDragIndex = -1;
+int g_tabDragStartX = 0;
+bool g_tabDragging = false;
 int g_tabScroll = 0;
 HWND g_tabTip = nullptr;
 
@@ -6532,6 +6535,21 @@ int TabHitTest(const TabLayout& layout, POINT point, bool* onClose) {
 }
 
 bool CloseDocument(int index);
+
+void MoveTab(int from, int to) {
+    if (from < 0 || to < 0 || from >= static_cast<int>(g_app.documents.size()) ||
+        to >= static_cast<int>(g_app.documents.size()) || from == to) return;
+    auto moved = std::move(g_app.documents[static_cast<size_t>(from)]);
+    g_app.documents.erase(g_app.documents.begin() + from);
+    g_app.documents.insert(g_app.documents.begin() + to, std::move(moved));
+    if (g_app.activeIndex == from) g_app.activeIndex = to;
+    else if (from < g_app.activeIndex && g_app.activeIndex <= to) --g_app.activeIndex;
+    else if (to <= g_app.activeIndex && g_app.activeIndex < from) ++g_app.activeIndex;
+    g_app.stateDirty = true;
+    EnsureTabVisible(to);
+    InvalidateTabs();
+    RefreshGutter();
+}
 
 void CopyTextToClipboard(const std::wstring& text) {
     // Clipboard history and other viewers briefly hold the clipboard after
@@ -6741,6 +6759,20 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
         return 0;
     }
     case WM_MOUSEMOVE: {
+        if (GetCapture() == strip && g_tabDragIndex >= 0) {
+            const int x = GET_X_LPARAM(lParam);
+            if (!g_tabDragging && std::abs(x - g_tabDragStartX) >= Scale(8)) g_tabDragging = true;
+            if (g_tabDragging) {
+                bool ignoredClose = false;
+                const int hit = TabHitTest(ComputeTabLayout(), POINT{x, GET_Y_LPARAM(lParam)}, &ignoredClose);
+                if (hit >= 0 && hit < static_cast<int>(g_app.documents.size()) && hit != g_tabDragIndex) {
+                    MoveTab(g_tabDragIndex, hit);
+                    g_tabDragIndex = hit;
+                }
+                InvalidateRect(strip, nullptr, FALSE);
+                return 0;
+            }
+        }
         const TabLayout layout = ComputeTabLayout();
         bool onClose = false;
         const int hit = TabHitTest(layout, POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, &onClose);
@@ -6780,12 +6812,27 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
             SetCapture(strip);
         } else if (hit >= 0) {
             SelectTab(hit);
+            g_tabDragIndex = hit;
+            g_tabDragStartX = GET_X_LPARAM(lParam);
+            g_tabDragging = false;
+            SetCapture(strip);
         }
         SetMenuState();
         InvalidateRect(strip, nullptr, FALSE);
         return 0;
     }
     case WM_LBUTTONUP: {
+        const bool dragged = g_tabDragging;
+        if (g_tabDragIndex >= 0) {
+            g_tabDragIndex = -1;
+            g_tabDragging = false;
+            if (GetCapture() == strip) ReleaseCapture();
+            if (dragged) {
+                SetMenuState();
+                InvalidateRect(strip, nullptr, FALSE);
+                return 0;
+            }
+        }
         const int pressed = g_tabPressedClose;
         g_tabPressedClose = -1;
         if (GetCapture() == strip) ReleaseCapture();
