@@ -95,6 +95,7 @@ constexpr int kIdFileSave = 1003;
 constexpr int kIdFileSaveAs = 1004;
 constexpr int kIdFileClose = 1005;
 constexpr int kIdFileExit = 1006;
+constexpr int kIdFileReopenClosed = 1008;
 constexpr int kIdEditUndo = 1101;
 constexpr int kIdEditRedo = 1102;
 constexpr int kIdEditCut = 1103;
@@ -281,6 +282,21 @@ struct TabDocument {
     uint64_t textHash = 0;       // to tell real edits from formatting-only EN_CHANGE
 };
 
+struct ClosedTab {
+    std::wstring path;
+    std::wstring title;
+    std::wstring text;
+    bool untitled = true;
+    bool modified = false;
+    int64_t caret = 0;
+    int64_t anchor = 0;
+    int firstVisibleLine = 0;
+    int encoding = 0;
+    int lineEnding = 0;
+    int language = 0;
+    uint64_t fileTimestamp = 0;
+};
+
 constexpr const wchar_t* kEncodingNames[] = {L"UTF-8", L"UTF-8 BOM", L"UTF-16 LE", L"UTF-16 BE", L"ANSI"};
 constexpr const wchar_t* kLineEndingNames[] = {L"CRLF", L"LF", L"CR"};
 constexpr const wchar_t* kLineEndingMenuNames[] = {L"Windows (CRLF)", L"Unix (LF)", L"旧式 Mac (CR)"};
@@ -364,6 +380,7 @@ struct AppState {
     bool findDialogIsReplace = false;
     wchar_t replaceBuffer[256]{};
     std::vector<TabDocument> documents;
+    std::vector<ClosedTab> closedTabs;
     std::vector<std::wstring> pendingOpenFiles;
     std::wstring statusNotice;
     int searchPanelHeight = 340;
@@ -3523,6 +3540,55 @@ bool PrepareDocumentClose(TabDocument& document) {
     return true;
 }
 
+void RememberClosedTab(TabDocument& document) {
+    CaptureEditorState(document);
+    ClosedTab closed;
+    closed.path = document.path;
+    closed.title = document.title;
+    closed.text = GetWindowTextValue(document.editor);
+    closed.untitled = document.untitled;
+    closed.modified = document.modified;
+    closed.caret = document.caret;
+    closed.anchor = document.anchor;
+    closed.firstVisibleLine = document.firstVisibleLine;
+    closed.encoding = document.encoding;
+    closed.lineEnding = document.lineEnding;
+    closed.language = document.language;
+    closed.fileTimestamp = document.fileTimestamp;
+    g_app.closedTabs.insert(g_app.closedTabs.begin(), std::move(closed));
+    constexpr size_t kClosedTabHistoryLimit = 30;
+    if (g_app.closedTabs.size() > kClosedTabHistoryLimit) {
+        g_app.closedTabs.resize(kClosedTabHistoryLimit);
+    }
+}
+
+void ReopenClosedDocument() {
+    if (g_app.closedTabs.empty()) return;
+    ClosedTab closed = std::move(g_app.closedTabs.front());
+    g_app.closedTabs.erase(g_app.closedTabs.begin());
+    DocumentFormat format;
+    format.encoding = closed.encoding;
+    format.lineEnding = closed.lineEnding;
+    format.language = closed.language;
+    format.fileTimestamp = closed.fileTimestamp;
+    if (!closed.modified && !closed.untitled && !closed.path.empty()) {
+        std::wstring currentText;
+        int encoding = format.encoding;
+        int lineEnding = format.lineEnding;
+        if (ReadTextFile(closed.path, currentText, &encoding, &lineEnding)) {
+            closed.text = std::move(currentText);
+            format.encoding = encoding;
+            format.lineEnding = lineEnding;
+            format.fileTimestamp = FileTimestamp(closed.path);
+        }
+    }
+    const int index = CreateDocument(closed.path, closed.title, std::move(closed.text), closed.untitled,
+        closed.modified, closed.caret, closed.anchor, closed.firstVisibleLine, nullptr, format);
+    if (index < 0) return;
+    SelectTab(index);
+    PersistAll(false);
+}
+
 bool CloseDocument(int index) {
     if (index < 0 || index >= static_cast<int>(g_app.documents.size())) {
         return false;
@@ -3530,6 +3596,8 @@ bool CloseDocument(int index) {
 
     TabDocument& document = g_app.documents[static_cast<size_t>(index)];
     if (!PrepareDocumentClose(document)) return false;
+
+    RememberClosedTab(document);
 
     const fs::path snapshot = document.snapshotPath;
     DestroyWindow(document.editor);
@@ -3622,6 +3690,8 @@ void SetMenuState() {
     EnableMenuItem(menu, kIdFileSave, MF_BYCOMMAND | (hasActive ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu, kIdFileSaveAs, MF_BYCOMMAND | (hasActive ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu, kIdFileClose, MF_BYCOMMAND | (hasActive ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, kIdFileReopenClosed, MF_BYCOMMAND |
+        (g_app.closedTabs.empty() ? MF_GRAYED : MF_ENABLED));
     if (g_app.themeMenu) {
         CheckMenuRadioItem(g_app.themeMenu, kIdThemeDark, kIdThemeBlue,
             kIdThemeDark + static_cast<int>(g_app.theme), MF_BYCOMMAND);
@@ -3673,6 +3743,7 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, kIdFileRename, L"重命名...\tF2");
     AppendMenuW(file, MF_STRING, kIdFileClose, L"关闭标签\tCtrl+W");
+    AppendMenuW(file, MF_STRING, kIdFileReopenClosed, L"重新打开关闭的标签\tCtrl+Shift+T");
     AppendMenuW(file, MF_STRING, kIdFileExit, L"退出");
 
     AppendMenuW(edit, MF_STRING, kIdEditUndo, L"撤销\tCtrl+Z");
@@ -4203,6 +4274,7 @@ HACCEL CreateAccelerators() {
         { FCONTROL | FVIRTKEY, 'S', kIdFileSave },
         { FCONTROL | FSHIFT | FVIRTKEY, 'S', kIdFileSaveAs },
         { FCONTROL | FVIRTKEY, 'W', kIdFileClose },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'T', kIdFileReopenClosed },
         { FCONTROL | FVIRTKEY, 'Z', kIdEditUndo },
         { FCONTROL | FVIRTKEY, 'Y', kIdEditRedo },
         { FCONTROL | FVIRTKEY, 'X', kIdEditCut },
@@ -16194,6 +16266,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdFileSave: SaveDocument(g_app.activeIndex, false); break;
         case kIdFileSaveAs: SaveDocument(g_app.activeIndex, true); break;
         case kIdFileClose: CloseDocument(g_app.activeIndex); break;
+        case kIdFileReopenClosed: ReopenClosedDocument(); break;
         case kIdFileExit: HandleMainWindowClose(true); break;
         case kIdHelpAbout:
             MessageBoxW(window,
