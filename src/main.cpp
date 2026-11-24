@@ -27,11 +27,14 @@
 #include <thread>
 #include <wincrypt.h>
 #include <cwctype>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 #include <iterator>
+#include <random>
+#include <chrono>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -45,6 +48,11 @@
 #include <cpp-pinyin/Pinyin.h>
 #include <cpp-pinyin/G2pglobal.h>
 #include <SimpleConverter.hpp>
+#include <faker-cxx/faker.h>
+
+extern "C" {
+#include "../third_party/duktape-2.7.0/src/duktape.h"
+}
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -93,6 +101,7 @@ constexpr int kIdEditCut = 1103;
 constexpr int kIdEditCopy = 1104;
 constexpr int kIdEditPaste = 1105;
 constexpr int kIdEditSelectAll = 1106;
+constexpr int kIdPrefixSuffix = 1107;
 constexpr int kIdHelpAbout = 1201;
 constexpr int kIdFindNext = 1206;
 constexpr int kIdFindPrevious = 1207;
@@ -133,7 +142,9 @@ enum TextToolId : int {
     kIdExtractEmails, kIdExtractUrls, kIdExtractIps, kIdExtractNumbers, kIdExtractKeywordLines, kIdExtractFields,
     kIdOutputReplace, kIdOutputNewTab, kIdOutputInsertBelow,  // order = ToolOutput values
     kIdTogglePreview,
-    kIdTextToolLast = kIdTogglePreview
+    kIdFormatCss, kIdMinifyCss, kIdFormatJavaScript, kIdMinifyJavaScript,
+    kIdMarkdownToHtml, kIdHtmlToMarkdown,
+    kIdTextToolLast = kIdMinifyJavaScript
 };
 constexpr int kIdNewTabButton = 1301;
 constexpr int kIdToolbarNew = 1401;
@@ -166,12 +177,73 @@ constexpr int kIdSettingsStartup = 1706;
 constexpr int kIdSettingsCloseBehavior = 1707;
 constexpr int kIdSettingsApply = 1708;
 constexpr int kIdSettingsCancel = 1709;
+constexpr int kIdSettingsWindowCloseBehavior = 1710;
+constexpr int kIdSettingsMinimizeToTray = 1711;
+constexpr int kIdSettingsShowTray = 1712;
+constexpr int kIdTrayShow = 1720;
+constexpr int kIdTrayExit = 1721;
 constexpr int kIdEncodingFirst = 1601;    // 1601..1605
 constexpr int kIdLineEndingFirst = 1611;  // 1611..1613
 constexpr int kIdLanguageFirst = 1621;    // 1621..1645
+constexpr int kIdLineSpacingFirst = 1651;
+constexpr int kIdLineSpacingSingle = kIdLineSpacingFirst;
+constexpr int kIdLineSpacing115 = kIdLineSpacingFirst + 1;
+constexpr int kIdLineSpacing150 = kIdLineSpacingFirst + 2;
+constexpr int kIdLineSpacing200 = kIdLineSpacingFirst + 3;
+constexpr int kIdLineSpacingCustom = kIdLineSpacingFirst + 4;
+
+enum DataGeneratorId : int {
+    kIdDataFirst = 1801,
+    kDataLineNumber = kIdDataFirst,
+    kDataArithmetic, kDataGeometric, kDataRandomInteger, kDataRandomDecimal,
+    kDataRandomPercent, kDataRandomLetter, kDataRandomString, kDataBoolean,
+    kDataPassword, kDataCaptcha, kDataColor, kDataChineseCharacter, kDataEnglishWord,
+    kDataUuid, kDataGuid, kDataUlid, kDataNanoId, kDataSnowflake, kDataOrderNumber,
+    kDataSku, kDataBarcode, kDataSerialNumber,
+    kDataCurrentDate, kDataCurrentTime, kDataCurrentDateTime, kDataUnixTimestamp,
+    kDataIsoTime, kDataRandomDate, kDataRandomTime, kDataDateSequence, kDataTimeSequence,
+    kDataChineseName, kDataEnglishName, kDataUsername, kDataEmail, kDataPhone,
+    kDataTelephone, kDataGender, kDataAge, kDataBirthDate, kDataCountry, kDataCity,
+    kDataStreet, kDataPostcode, kDataCompany, kDataJob, kDataProfile, kDataFullProfile,
+    kDataIpv4, kDataIpv6, kDataMac, kDataPort, kDataDomain, kDataUrl, kDataUserAgent,
+    kDataApiKey, kDataToken, kDataJwt, kDataHex, kDataBinary, kDataBase64, kDataHash,
+    kDataHttpHeaders,
+    kDataLorem, kDataChineseLorem, kDataEnglishLorem, kDataSentence, kDataParagraph,
+    kDataRepeatText, kDataRepeatChar, kDataBlankLines, kDataDivider, kDataMarkdownTable,
+    kDataMarkdownToc, kDataMarkdownTasks,
+    kDataJson, kDataJsonl, kDataXml, kDataCsv, kDataTsv, kDataYaml, kDataToml,
+    kDataSql, kDataHtmlTable, kDataTemplate, kDataMultiField, kDataUsers, kDataProducts,
+    kDataOrders, kDataLogs, kDataApiResponse,
+    kIdDataLast = kDataApiResponse
+};
+constexpr int kIdDataDialogCount = 1951;
+constexpr int kIdDataDialogStart = 1952;
+constexpr int kIdDataDialogEnd = 1953;
+constexpr int kIdDataDialogStep = 1954;
+constexpr int kIdDataDialogLength = 1955;
+constexpr int kIdDataDialogPrefix = 1956;
+constexpr int kIdDataDialogSuffix = 1957;
+constexpr int kIdDataDialogSeparator = 1958;
+constexpr int kIdDataDialogPadding = 1959;
+constexpr int kIdDataDialogSeed = 1960;
+constexpr int kIdDataDialogCharset = 1961;
+constexpr int kIdDataDialogRepeat = 1962;
+constexpr int kIdDataDialogLocale = 1963;
+constexpr int kIdDataDialogOutput = 1964;
+constexpr int kIdDataDialogUnique = 1965;
+constexpr int kIdDataDialogDescending = 1966;
+constexpr int kIdDataDialogPreview = 1967;
+constexpr int kIdDataDialogExecute = 1968;
+constexpr int kIdDataDialogCopy = 1969;
+constexpr int kIdDataDialogNewTab = 1970;
+constexpr int kIdDataDialogSaveTemplate = 1971;
 
 enum class ThemeKind { Dark = 0, Light = 1, Green = 2, Blue = 3 };
 enum class CloseBehavior { Prompt = 0, Direct = 1, Save = 2 };
+enum class WindowCloseBehavior { Exit = 0, MinimizeToTray = 1, Prompt = 2 };
+
+constexpr UINT kMessageTrayIcon = WM_APP + 5;
+constexpr UINT kTrayIconId = 1;
 
 enum class Tok : uint8_t {
     Plain, Keyword, Type, String, Number, Comment, Function, Tag, Attribute, Property, Constant, Meta,
@@ -273,11 +345,13 @@ struct AppState {
     HBRUSH controlBrush = nullptr;
     HBRUSH statusBrush = nullptr;
     HMENU themeMenu = nullptr;
+    HMENU lineSpacingMenu = nullptr;
     WNDPROC oldTabProc = nullptr;
     WNDPROC oldStatusProc = nullptr;
     bool darkTheme = true;
     ThemeKind theme = ThemeKind::Dark;
     int fontSize = 13;
+    int lineSpacingPercent = 100;
     std::wstring fontFamily = L"Consolas";
     bool showLineNumbers = true;
     bool wordWrap = false;
@@ -318,6 +392,11 @@ struct AppState {
     bool previousRunWasUnclean = false;
     bool launchAtStartup = false;
     CloseBehavior closeBehavior = CloseBehavior::Prompt;
+    WindowCloseBehavior windowCloseBehavior = WindowCloseBehavior::Exit;
+    bool minimizeToTray = false;
+    bool showTrayIcon = true;
+    bool trayIconAdded = false;
+    bool hiddenToTray = false;
     int languageIndex = 1;
     int encodingIndex = 0;
     int lineEndingIndex = 0;
@@ -329,6 +408,9 @@ struct AppState {
     HWND settingsWrapCheck = nullptr;
     HWND settingsStartupCheck = nullptr;
     HWND settingsCloseBehaviorCombo = nullptr;
+    HWND settingsWindowCloseBehaviorCombo = nullptr;
+    HWND settingsMinimizeToTrayCheck = nullptr;
+    HWND settingsShowTrayCheck = nullptr;
     fs::path dataDirectory;
     fs::path recoveryDirectory;
     fs::path sessionPath;
@@ -336,6 +418,12 @@ struct AppState {
 };
 
 AppState g_app;
+
+struct PromptChoice;
+bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels,
+    std::vector<std::wstring>& values,
+    std::vector<std::pair<std::wstring, bool>>* checks,
+    std::vector<PromptChoice>* choices);
 
 // All layout constants are in 96-DPI pixels; scale them for the window's
 // current monitor (the process is per-monitor DPI aware).
@@ -364,11 +452,21 @@ void RefreshGutter();
 void AppendEncodingItems(HMENU menu);
 void CheckDocumentMenuItems(HMENU menu);
 void ApplyWordWrapAll();
+void ApplyEditorLineSpacing(HWND editor);
+void ApplyEditorLineSpacingAll();
+void OpenCustomLineSpacingDialog();
+bool IsDataGeneratorCommand(int command);
+void AppendDataGeneratorMenus(HMENU menu);
+void OpenDataGeneratorDialog(int command);
+std::wstring Base64Encode(std::wstring_view text);
 bool CloseDocument(int index);
 void RenameDocument(int index);
 void AppendTextToolMenus(HMENU menu);
 void ThemeCheckbox(HWND box);
+void ThemePushButtons(std::initializer_list<HWND> buttons);
 void ShowNotice(const std::wstring& text);
+void SaveSearchState();
+void CancelSearch(bool wait);
 void ApplyToolResult(TabDocument& document, CHARRANGE range, const std::wstring& result, int mode,
     const std::wstring& toolName, std::wstring notice);
 void ApplySearchPanelTheme();
@@ -381,6 +479,15 @@ void RefreshChrome();
 void ApplyMenuColorMode();
 void EnsureTabVisible(int index);
 void InvalidateToolbar();
+void UpdateTrayIcon();
+void RemoveTrayIcon();
+void HideMainWindowToTray();
+void RestoreMainWindowFromTray();
+bool HandleMainWindowClose(bool forceExit = false);
+void OpenPrefixSuffixDialog();
+std::vector<std::wstring> SplitLines(std::wstring_view text);
+std::wstring JoinLines(const std::vector<std::wstring>& lines, std::wstring_view separator = L"\r");
+bool ToolRange(HWND editor, bool wholeLines, CHARRANGE& range, std::wstring& text, bool& wholeDocument);
 
 LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lParam);
 void ApplyEditorFont();
@@ -2893,6 +3000,7 @@ bool SaveSessionFile() {
     output << "MCSESSION\t1\n";
     output << "ACTIVE\t" << g_app.activeIndex << "\n";
     output << "THEME\t" << static_cast<int>(g_app.theme) << "\n";
+    output << "LINE_SPACING\t" << g_app.lineSpacingPercent << "\n";
     output << "OPTIONS\t" << (g_app.showLineNumbers ? 1 : 0) << '\t'
            << (g_app.wordWrap ? 1 : 0) << '\t'
            << (g_app.sidebarVisible ? 1 : 0) << '\t'
@@ -2905,7 +3013,10 @@ bool SaveSessionFile() {
     output << "PREFERENCES\t" << (g_app.launchAtStartup ? 1 : 0) << '\t'
            << static_cast<int>(g_app.closeBehavior) << '\t'
            << (g_app.previewTextTools ? 1 : 0) << '\t'
-           << g_app.toolOutputMode << "\n";
+           << g_app.toolOutputMode << '\t'
+           << static_cast<int>(g_app.windowCloseBehavior) << '\t'
+           << (g_app.minimizeToTray ? 1 : 0) << '\t'
+           << (g_app.showTrayIcon ? 1 : 0) << "\n";
 
     // rcNormalPosition is the restored size even while maximized/minimized.
     WINDOWPLACEMENT placement{};
@@ -3128,6 +3239,76 @@ void ApplyWordWrapAll() {
     RefreshGutter();
 }
 
+// RichEdit stores multiple line spacing in twentieths of a line.  Formatting
+// the complete document keeps the setting consistent across every paragraph,
+// while the event guard and modify flag preservation ensure this view option
+// never turns a clean document into an unsaved one.
+void ApplyEditorLineSpacing(HWND editor) {
+    if (!editor) return;
+    EditorEventMute mute(editor);
+    CHARRANGE selection{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const LONG firstVisibleLine = static_cast<LONG>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+    const LRESULT wasModified = SendMessageW(editor, EM_GETMODIFY, 0, 0);
+
+    PARAFORMAT2 format{};
+    format.cbSize = sizeof(format);
+    format.dwMask = PFM_LINESPACING;
+    format.bLineSpacingRule = tomLineSpaceMultiple;
+    format.dyLineSpacing = std::clamp(
+        MulDiv(g_app.lineSpacingPercent, 20, 100), 10, 60);
+
+    SendMessageW(editor, EM_SETSEL, 0, -1);
+    SendMessageW(editor, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format));
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    SendMessageW(editor, EM_SETMODIFY, wasModified ? TRUE : FALSE, 0);
+
+    const LONG nowVisibleLine = static_cast<LONG>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+    if (firstVisibleLine != nowVisibleLine) {
+        SendMessageW(editor, EM_LINESCROLL, 0, firstVisibleLine - nowVisibleLine);
+    }
+}
+
+void ApplyEditorLineSpacingAll() {
+    for (const TabDocument& document : g_app.documents) {
+        ApplyEditorLineSpacing(document.editor);
+    }
+    RefreshGutter();
+    g_app.stateDirty = true;
+}
+
+void SetLineSpacingPercent(int percent) {
+    g_app.lineSpacingPercent = std::clamp(percent, 50, 300);
+    ApplyEditorLineSpacingAll();
+    SetMenuState();
+}
+
+void OpenCustomLineSpacingDialog() {
+    std::wostringstream initial;
+    initial << std::fixed << std::setprecision(2)
+            << (static_cast<double>(g_app.lineSpacingPercent) / 100.0);
+    std::wstring value = initial.str();
+    std::vector<std::wstring> values{value};
+    if (!PromptForText(L"自定义行距", {L"行距倍数（0.50 - 3.00，例如 1.25）："}, values, nullptr, nullptr)) {
+        return;
+    }
+    value = values.front();
+
+    size_t consumed = 0;
+    double multiplier = 0.0;
+    try {
+        multiplier = std::stod(value, &consumed);
+    } catch (...) {
+        multiplier = 0.0;
+    }
+    while (consumed < value.size() && iswspace(value[consumed])) ++consumed;
+    if (consumed != value.size() || !std::isfinite(multiplier) || multiplier < 0.5 || multiplier > 3.0) {
+        MessageBoxW(g_app.window, L"请输入 0.50 到 3.00 之间的行距倍数。", kWindowTitle, MB_ICONWARNING);
+        return;
+    }
+    SetLineSpacingPercent(static_cast<int>(std::lround(multiplier * 100.0)));
+}
+
 int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     bool untitled, bool modified, int64_t caret, int64_t anchor, int firstVisibleLine,
     const fs::path* explicitSnapshot = nullptr, const DocumentFormat& format = {}) {
@@ -3186,7 +3367,6 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     SendMessageW(document.editor, WM_SETFONT,
         reinterpret_cast<WPARAM>(g_app.editorFont != nullptr
             ? g_app.editorFont : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-    ApplyEditorTheme(document.editor);
     SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
     // With an Asian keyboard layout active (e.g. a Chinese IME), RichEdit's
     // auto-font / dual-font modes switch typed text to a proportional UI font.
@@ -3195,6 +3375,11 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     SendMessageW(document.editor, EM_SETLANGOPTIONS, 0,
         languageOptions & ~static_cast<LRESULT>(IMF_AUTOFONT | IMF_DUALFONT | IMF_AUTOFONTSIZEADJUST));
     SetWindowTextW(document.editor, text.c_str());
+    // RichEdit resets the character format when WM_SETTEXT/SetWindowText is
+    // applied.  Set the theme after loading the document so dark-theme text
+    // does not fall back to the RichEdit default black foreground.
+    ApplyEditorTheme(document.editor);
+    ApplyEditorLineSpacing(document.editor);
     ApplyWordWrap(document.editor);
     if (LanguageFromPath(document.path) == kLanguagePlain) document.sniffedLanguage = SniffLanguage(text);
     // Colours are painted when the tab is shown (only the visible part).
@@ -3445,6 +3630,20 @@ void SetMenuState() {
         (g_app.showLineNumbers ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, kIdToolbarWrap, MF_BYCOMMAND |
         (g_app.wordWrap ? MF_CHECKED : MF_UNCHECKED));
+    if (g_app.lineSpacingMenu) {
+        for (int id = kIdLineSpacingSingle; id <= kIdLineSpacingCustom; ++id) {
+            CheckMenuItem(g_app.lineSpacingMenu, id, MF_BYCOMMAND | MF_UNCHECKED);
+        }
+        int selected = 0;
+        switch (g_app.lineSpacingPercent) {
+        case 100: selected = kIdLineSpacingSingle; break;
+        case 115: selected = kIdLineSpacing115; break;
+        case 150: selected = kIdLineSpacing150; break;
+        case 200: selected = kIdLineSpacing200; break;
+        default: selected = 0; break;
+        }
+        if (selected != 0) CheckMenuItem(g_app.lineSpacingMenu, selected, MF_BYCOMMAND | MF_CHECKED);
+    }
     CheckDocumentMenuItems(menu);
     CheckMenuItem(menu, kIdTogglePreview, MF_BYCOMMAND | (g_app.previewTextTools ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuRadioItem(menu, kIdOutputReplace, kIdOutputInsertBelow, kIdOutputReplace + g_app.toolOutputMode, MF_BYCOMMAND);
@@ -3455,8 +3654,10 @@ HMENU CreateApplicationMenu() {
     HMENU menu = CreateMenu();
     HMENU file = CreatePopupMenu();
     HMENU edit = CreatePopupMenu();
+    HMENU data = CreatePopupMenu();
     HMENU search = CreatePopupMenu();
     HMENU view = CreatePopupMenu();
+    HMENU lineSpacing = CreatePopupMenu();
     HMENU encoding = CreatePopupMenu();
     HMENU language = CreatePopupMenu();
     HMENU run = CreatePopupMenu();
@@ -3482,7 +3683,10 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(edit, MF_STRING, kIdEditPaste, L"粘贴\tCtrl+V");
     AppendMenuW(edit, MF_STRING, kIdEditSelectAll, L"全选\tCtrl+A");
     AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(edit, MF_STRING, kIdPrefixSuffix, L"前缀与后缀批量处理...");
+    AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
     AppendTextToolMenus(edit);
+    AppendDataGeneratorMenus(data);
 
     AppendMenuW(search, MF_STRING, kIdToolbarFind, L"查找\tCtrl+F");
     AppendMenuW(search, MF_STRING, kIdToolbarReplace, L"替换\tCtrl+H");
@@ -3512,6 +3716,14 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(search, MF_STRING, kIdToolbarGoto, L"跳转到行\tCtrl+G");
     AppendMenuW(view, MF_STRING, kIdToolbarLineNumbers, L"行号");
     AppendMenuW(view, MF_STRING, kIdToolbarWrap, L"自动换行");
+    AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacingSingle, L"1.0 倍");
+    AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacing115, L"1.15 倍");
+    AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacing150, L"1.5 倍");
+    AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacing200, L"2.0 倍");
+    AppendMenuW(lineSpacing, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacingCustom, L"自定义...");
+    g_app.lineSpacingMenu = lineSpacing;
+    AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(lineSpacing), L"行距");
     AppendEncodingItems(encoding);
     for (int index = 0; index < kLanguageCount; ++index) {
         AppendMenuW(language, MF_STRING, kIdLanguageFirst + index, kLanguageNames[index]);
@@ -3538,6 +3750,7 @@ HMENU CreateApplicationMenu() {
 
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"文件(F)");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(edit), L"编辑(E)");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(data), L"数据(D)");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(search), L"搜索(S)");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"视图(V)");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(encoding), L"编码(N)");
@@ -3575,6 +3788,7 @@ void LoadPersistedSession() {
     std::string line;
     int activeIndex = 0;
     int persistedTheme = static_cast<int>(g_app.theme);
+    int persistedLineSpacing = g_app.lineSpacingPercent;
     int persistedShowLineNumbers = g_app.showLineNumbers ? 1 : 0;
     int persistedWordWrap = g_app.wordWrap ? 1 : 0;
     int persistedSidebarVisible = g_app.sidebarVisible ? 1 : 0;
@@ -3584,6 +3798,9 @@ void LoadPersistedSession() {
     int persistedLineEnding = g_app.lineEndingIndex;
     int persistedStartup = g_app.launchAtStartup ? 1 : 0;
     int persistedCloseBehavior = static_cast<int>(g_app.closeBehavior);
+    int persistedWindowCloseBehavior = static_cast<int>(g_app.windowCloseBehavior);
+    int persistedMinimizeToTray = g_app.minimizeToTray ? 1 : 0;
+    int persistedShowTrayIcon = g_app.showTrayIcon ? 1 : 0;
     std::wstring persistedFontFamily = g_app.fontFamily;
     std::vector<SessionEntry> entries;
 
@@ -3598,6 +3815,8 @@ void LoadPersistedSession() {
             ParseInt(parts[1], activeIndex);
         } else if (parts[0] == "THEME" && parts.size() >= 2) {
             ParseInt(parts[1], persistedTheme);
+        } else if (parts[0] == "LINE_SPACING" && parts.size() >= 2) {
+            ParseInt(parts[1], persistedLineSpacing);
         } else if (parts[0] == "OPTIONS" && parts.size() >= 9) {
             ParseInt(parts[1], persistedShowLineNumbers);
             ParseInt(parts[2], persistedWordWrap);
@@ -3625,6 +3844,9 @@ void LoadPersistedSession() {
             if (parts.size() >= 4 && ParseInt(parts[3], preview)) g_app.previewTextTools = preview != 0;
             int outputMode = 1;
             if (parts.size() >= 5 && ParseInt(parts[4], outputMode)) g_app.toolOutputMode = std::clamp(outputMode, 0, 2);
+            if (parts.size() >= 6) ParseInt(parts[5], persistedWindowCloseBehavior);
+            if (parts.size() >= 7) ParseInt(parts[6], persistedMinimizeToTray);
+            if (parts.size() >= 8) ParseInt(parts[7], persistedShowTrayIcon);
         } else if (parts[0] == "WINDOW" && parts.size() >= 6) {
             int left = 0, top = 0, width = 0, height = 0, maximized = 0;
             if (ParseInt(parts[1], left) && ParseInt(parts[2], top) &&
@@ -3662,6 +3884,7 @@ void LoadPersistedSession() {
     }
 
     g_app.theme = static_cast<ThemeKind>(std::clamp(persistedTheme, 0, 3));
+    g_app.lineSpacingPercent = std::clamp(persistedLineSpacing, 50, 300);
     g_app.showLineNumbers = persistedShowLineNumbers != 0;
     g_app.wordWrap = persistedWordWrap != 0;
     g_app.sidebarVisible = false;
@@ -3672,6 +3895,9 @@ void LoadPersistedSession() {
     g_app.lineEndingIndex = std::clamp(persistedLineEnding, 0, kLineEndingCount - 1);
     g_app.launchAtStartup = persistedStartup != 0;
     g_app.closeBehavior = static_cast<CloseBehavior>(std::clamp(persistedCloseBehavior, 0, 2));
+    g_app.windowCloseBehavior = static_cast<WindowCloseBehavior>(std::clamp(persistedWindowCloseBehavior, 0, 2));
+    g_app.minimizeToTray = persistedMinimizeToTray != 0;
+    g_app.showTrayIcon = persistedShowTrayIcon != 0;
 
     // Font and theme first, so every editor below is created with them.
     ApplyEditorFont();
@@ -4080,12 +4306,111 @@ void ApplyEditorFont() {
     RefreshGutter();
 }
 
+void RemoveTrayIcon() {
+    if (!g_app.trayIconAdded || !g_app.window) return;
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = g_app.window;
+    data.uID = kTrayIconId;
+    Shell_NotifyIconW(NIM_DELETE, &data);
+    g_app.trayIconAdded = false;
+}
+
+void UpdateTrayIcon() {
+    if (!g_app.window) return;
+    const bool shouldShow = g_app.showTrayIcon || g_app.hiddenToTray;
+    if (!shouldShow) {
+        RemoveTrayIcon();
+        return;
+    }
+
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = g_app.window;
+    data.uID = kTrayIconId;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = kMessageTrayIcon;
+    data.hIcon = static_cast<HICON>(LoadImageW(g_app.instance, MAKEINTRESOURCEW(IDI_MCNOTEPAD),
+        IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    bool ownsIcon = data.hIcon != nullptr;
+    if (!data.hIcon) data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcsncpy_s(data.szTip, L"MCnotepad", _TRUNCATE);
+
+    if (g_app.trayIconAdded) {
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+    } else if (Shell_NotifyIconW(NIM_ADD, &data)) {
+        g_app.trayIconAdded = true;
+        data.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &data);
+    }
+    if (ownsIcon) DestroyIcon(data.hIcon);
+}
+
+void RestoreMainWindowFromTray() {
+    g_app.hiddenToTray = false;
+    UpdateTrayIcon();
+    ShowWindow(g_app.window, SW_SHOW);
+    ShowWindow(g_app.window, IsZoomed(g_app.window) ? SW_MAXIMIZE : SW_RESTORE);
+    SetForegroundWindow(g_app.window);
+}
+
+void HideMainWindowToTray() {
+    if (!g_app.window) return;
+    g_app.hiddenToTray = true;
+    PersistAll(false);
+    UpdateTrayIcon();
+    ShowWindow(g_app.window, SW_HIDE);
+}
+
+bool HandleMainWindowClose(bool forceExit) {
+    if (g_app.closing) return true;
+    if (!forceExit && g_app.windowCloseBehavior == WindowCloseBehavior::MinimizeToTray) {
+        HideMainWindowToTray();
+        return false;
+    }
+    if (!forceExit && g_app.windowCloseBehavior == WindowCloseBehavior::Prompt) {
+        const int choice = MessageBoxW(g_app.window,
+            L"关闭 MCnotepad：\n\n是：退出软件\n否：最小化到系统托盘\n取消：继续使用",
+            kWindowTitle, MB_YESNOCANCEL | MB_ICONQUESTION);
+        if (choice == IDCANCEL) return false;
+        if (choice == IDNO) {
+            HideMainWindowToTray();
+            return false;
+        }
+    }
+    if (!PrepareApplicationClose()) return false;
+
+    g_app.closing = true;
+    KillTimer(g_app.window, kTimerAutosave);
+    CancelSearch(true);
+    SaveSearchState();
+    const bool persisted = PersistAll(true);
+    if (!persisted) {
+        MessageBoxW(g_app.window, L"会话恢复数据保存失败，程序将继续退出。", kWindowTitle, MB_ICONWARNING);
+    }
+    RemoveRunningMarker();
+    DestroyWindow(g_app.window);
+    return true;
+}
+
 void CreateSettingsControl(HWND parent, const wchar_t* className, const wchar_t* text,
     DWORD style, int id, int x, int y, int width, int height) {
     HWND control = CreateWindowExW(0, className, text, WS_CHILD | WS_VISIBLE | style,
         Scale(x), Scale(y), Scale(width), Scale(height), parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
         g_app.instance, nullptr);
-    if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+    if (control) {
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        if (_wcsicmp(className, L"COMBOBOX") == 0) {
+            SetWindowTheme(control, g_app.darkTheme ? L"DarkMode_CFD" : L"Explorer", nullptr);
+        } else if (_wcsicmp(className, L"BUTTON") == 0) {
+            const LONG buttonType = static_cast<LONG>(style & BS_TYPEMASK);
+            if (buttonType == BS_AUTOCHECKBOX || buttonType == BS_AUTO3STATE) {
+                ThemeCheckbox(control);
+            } else if (g_app.darkTheme) {
+                SetWindowTheme(control, L"DarkMode_Explorer", nullptr);
+            }
+        }
+    }
     if (id == kIdSettingsFont) g_app.settingsFontCombo = control;
     if (id == kIdSettingsSize) g_app.settingsSizeCombo = control;
     if (id == kIdSettingsTheme) g_app.settingsThemeCombo = control;
@@ -4093,6 +4418,9 @@ void CreateSettingsControl(HWND parent, const wchar_t* className, const wchar_t*
     if (id == kIdSettingsWrap) g_app.settingsWrapCheck = control;
     if (id == kIdSettingsStartup) g_app.settingsStartupCheck = control;
     if (id == kIdSettingsCloseBehavior) g_app.settingsCloseBehaviorCombo = control;
+    if (id == kIdSettingsWindowCloseBehavior) g_app.settingsWindowCloseBehaviorCombo = control;
+    if (id == kIdSettingsMinimizeToTray) g_app.settingsMinimizeToTrayCheck = control;
+    if (id == kIdSettingsShowTray) g_app.settingsShowTrayCheck = control;
 }
 
 LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -4130,23 +4458,38 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             kIdSettingsStartup, 26, 132, 170, 26);
         SendMessageW(g_app.settingsStartupCheck, BM_SETCHECK,
             g_app.launchAtStartup ? BST_CHECKED : BST_UNCHECKED, 0);
-        addLabel(L"关闭未保存标签", 26, 170, 130, 24);
+        CreateSettingsControl(window, L"BUTTON", L"显示系统托盘图标", BS_AUTOCHECKBOX | WS_TABSTOP,
+            kIdSettingsShowTray, 215, 132, 190, 26);
+        SendMessageW(g_app.settingsShowTrayCheck, BM_SETCHECK,
+            g_app.showTrayIcon ? BST_CHECKED : BST_UNCHECKED, 0);
+        CreateSettingsControl(window, L"BUTTON", L"最小化时隐藏到托盘", BS_AUTOCHECKBOX | WS_TABSTOP,
+            kIdSettingsMinimizeToTray, 26, 164, 190, 26);
+        SendMessageW(g_app.settingsMinimizeToTrayCheck, BM_SETCHECK,
+            g_app.minimizeToTray ? BST_CHECKED : BST_UNCHECKED, 0);
+        addLabel(L"关闭按钮行为", 26, 202, 150, 24);
         CreateSettingsControl(window, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP,
-            kIdSettingsCloseBehavior, 160, 166, 260, 180);
+            kIdSettingsWindowCloseBehavior, 190, 198, 280, 180);
+        for (const wchar_t* value : {L"退出软件", L"最小化到系统托盘", L"每次询问"})
+            SendMessageW(g_app.settingsWindowCloseBehaviorCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
+        SendMessageW(g_app.settingsWindowCloseBehaviorCombo, CB_SETCURSEL,
+            static_cast<int>(g_app.windowCloseBehavior), 0);
+        addLabel(L"退出时未保存标签", 26, 240, 150, 24);
+        CreateSettingsControl(window, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP,
+            kIdSettingsCloseBehavior, 190, 236, 280, 180);
         for (const wchar_t* value : {L"提示保存", L"直接关闭（保留恢复内容）", L"自动保存后关闭"})
             SendMessageW(g_app.settingsCloseBehaviorCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
         SendMessageW(g_app.settingsCloseBehaviorCombo, CB_SETCURSEL,
             static_cast<int>(g_app.closeBehavior), 0);
         CreateSettingsControl(window, L"BUTTON", L"显示行号", BS_AUTOCHECKBOX | WS_TABSTOP,
-            kIdSettingsLineNumbers, 26, 208, 170, 26);
+            kIdSettingsLineNumbers, 26, 278, 170, 26);
         CreateSettingsControl(window, L"BUTTON", L"自动换行", BS_AUTOCHECKBOX | WS_TABSTOP,
-            kIdSettingsWrap, 215, 208, 170, 26);
+            kIdSettingsWrap, 215, 278, 170, 26);
         SendMessageW(g_app.settingsLineNumbersCheck, BM_SETCHECK, g_app.showLineNumbers ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(g_app.settingsWrapCheck, BM_SETCHECK, g_app.wordWrap ? BST_CHECKED : BST_UNCHECKED, 0);
         CreateSettingsControl(window, L"BUTTON", L"应用", BS_DEFPUSHBUTTON | WS_TABSTOP,
-            kIdSettingsApply, 250, 270, 82, 30);
+            kIdSettingsApply, 360, 340, 82, 30);
         CreateSettingsControl(window, L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP,
-            kIdSettingsCancel, 340, 270, 82, 30);
+            kIdSettingsCancel, 460, 340, 82, 30);
         return 0;
     }
     case WM_COMMAND:
@@ -4167,6 +4510,16 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             if (closeBehaviorIndex >= 0 && closeBehaviorIndex <= 2) {
                 g_app.closeBehavior = static_cast<CloseBehavior>(closeBehaviorIndex);
             }
+            const int windowCloseIndex = static_cast<int>(SendMessageW(
+                g_app.settingsWindowCloseBehaviorCombo, CB_GETCURSEL, 0, 0));
+            if (windowCloseIndex >= 0 && windowCloseIndex <= 2) {
+                g_app.windowCloseBehavior = static_cast<WindowCloseBehavior>(windowCloseIndex);
+            }
+            g_app.minimizeToTray = SendMessageW(g_app.settingsMinimizeToTrayCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            g_app.showTrayIcon = SendMessageW(g_app.settingsShowTrayCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            if (g_app.windowCloseBehavior == WindowCloseBehavior::MinimizeToTray) {
+                g_app.showTrayIcon = true;
+            }
             if (!SetStartupRegistration(startupEnabled)) {
                 MessageBoxW(window, L"开机启动设置写入失败，请检查当前账户的注册表权限。",
                     kWindowTitle, MB_ICONWARNING);
@@ -4175,6 +4528,7 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             }
             ApplyWordWrapAll();
             ApplyEditorFont();
+            UpdateTrayIcon();
             LayoutChildren(g_app.window);
             g_app.stateDirty = true;
             PersistAll(false);
@@ -4248,7 +4602,7 @@ void OpenSettingsDialog() {
     RegisterClassW(&klass);
     g_app.settingsWindow = CreateWindowExW(WS_EX_DLGMODALFRAME, klass.lpszClassName,
         L"MCnotepad 偏好设置", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, Scale(470), Scale(350), g_app.window, nullptr, g_app.instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, Scale(560), Scale(410), g_app.window, nullptr, g_app.instance, nullptr);
     if (!g_app.settingsWindow) return;
     EnableWindow(g_app.window, FALSE);
     ApplyWindowFrameTheme(g_app.settingsWindow);
@@ -4346,6 +4700,7 @@ void ReloadDocumentFromDisk(int index) {
     {
         EditorEventMute mute(document.editor);
         SetWindowTextW(document.editor, text.c_str());
+        ApplyEditorTheme(document.editor);
         SendMessageW(document.editor, EM_SETMODIFY, FALSE, 0);
     }
     document.encoding = encoding;
@@ -4621,6 +4976,415 @@ bool FormatJson(std::wstring_view input, std::wstring& output, std::wstring& err
     return true;
 }
 
+// The developer tools below intentionally use a small, allocation-friendly
+// lexer instead of a third-party parser.  Strings, template literals and
+// comments are treated as opaque tokens, so normal CSS/JavaScript pasted into
+// the editor is never modified inside a literal.  The tools are formatters,
+// not validators; malformed input is still returned in a deterministic form.
+bool CodeToolWordChar(wchar_t c) {
+    return std::iswalnum(c) || c == L'_' || c == L'$' || c == L'-';
+}
+
+bool CodeToolNeedsSpace(wchar_t left, wchar_t right) {
+    return CodeToolWordChar(left) && CodeToolWordChar(right);
+}
+
+void CodeToolTrimLine(std::wstring& output) {
+    while (!output.empty() && (output.back() == L' ' || output.back() == L'\t')) output.pop_back();
+}
+
+void CodeToolNewline(std::wstring& output, int indent, bool& lineStart) {
+    CodeToolTrimLine(output);
+    if (output.empty() || output.size() < 2 || output.compare(output.size() - 2, 2, L"\r\n") != 0) output += L"\r\n";
+    output.append(static_cast<size_t>(std::max(0, indent)) * 4, L' ');
+    lineStart = true;
+}
+
+size_t CodeToolSkipSpace(std::wstring_view input, size_t index) {
+    while (index < input.size() && std::iswspace(input[index])) ++index;
+    return index;
+}
+
+bool CssDeclarationColon(std::wstring_view input, size_t index) {
+    int parentheses = 0;
+    for (size_t i = index + 1; i < input.size(); ++i) {
+        const wchar_t c = input[i];
+        if (c == L'(') ++parentheses;
+        else if (c == L')' && parentheses > 0) --parentheses;
+        else if (parentheses == 0 && (c == L';' || c == L'{' || c == L'}' || c == L'\r' || c == L'\n')) {
+            return c == L';';
+        }
+    }
+    return true;
+}
+
+std::wstring FormatCss(std::wstring_view input) {
+    std::wstring output;
+    output.reserve(input.size() + input.size() / 3);
+    int indent = 0;
+    int parentheses = 0;
+    bool lineStart = true;
+    bool pendingSpace = false;
+    wchar_t quote = 0;
+    for (size_t i = 0; i < input.size();) {
+        const wchar_t c = input[i];
+        if (quote != 0) {
+            output += c;
+            ++i;
+            if (c == L'\\' && i < input.size()) output += input[i++];
+            else if (c == quote) quote = 0;
+            lineStart = false;
+            continue;
+        }
+        if (c == L'\'' || c == L'\"') {
+            if (pendingSpace && !lineStart && !output.empty() && output.back() != L' ') output += L' ';
+            pendingSpace = false;
+            output += c; quote = c; lineStart = false; ++i; continue;
+        }
+        if (c == L'/' && i + 1 < input.size() && input[i + 1] == L'*') {
+            const size_t end = input.find(L"*/", i + 2);
+            const size_t length = end == std::wstring_view::npos ? input.size() - i : end + 2 - i;
+            if (!lineStart) CodeToolNewline(output, indent, lineStart);
+            output.append(input.substr(i, length));
+            lineStart = false;
+            CodeToolNewline(output, indent, lineStart);
+            i += length; pendingSpace = false; continue;
+        }
+        if (std::iswspace(c)) { pendingSpace = true; ++i; continue; }
+        if (c == L'{') {
+            if (pendingSpace && !lineStart && !output.empty() && output.back() != L' ') output += L' ';
+            output += L'{'; ++indent; CodeToolNewline(output, indent, lineStart);
+            pendingSpace = false; ++i; continue;
+        }
+        if (c == L'}') {
+            CodeToolTrimLine(output);
+            if (!lineStart) CodeToolNewline(output, std::max(0, indent - 1), lineStart);
+            indent = std::max(0, indent - 1);
+            output += L'}'; lineStart = false;
+            const size_t next = CodeToolSkipSpace(input, i + 1);
+            if (next >= input.size() || (input[next] != L';' && input[next] != L',')) CodeToolNewline(output, indent, lineStart);
+            pendingSpace = false; ++i; continue;
+        }
+        if (c == L';') {
+            CodeToolTrimLine(output); output += L';';
+            if (parentheses == 0) CodeToolNewline(output, indent, lineStart);
+            else output += L' ';
+            pendingSpace = false; ++i; continue;
+        }
+        if (c == L'(') { output += c; ++parentheses; lineStart = false; pendingSpace = false; ++i; continue; }
+        if (c == L')') { CodeToolTrimLine(output); output += c; parentheses = std::max(0, parentheses - 1); lineStart = false; pendingSpace = false; ++i; continue; }
+        if (c == L':') {
+            CodeToolTrimLine(output); output += L':';
+            if (CssDeclarationColon(input, i)) output += L' ';
+            lineStart = false; pendingSpace = false; ++i; continue;
+        }
+        if (c == L',') {
+            CodeToolTrimLine(output); output += L", "; lineStart = false; pendingSpace = false; ++i; continue;
+        }
+        if (pendingSpace && !lineStart && !output.empty() && output.back() != L' ' && output.back() != L'\r' && output.back() != L'\n') output += L' ';
+        output += c; lineStart = false; pendingSpace = false; ++i;
+    }
+    CodeToolTrimLine(output);
+    while (output.size() >= 2 && output.compare(output.size() - 2, 2, L"\r\n") == 0) output.resize(output.size() - 2);
+    return output;
+}
+
+std::wstring MinifyCss(std::wstring_view input) {
+    std::wstring output;
+    output.reserve(input.size());
+    bool pendingSpace = false;
+    wchar_t quote = 0;
+    for (size_t i = 0; i < input.size();) {
+        const wchar_t c = input[i];
+        if (quote != 0) {
+            output += c; ++i;
+            if (c == L'\\' && i < input.size()) output += input[i++];
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == L'\'' || c == L'\"') { if (pendingSpace && !output.empty() && CodeToolWordChar(output.back())) output += L' '; pendingSpace = false; output += c; quote = c; ++i; continue; }
+        if (c == L'/' && i + 1 < input.size() && input[i + 1] == L'*') {
+            const size_t end = input.find(L"*/", i + 2);
+            const size_t length = end == std::wstring_view::npos ? input.size() - i : end + 2 - i;
+            const bool keep = i + 2 < input.size() && input[i + 2] == L'!';
+            if (keep) { if (pendingSpace && !output.empty()) output += L' '; output.append(input.substr(i, length)); }
+            i += length; pendingSpace = false; continue;
+        }
+        if (std::iswspace(c)) { pendingSpace = true; ++i; continue; }
+        if (c == L';') {
+            size_t next = CodeToolSkipSpace(input, i + 1);
+            if (next < input.size() && input[next] == L'}') { pendingSpace = false; ++i; continue; }
+        }
+        const bool punctuation = c == L'{' || c == L'}' || c == L';' || c == L':' || c == L',' || c == L'>' || c == L'~';
+        if (pendingSpace && !output.empty() && !punctuation && output.back() != L'{' && output.back() != L';' && output.back() != L':') {
+            if (CodeToolNeedsSpace(output.back(), c)) output += L' ';
+        }
+        pendingSpace = false;
+        if (punctuation) while (!output.empty() && output.back() == L' ') output.pop_back();
+        output += c; ++i;
+    }
+    while (!output.empty() && std::iswspace(output.back())) output.pop_back();
+    return output;
+}
+
+bool JsKeywordBeforeParen(const std::wstring& output) {
+    static constexpr const wchar_t* words[] = {L"if", L"for", L"while", L"switch", L"catch", L"with"};
+    for (const wchar_t* word : words) {
+        const size_t length = std::wcslen(word);
+        if (output.size() >= length && output.compare(output.size() - length, length, word) == 0) {
+            if (output.size() == length || !CodeToolWordChar(output[output.size() - length - 1])) return true;
+        }
+    }
+    return false;
+}
+
+bool JsUnaryOperator(const std::wstring& output) {
+    size_t i = output.size();
+    while (i > 0 && std::iswspace(output[i - 1])) --i;
+    if (i == 0) return true;
+    return std::wcschr(L"([{=,:;!?&|+-*/%<>", output[i - 1]) != nullptr;
+}
+
+bool JsLooksLikeRegexStart(const std::wstring& output) {
+    size_t i = output.size();
+    while (i > 0 && std::iswspace(output[i - 1])) --i;
+    if (i == 0 || std::wcschr(L"([{=,:;!?&|+-*%<>", output[i - 1]) != nullptr) return true;
+    size_t end = i;
+    while (i > 0 && CodeToolWordChar(output[i - 1])) --i;
+    const std::wstring_view word(output.data() + i, end - i);
+    for (const std::wstring_view keyword : {L"return", L"case", L"throw", L"typeof", L"void", L"delete", L"new", L"in", L"of", L"yield", L"await"}) {
+        if (word == keyword) return true;
+    }
+    return false;
+}
+
+size_t JsRegexEnd(std::wstring_view input, size_t start) {
+    bool escaped = false;
+    bool characterClass = false;
+    for (size_t i = start + 1; i < input.size(); ++i) {
+        const wchar_t c = input[i];
+        if (escaped) { escaped = false; continue; }
+        if (c == L'\\') { escaped = true; continue; }
+        if (c == L'[') { characterClass = true; continue; }
+        if (c == L']') { characterClass = false; continue; }
+        if (c == L'/' && !characterClass) {
+            ++i;
+            while (i < input.size() && std::iswalpha(input[i])) ++i;
+            return i;
+        }
+        if (c == L'\r' || c == L'\n') break;
+    }
+    return start;
+}
+
+std::wstring FormatJavaScript(std::wstring_view input) {
+    std::wstring output;
+    output.reserve(input.size() + input.size() / 3);
+    int indent = 0;
+    int parentheses = 0;
+    bool lineStart = true;
+    bool pendingSpace = false;
+    wchar_t quote = 0;
+    for (size_t i = 0; i < input.size();) {
+        const wchar_t c = input[i];
+        if (quote != 0) {
+            output += c; ++i;
+            if (c == L'\\' && i < input.size()) output += input[i++];
+            else if (c == quote) quote = 0;
+            lineStart = false; continue;
+        }
+        if (c == L'\'' || c == L'\"' || c == L'`') {
+            if (pendingSpace && !lineStart && !output.empty() && output.back() != L' ') output += L' ';
+            pendingSpace = false; output += c; quote = c; lineStart = false; ++i; continue;
+        }
+        if (c == L'/' && i + 1 < input.size() && input[i + 1] == L'/') {
+            if (pendingSpace && !lineStart) output += L' ';
+            const size_t end = input.find_first_of(L"\r\n", i + 2);
+            output.append(input.substr(i, end == std::wstring_view::npos ? input.size() - i : end - i));
+            lineStart = false; CodeToolNewline(output, indent, lineStart); pendingSpace = false;
+            i = end == std::wstring_view::npos ? input.size() : end; continue;
+        }
+        if (c == L'/' && i + 1 < input.size() && input[i + 1] == L'*') {
+            const size_t end = input.find(L"*/", i + 2);
+            const size_t length = end == std::wstring_view::npos ? input.size() - i : end + 2 - i;
+            if (!lineStart) CodeToolNewline(output, indent, lineStart);
+            output.append(input.substr(i, length)); lineStart = false;
+            CodeToolNewline(output, indent, lineStart); pendingSpace = false; i += length; continue;
+        }
+        if (c == L'/' && JsLooksLikeRegexStart(output)) {
+            const size_t end = JsRegexEnd(input, i);
+            if (end > i) {
+                if (pendingSpace && !lineStart && !output.empty() && output.back() != L' ') output += L' ';
+                output.append(input.substr(i, end - i)); lineStart = false; pendingSpace = false; i = end; continue;
+            }
+        }
+        if (std::iswspace(c)) { pendingSpace = true; ++i; continue; }
+        if (c == L'{') {
+            if (pendingSpace && !lineStart && !output.empty() && output.back() != L' ') output += L' ';
+            output += L'{'; ++indent; CodeToolNewline(output, indent, lineStart); pendingSpace = false; ++i; continue;
+        }
+        if (c == L'}') {
+            CodeToolTrimLine(output);
+            if (!lineStart) CodeToolNewline(output, std::max(0, indent - 1), lineStart);
+            indent = std::max(0, indent - 1); output += L'}'; lineStart = false;
+            size_t next = CodeToolSkipSpace(input, i + 1);
+            bool continuation = next < input.size() && (input[next] == L';' || input[next] == L',' || input[next] == L')' || input[next] == L']' || input[next] == L'.');
+            if (!continuation && next < input.size()) {
+                for (const wchar_t* word : {L"else", L"catch", L"finally"}) {
+                    const size_t n = std::wcslen(word);
+                    if (next + n <= input.size() && input.substr(next, n) == word) { continuation = true; break; }
+                }
+            }
+            if (continuation) output += L' '; else CodeToolNewline(output, indent, lineStart);
+            pendingSpace = false; ++i; continue;
+        }
+        if (c == L';') {
+            CodeToolTrimLine(output); output += L';';
+            if (parentheses == 0) CodeToolNewline(output, indent, lineStart); else output += L' ';
+            pendingSpace = false; ++i; continue;
+        }
+        if (c == L'(') {
+            if (JsKeywordBeforeParen(output)) output += L' ';
+            output += c; ++parentheses; lineStart = false; pendingSpace = false; ++i; continue;
+        }
+        if (c == L')') { CodeToolTrimLine(output); output += c; parentheses = std::max(0, parentheses - 1); lineStart = false; pendingSpace = false; ++i; continue; }
+        if (c == L',') { CodeToolTrimLine(output); output += L", "; lineStart = false; pendingSpace = false; ++i; continue; }
+        if (c == L':') { CodeToolTrimLine(output); output += L": "; lineStart = false; pendingSpace = false; ++i; continue; }
+        if (c == L'.') { CodeToolTrimLine(output); output += c; lineStart = false; pendingSpace = false; ++i; continue; }
+        if (c == L'!' || c == L'~') { if (pendingSpace && !JsUnaryOperator(output)) output += L' '; output += c; lineStart = false; pendingSpace = false; ++i; continue; }
+        if (c == L'+' || c == L'-') {
+            if (i + 1 < input.size() && input[i + 1] == c) { CodeToolTrimLine(output); output += c; output += c; i += 2; lineStart = false; pendingSpace = false; continue; }
+            if (JsUnaryOperator(output)) { CodeToolTrimLine(output); output += c; }
+            else { CodeToolTrimLine(output); output += L' '; output += c; output += L' '; }
+            lineStart = false; pendingSpace = false; ++i; continue;
+        }
+        const wchar_t* op = nullptr;
+        for (const wchar_t* candidate : {L"===", L"!==", L">>>", L"**=", L"=>", L"==", L"!=", L"<=", L">=", L"&&", L"||", L"??", L"+=", L"-=", L"*=", L"/=", L"%=", L"**", L"<<", L">>"}) {
+            const size_t n = std::wcslen(candidate);
+            if (i + n <= input.size() && input.substr(i, n) == candidate) { op = candidate; break; }
+        }
+        if (op != nullptr) {
+            CodeToolTrimLine(output); output += L' '; output += op; output += L' '; lineStart = false; pendingSpace = false; i += std::wcslen(op); continue;
+        }
+        if (std::wcschr(L"=*/%<>|&^", c) != nullptr) {
+            CodeToolTrimLine(output); output += L' '; output += c; output += L' '; lineStart = false; pendingSpace = false; ++i; continue;
+        }
+        if (pendingSpace && !lineStart && !output.empty() && output.back() != L' ' && CodeToolNeedsSpace(output.back(), c)) output += L' ';
+        output += c; lineStart = false; pendingSpace = false; ++i;
+    }
+    CodeToolTrimLine(output);
+    while (output.size() >= 2 && output.compare(output.size() - 2, 2, L"\r\n") == 0) output.resize(output.size() - 2);
+    return output;
+}
+
+std::wstring MinifyJavaScript(std::wstring_view input) {
+    std::wstring output;
+    output.reserve(input.size());
+    bool pendingSpace = false;
+    wchar_t quote = 0;
+    for (size_t i = 0; i < input.size();) {
+        const wchar_t c = input[i];
+        if (quote != 0) {
+            output += c; ++i;
+            if (c == L'\\' && i < input.size()) output += input[i++];
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == L'\'' || c == L'\"' || c == L'`') { if (pendingSpace && !output.empty() && CodeToolWordChar(output.back())) output += L' '; pendingSpace = false; output += c; quote = c; ++i; continue; }
+        if (c == L'/' && i + 1 < input.size() && input[i + 1] == L'/') {
+            const size_t end = input.find_first_of(L"\r\n", i + 2); i = end == std::wstring_view::npos ? input.size() : end; pendingSpace = true; continue;
+        }
+        if (c == L'/' && i + 1 < input.size() && input[i + 1] == L'*') {
+            const size_t end = input.find(L"*/", i + 2);
+            const size_t length = end == std::wstring_view::npos ? input.size() - i : end + 2 - i;
+            const bool keep = i + 2 < input.size() && input[i + 2] == L'!';
+            if (keep) { if (pendingSpace && !output.empty()) output += L' '; output.append(input.substr(i, length)); }
+            i += length; pendingSpace = true; continue;
+        }
+        if (std::iswspace(c)) { pendingSpace = true; ++i; continue; }
+        const bool punctuation = c == L'{' || c == L'}' || c == L'(' || c == L')' || c == L'[' || c == L']' || c == L';' || c == L',' || c == L':' || c == L'.';
+        if (pendingSpace && !output.empty() && !punctuation && CodeToolNeedsSpace(output.back(), c)) output += L' ';
+        pendingSpace = false;
+        if (c == L';') { size_t next = CodeToolSkipSpace(input, i + 1); if (next < input.size() && input[next] == L'}') { ++i; continue; } }
+        output += c; ++i;
+    }
+    while (!output.empty() && std::iswspace(output.back())) output.pop_back();
+    return output;
+}
+
+bool LoadTextAsset(const fs::path& path, std::string& output) {
+    std::vector<char> bytes;
+    if (!ReadBinaryFile(path, bytes)) return false;
+    output.assign(bytes.begin(), bytes.end());
+    return true;
+}
+
+bool ShowdownConvert(std::wstring_view input, bool markdownToHtml, std::wstring& output, std::wstring& error) {
+    if (input.size() > 8u * 1024u * 1024u) {
+        error = L"为避免转换过程占用过多内存，单次处理限制为 8 MB。";
+        return false;
+    }
+    static std::string showdownScript;
+    static std::string domScript;
+    static bool assetsLoaded = false;
+    if (!assetsLoaded) {
+        const fs::path root = fs::path(CurrentExecutablePath()).parent_path() / L"resources";
+        assetsLoaded = LoadTextAsset(root / L"showdown.js", showdownScript) &&
+            LoadTextAsset(root / L"showdown-dom.js", domScript);
+    }
+    if (!assetsLoaded) {
+        error = L"缺少 Showdown 运行资源，请确认 resources/showdown.js 和 resources/showdown-dom.js 存在。";
+        return false;
+    }
+    duk_context* ctx = duk_create_heap_default();
+    if (!ctx) { error = L"无法创建 JavaScript 运行环境。"; return false; }
+    auto fail = [&](const char* message) {
+        error = Utf8ToWide(message ? message : "JavaScript 执行失败");
+        duk_destroy_heap(ctx);
+        return false;
+    };
+    duk_push_lstring(ctx, showdownScript.data(), showdownScript.size());
+    if (duk_peval(ctx) != 0) return fail(duk_safe_to_string(ctx, -1));
+    duk_pop(ctx);
+    if (!markdownToHtml) {
+        duk_push_lstring(ctx, domScript.data(), domScript.size());
+        if (duk_peval(ctx) != 0) return fail(duk_safe_to_string(ctx, -1));
+        duk_pop(ctx);
+    }
+    duk_get_global_string(ctx, "showdown");
+    if (!duk_is_object(ctx, -1)) return fail("Showdown 初始化失败");
+    duk_get_prop_string(ctx, -1, "Converter");
+    if (!duk_is_function(ctx, -1)) return fail("Showdown Converter 不可用");
+    if (markdownToHtml) {
+        duk_push_object(ctx);
+        duk_push_true(ctx); duk_put_prop_string(ctx, -2, "tables");
+        duk_push_true(ctx); duk_put_prop_string(ctx, -2, "strikethrough");
+        duk_push_true(ctx); duk_put_prop_string(ctx, -2, "tasklists");
+        duk_push_true(ctx); duk_put_prop_string(ctx, -2, "ghCodeBlocks");
+        duk_push_true(ctx); duk_put_prop_string(ctx, -2, "simplifiedAutoLink");
+        duk_new(ctx, 1);
+    } else {
+        duk_new(ctx, 0);
+    }
+    const char* method = markdownToHtml ? "makeHtml" : "makeMarkdown";
+    duk_get_prop_string(ctx, -1, method);
+    if (!duk_is_function(ctx, -1)) return fail("Showdown 转换方法不可用");
+    duk_dup(ctx, -2);  // this = Converter instance
+    const std::string utf8 = WideToUtf8(input);
+    duk_push_lstring(ctx, utf8.data(), utf8.size());
+    if (!markdownToHtml) duk_get_global_string(ctx, "MCShowdownDOM");
+    if (duk_pcall_method(ctx, markdownToHtml ? 1 : 2) != 0) return fail(duk_safe_to_string(ctx, -1));
+    if (!duk_is_string(ctx, -1)) return fail("Showdown 返回了非文本结果");
+    output = Utf8ToWide(duk_get_string(ctx, -1));
+    if (!markdownToHtml) {
+        // The DOM adapter has no concept of an empty comment node.  Showdown
+        // may emit one while normalizing a fragment; it carries no content.
+        for (size_t pos = 0; (pos = output.find(L"<!-- -->", pos)) != std::wstring::npos;) output.erase(pos, 8);
+    }
+    duk_destroy_heap(ctx);
+    return true;
+}
+
 void FormatActiveDocument() {
     TabDocument* document = ActiveDocument();
     if (!document) return;
@@ -4804,6 +5568,22 @@ void DrawPlus(HDC dc, int cx, int cy, int half, COLORREF color) {
     graphics.DrawLine(&pen, x, y - h, x, y + h);
 }
 
+void DrawChevron(HDC dc, int cx, int cy, bool left, COLORREF color) {
+    Graphics graphics(dc);
+    graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+    Pen pen(ToGdiplus(color), static_cast<REAL>(std::max(1, Scale(1))) * 1.25f);
+    const REAL x = static_cast<REAL>(cx);
+    const REAL y = static_cast<REAL>(cy);
+    const REAL half = static_cast<REAL>(Scale(4));
+    if (left) {
+        graphics.DrawLine(&pen, x + half / 2, y - half, x - half / 2, y);
+        graphics.DrawLine(&pen, x - half / 2, y, x + half / 2, y + half);
+    } else {
+        graphics.DrawLine(&pen, x - half / 2, y - half, x + half / 2, y);
+        graphics.DrawLine(&pen, x + half / 2, y, x - half / 2, y + half);
+    }
+}
+
 void DrawHairline(HDC dc, int x1, int y1, int x2, int y2, COLORREF color) {
     RECT line{std::min(x1, x2), std::min(y1, y2), std::max(x1, x2) + (x1 == x2 ? 1 : 0),
         std::max(y1, y2) + (y1 == y2 ? 1 : 0)};
@@ -4874,7 +5654,10 @@ void DrawToolIcon(HDC dc, int id, const RECT& cell, COLORREF color) {
         DrawGlyphIcon(dc, cell, L"文A", g_app.uiFontFace.c_str(), 8, FW_SEMIBOLD, color);
         return;
     }
-    const int size = Scale(16);
+    const int cellWidth = static_cast<int>(cell.right - cell.left);
+    const int cellHeight = static_cast<int>(cell.bottom - cell.top);
+    const int size = std::min(Scale(16), std::max(Scale(12),
+        std::min(cellWidth, cellHeight) - Scale(6)));
     const int x = (cell.left + cell.right - size) / 2;
     const int y = (cell.top + cell.bottom - size) / 2;
     Bitmap* image = ToolbarIconImage(id);
@@ -4989,11 +5772,19 @@ void BuildMenuBarItems() {
 void LayoutMenuBarItems(HWND bar) {
     HDC dc = GetDC(bar);
     HGDIOBJ previous = SelectObject(dc, g_app.uiFont);
-    int x = Scale(4);
     RECT client{};
     GetClientRect(bar, &client);
+    const int paddings[] = {Scale(20), Scale(12), Scale(6)};
+    int horizontalPadding = paddings[0];
+    for (const int candidate : paddings) {
+        int total = Scale(4);
+        for (const MenuBarItem& item : g_menuItems) total += TextWidth(dc, item.text) + candidate;
+        horizontalPadding = candidate;
+        if (total <= client.right || candidate == paddings[std::size(paddings) - 1]) break;
+    }
+    int x = Scale(4);
     for (MenuBarItem& item : g_menuItems) {
-        const int width = TextWidth(dc, item.text) + Scale(20);
+        const int width = TextWidth(dc, item.text) + horizontalPadding;
         item.rect = RECT{x, Scale(3), x + width, client.bottom - Scale(3)};
         x += width;
     }
@@ -5203,20 +5994,41 @@ bool ToolChecked(int id) {
 void LayoutToolbarItems(HWND bar) {
     RECT client{};
     GetClientRect(bar, &client);
-    const int width = Scale(kToolButtonWidth);
+    const int itemCount = static_cast<int>(g_toolItems.size());
+    const int leftCount = static_cast<int>(std::count_if(g_toolItems.begin(), g_toolItems.end(),
+        [](const ToolbarItem& item) { return !item.alignRight; }));
+    const int rightCount = itemCount - leftCount;
+    const int groupBreaks = static_cast<int>(std::count_if(g_toolItems.begin(), g_toolItems.end(),
+        [](const ToolbarItem& item) { return !item.alignRight && item.groupStart; })) - 1;
+    const int padding = Scale(6);
+    int width = Scale(kToolButtonWidth);
+    int itemGap = Scale(2);
+    int groupGap = Scale(12);
+    const int available = std::max(0, static_cast<int>(client.right) - padding * 2);
+    const auto required = [&]() {
+        return itemCount * width + std::max(0, itemCount - rightCount - 1) * itemGap
+            + std::max(0, rightCount - 1) * itemGap + std::max(0, groupBreaks) * groupGap;
+    };
+    if (required() > available) {
+        itemGap = Scale(1);
+        groupGap = Scale(6);
+        const int fixed = std::max(0, itemCount - rightCount - 1) * itemGap
+            + std::max(0, rightCount - 1) * itemGap + std::max(0, groupBreaks) * groupGap;
+        width = std::max(Scale(22), (available - fixed) / std::max(1, itemCount));
+    }
     const int height = Scale(kToolButtonHeight);
     const int top = (client.bottom - height) / 2;
-    int x = Scale(6);
-    int right = client.right - Scale(6);
+    int x = padding;
+    int right = client.right - padding;
     for (size_t index = 0; index < g_toolItems.size(); ++index) {
         ToolbarItem& item = g_toolItems[index];
         if (item.alignRight) {
             item.rect = RECT{right - width, top, right, top + height};
-            right -= width + Scale(2);
+            right -= width + itemGap;
         } else {
-            if (item.groupStart && index > 0) x += Scale(12);
+            if (item.groupStart && index > 0) x += groupGap;
             item.rect = RECT{x, top, x + width, top + height};
-            x += width + Scale(2);
+            x += width + itemGap;
         }
         if (g_toolTip) {
             TOOLINFOW tool{sizeof(tool)};
@@ -5328,6 +6140,8 @@ LRESULT CALLBACK ToolbarProc(HWND bar, UINT message, WPARAM wParam, LPARAM lPara
 // ---- Tab strip ----------------------------------------------------------------
 
 constexpr int kTabPlus = -2;
+constexpr int kTabScrollLeft = -3;
+constexpr int kTabScrollRight = -4;
 int g_tabHot = -1;
 bool g_tabCloseHot = false;
 int g_tabPressedClose = -1;
@@ -5336,8 +6150,13 @@ HWND g_tabTip = nullptr;
 
 struct TabLayout {
     std::vector<RECT> tabs;
+    RECT scrollLeft{};
+    RECT scrollRight{};
     RECT plus{};
+    int visibleLeft = 0;
     int visibleRight = 0;  // tabs are clipped here when they overflow
+    int maxScroll = 0;
+    bool overflow = false;
 };
 
 TabLayout ComputeTabLayout() {
@@ -5359,20 +6178,35 @@ TabLayout ComputeTabLayout() {
 
     const int left = Scale(6);
     const int plusWidth = Scale(30);
-    layout.visibleRight = client.right - plusWidth - Scale(8);
-    const int available = std::max(0, layout.visibleRight - left);
-    g_tabScroll = std::clamp(g_tabScroll, 0, std::max(0, total - available));
     const int top = Scale(5);
-    int x = left - g_tabScroll;
+    const int buttonWidth = Scale(28);
+    const int rightEdge = std::max(left, static_cast<int>(client.right) - plusWidth - Scale(6));
+    const int unscrolledAvailable = std::max(0, rightEdge - left);
+    layout.overflow = total > unscrolledAvailable;
+    if (layout.overflow) {
+        layout.visibleLeft = buttonWidth;
+        layout.visibleRight = std::max(layout.visibleLeft, rightEdge - buttonWidth);
+        layout.scrollLeft = RECT{0, 0, buttonWidth, client.bottom};
+        layout.scrollRight = RECT{layout.visibleRight, 0, rightEdge, client.bottom};
+    } else {
+        layout.visibleLeft = left;
+        layout.visibleRight = rightEdge;
+    }
+    const int available = std::max(0, layout.visibleRight - layout.visibleLeft);
+    layout.maxScroll = std::max(0, total - available);
+    g_tabScroll = std::clamp(g_tabScroll, 0, layout.maxScroll);
+    int x = layout.visibleLeft - g_tabScroll;
     for (const int width : widths) {
         layout.tabs.push_back(RECT{x, top, x + width, client.bottom});
         x += width;
     }
-    // "+" follows the last tab; when tabs overflow it stays pinned on the right.
-    const int plusLeft = total <= available ? x + Scale(4) : layout.visibleRight + Scale(4);
+    // "+" follows the last tab when there is room and stays pinned on the right
+    // while the tab strip is horizontally scrolled.
+    const int plusLeft = layout.overflow
+        ? rightEdge + Scale(2)
+        : std::min(x + Scale(4), rightEdge + Scale(2));
     const int plusTop = top + (client.bottom - top - plusWidth) / 2;
     layout.plus = RECT{plusLeft, plusTop, plusLeft + plusWidth, plusTop + plusWidth};
-    if (total <= available) layout.visibleRight = client.right;
     return layout;
 }
 
@@ -5386,8 +6220,9 @@ void EnsureTabVisible(int index) {
     const TabLayout layout = ComputeTabLayout();
     if (index < 0 || index >= static_cast<int>(layout.tabs.size())) return;
     const RECT& tab = layout.tabs[static_cast<size_t>(index)];
-    if (tab.left < Scale(6)) g_tabScroll -= Scale(6) - tab.left;
+    if (tab.left < layout.visibleLeft) g_tabScroll -= layout.visibleLeft - tab.left;
     else if (tab.right > layout.visibleRight) g_tabScroll += tab.right - layout.visibleRight;
+    g_tabScroll = std::clamp(g_tabScroll, 0, layout.maxScroll);
     InvalidateRect(g_app.tabs, nullptr, FALSE);
 }
 
@@ -5395,11 +6230,14 @@ void InvalidateTabs() {
     if (g_app.tabs) InvalidateRect(g_app.tabs, nullptr, FALSE);
 }
 
-// Returns a tab index, kTabPlus, or -1; sets onClose when over a close box.
+// Returns a tab index, a tab-strip control constant, or -1; sets onClose when
+// the pointer is over a tab close box.
 int TabHitTest(const TabLayout& layout, POINT point, bool* onClose) {
     if (onClose) *onClose = false;
+    if (layout.overflow && PtInRect(&layout.scrollLeft, point)) return kTabScrollLeft;
+    if (layout.overflow && PtInRect(&layout.scrollRight, point)) return kTabScrollRight;
     if (PtInRect(&layout.plus, point)) return kTabPlus;
-    if (point.x >= layout.visibleRight) return -1;
+    if (point.x < layout.visibleLeft || point.x >= layout.visibleRight) return -1;
     for (size_t index = 0; index < layout.tabs.size(); ++index) {
         if (!PtInRect(&layout.tabs[index], point)) continue;
         if (onClose) {
@@ -5450,8 +6288,9 @@ void ShowTabContextMenu(int index, POINT screen) {
     AppendMenuW(menu, MF_STRING, 6, hasFile ? L"重命名文件...\tF2" : L"重命名标签...\tF2");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 1, L"关闭\tCtrl+W");
-    AppendMenuW(menu, MF_STRING | (last == 0 ? MF_GRAYED : 0), 2, L"关闭其他标签");
+    AppendMenuW(menu, MF_STRING | (index == 0 ? MF_GRAYED : 0), 8, L"关闭左侧标签");
     AppendMenuW(menu, MF_STRING | (index == last ? MF_GRAYED : 0), 3, L"关闭右侧标签");
+    AppendMenuW(menu, MF_STRING | (last == 0 ? MF_GRAYED : 0), 2, L"关闭其他标签");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (hasFile ? 0 : MF_GRAYED), 4, L"复制文件路径");
     AppendMenuW(menu, MF_STRING | (hasFile ? 0 : MF_GRAYED), 5, L"在资源管理器中显示");
@@ -5472,6 +6311,15 @@ void ShowTabContextMenu(int index, POINT screen) {
             if (i < static_cast<int>(g_app.documents.size()) && g_app.documents[static_cast<size_t>(i)].editor != target) {
                 if (!CloseDocument(i)) break;
             }
+        }
+        break;
+    case 8:
+        // Close from the beginning so the target tab remains addressable while
+        // vector indices shift after each successful close.
+        while (true) {
+            const int targetIndex = IndexOfEditor(target);
+            if (targetIndex <= 0) break;
+            if (!CloseDocument(0)) break;
         }
         break;
     case 3:
@@ -5527,7 +6375,7 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
         int activeRight = -1;
 
         const int saved = SaveDC(dc);
-        IntersectClipRect(dc, 0, 0, layout.visibleRight, client.bottom);
+        IntersectClipRect(dc, layout.visibleLeft, 0, layout.visibleRight, client.bottom);
         for (size_t index = 0; index < layout.tabs.size(); ++index) {
             const TabDocument& document = g_app.documents[index];
             const RECT& tab = layout.tabs[index];
@@ -5579,6 +6427,32 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
             DrawHairline(dc, 0, bottom, client.right, bottom, palette.panelBorder);
         }
 
+        if (layout.overflow) {
+            const bool canScrollLeft = g_tabScroll > 0;
+            const bool canScrollRight = g_tabScroll < layout.maxScroll;
+            const bool leftHot = g_tabHot == kTabScrollLeft;
+            const bool rightHot = g_tabHot == kTabScrollRight;
+            if (leftHot && canScrollLeft) {
+                FillRounded(dc, RECT{layout.scrollLeft.left + Scale(2), layout.scrollLeft.top + Scale(3),
+                    layout.scrollLeft.right - Scale(2), layout.scrollLeft.bottom - Scale(3)}, Scale(5),
+                    palette.toolbarButtonBackground);
+            }
+            if (rightHot && canScrollRight) {
+                FillRounded(dc, RECT{layout.scrollRight.left + Scale(2), layout.scrollRight.top + Scale(3),
+                    layout.scrollRight.right - Scale(2), layout.scrollRight.bottom - Scale(3)}, Scale(5),
+                    palette.toolbarButtonBackground);
+            }
+            DrawChevron(dc, (layout.scrollLeft.left + layout.scrollLeft.right) / 2,
+                (layout.scrollLeft.top + layout.scrollLeft.bottom) / 2, true,
+                canScrollLeft ? palette.toolbarIcon : palette.toolbarIconDisabled);
+            DrawChevron(dc, (layout.scrollRight.left + layout.scrollRight.right) / 2,
+                (layout.scrollRight.top + layout.scrollRight.bottom) / 2, false,
+                canScrollRight ? palette.toolbarIcon : palette.toolbarIconDisabled);
+            DrawHairline(dc, layout.scrollLeft.right - 1, Scale(7), layout.scrollLeft.right - 1,
+                client.bottom - Scale(7), palette.panelBorder);
+            DrawHairline(dc, layout.scrollRight.left, Scale(7), layout.scrollRight.left,
+                client.bottom - Scale(7), palette.panelBorder);
+        }
         if (g_tabHot == kTabPlus) FillRounded(dc, layout.plus, Scale(5), palette.toolbarButtonBackground);
         DrawPlus(dc, (layout.plus.left + layout.plus.right) / 2, (layout.plus.top + layout.plus.bottom) / 2,
             Scale(6), palette.toolbarIcon);
@@ -5611,7 +6485,13 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
     case WM_LBUTTONDOWN: {
         bool onClose = false;
         const int hit = TabHitTest(ComputeTabLayout(), POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, &onClose);
-        if (hit == kTabPlus) {
+        if (hit == kTabScrollLeft || hit == kTabScrollRight) {
+            const TabLayout layout = ComputeTabLayout();
+            const int step = std::max(Scale(96), layout.visibleRight - layout.visibleLeft - Scale(24));
+            g_tabScroll += hit == kTabScrollLeft ? -step : step;
+            g_tabScroll = std::clamp(g_tabScroll, 0, layout.maxScroll);
+            InvalidateRect(strip, nullptr, FALSE);
+        } else if (hit == kTabPlus) {
             NewDocument();
         } else if (hit >= 0 && onClose) {
             g_tabPressedClose = hit;
@@ -5660,8 +6540,13 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
         return 0;
     }
     case WM_MOUSEWHEEL: {
-        g_tabScroll -= GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA * Scale(80);
-        InvalidateRect(strip, nullptr, FALSE);
+        const TabLayout layout = ComputeTabLayout();
+        if (layout.overflow) {
+            const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+            g_tabScroll -= notches * Scale(100);
+            g_tabScroll = std::clamp(g_tabScroll, 0, layout.maxScroll);
+            InvalidateRect(strip, nullptr, FALSE);
+        }
         return 0;
     }
     case WM_NOTIFY: {
@@ -5982,6 +6867,13 @@ LRESULT CALLBACK PromptProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         SetBkColor(dc, CurrentPalette().windowBackground);
         return reinterpret_cast<LRESULT>(g_app.windowBrush);
     }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, CurrentPalette().controlText);
+        SetBkColor(dc, CurrentPalette().controlBackground);
+        return reinterpret_cast<LRESULT>(g_app.controlBrush);
+    }
     default:
         break;
     }
@@ -6122,6 +7014,605 @@ void RenameDocument(int index) {
     ShowNotice(L"已重命名为 " + document.title);
 }
 
+// ---- Prefix/suffix batch processor -------------------------------------------
+
+enum class PrefixSuffixOperation { Add = 0, Remove = 1, Replace = 2, FixedDelete = 3 };
+enum class PrefixSuffixTarget { Prefix = 0, Suffix = 1, Both = 2 };
+enum class PrefixSuffixScope { Selection = 0, CurrentDocument = 1, AllDocuments = 2 };
+
+struct PrefixSuffixRule {
+    PrefixSuffixOperation operation = PrefixSuffixOperation::Add;
+    PrefixSuffixTarget target = PrefixSuffixTarget::Prefix;
+    PrefixSuffixScope scope = PrefixSuffixScope::Selection;
+    std::wstring prefix;
+    std::wstring suffix;
+    std::wstring replacement;
+    int fixedLength = 1;
+    bool regex = false;
+    bool matchCase = false;
+    bool skipBlank = true;
+    bool skipExisting = true;
+    bool trimWhitespace = true;
+};
+
+struct PrefixSuffixResult {
+    std::wstring text;
+    int totalLines = 0;
+    int changedLines = 0;
+    int skippedLines = 0;
+};
+
+constexpr size_t kPrefixSuffixHistoryLimit = 100;
+std::vector<PrefixSuffixRule> g_recentPrefixSuffixRules;
+bool g_prefixSuffixHistoryLoaded = false;
+void SavePrefixSuffixHistory();
+
+bool PrefixSuffixEqual(std::wstring_view a, std::wstring_view b, bool matchCase) {
+    if (a.size() != b.size()) return false;
+    if (matchCase) return a == b;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::towlower(a[i]) != std::towlower(b[i])) return false;
+    }
+    return true;
+}
+
+struct PrefixSuffixMatch {
+    bool found = false;
+    size_t start = 0;
+    size_t length = 0;
+};
+
+bool PrefixSuffixRegexSearch(std::wstring_view line, std::wstring_view pattern, bool matchCase,
+    bool prefix, PrefixSuffixMatch& result, std::wstring& error) {
+    try {
+        const auto flags = std::regex_constants::ECMAScript |
+            (matchCase ? std::regex_constants::syntax_option_type{} : std::regex_constants::icase);
+        const std::wregex expression(std::wstring(pattern), flags);
+        const std::wstring value(line);
+        std::wsmatch match;
+        if (prefix) {
+            if (!std::regex_search(value.cbegin(), value.cend(), match, expression, std::regex_constants::match_continuous)) return true;
+            result = {true, static_cast<size_t>(match.position()), static_cast<size_t>(match.length())};
+        } else {
+            if (!std::regex_search(value.cbegin(), value.cend(), match, expression)) return true;
+            const size_t start = static_cast<size_t>(match.position());
+            const size_t length = static_cast<size_t>(match.length());
+            if (start + length != line.size()) return true;
+            result = {true, start, length};
+        }
+        return true;
+    } catch (const std::regex_error& ex) {
+        error = L"正则表达式无效（错误代码 " + std::to_wstring(static_cast<int>(ex.code())) + L"）。";
+        return false;
+    }
+}
+
+bool PrefixSuffixFind(std::wstring_view line, std::wstring_view pattern, bool regex, bool matchCase,
+    bool prefix, size_t searchStart, size_t searchEnd, PrefixSuffixMatch& result, std::wstring& error) {
+    if (pattern.empty()) return true;
+    const std::wstring_view part = line.substr(searchStart, searchEnd - searchStart);
+    if (regex) {
+        PrefixSuffixMatch local;
+        if (!PrefixSuffixRegexSearch(part, pattern, matchCase, prefix, local, error)) return false;
+        if (local.found) result = {true, searchStart + local.start, local.length};
+        return true;
+    }
+    if (prefix) {
+        if (part.size() >= pattern.size() && PrefixSuffixEqual(part.substr(0, pattern.size()), pattern, matchCase)) {
+            result = {true, searchStart, pattern.size()};
+        }
+    } else if (part.size() >= pattern.size() &&
+               PrefixSuffixEqual(part.substr(part.size() - pattern.size()), pattern, matchCase)) {
+        result = {true, searchEnd - pattern.size(), pattern.size()};
+    }
+    return true;
+}
+
+bool PrefixSuffixApplyLine(const PrefixSuffixRule& rule, std::wstring& line, bool& changed, std::wstring& error) {
+    changed = false;
+    const size_t contentStart = rule.trimWhitespace ? line.find_first_not_of(L" \t\u3000") : 0;
+    const size_t contentEnd = rule.trimWhitespace ? line.find_last_not_of(L" \t\u3000") + 1 : line.size();
+    if (contentStart == std::wstring::npos || contentStart >= contentEnd) return true;
+
+    PrefixSuffixMatch prefixMatch, suffixMatch;
+    const bool needPrefix = rule.target == PrefixSuffixTarget::Prefix || rule.target == PrefixSuffixTarget::Both;
+    const bool needSuffix = rule.target == PrefixSuffixTarget::Suffix || rule.target == PrefixSuffixTarget::Both;
+    if (needPrefix && !PrefixSuffixFind(line, rule.prefix, rule.regex, rule.matchCase, true,
+        contentStart, contentEnd, prefixMatch, error)) return false;
+    if (needSuffix && !PrefixSuffixFind(line, rule.suffix, rule.regex, rule.matchCase, false,
+        contentStart, contentEnd, suffixMatch, error)) return false;
+
+    if (rule.operation == PrefixSuffixOperation::Add && rule.skipExisting &&
+        ((needPrefix && prefixMatch.found) || (needSuffix && suffixMatch.found))) return true;
+
+    if (rule.operation == PrefixSuffixOperation::Add) {
+        if (needSuffix) line.insert(contentEnd, rule.suffix);
+        if (needPrefix) line.insert(contentStart, rule.prefix);
+        changed = needPrefix || needSuffix;
+        return true;
+    }
+    if (rule.operation == PrefixSuffixOperation::FixedDelete) {
+        const size_t count = static_cast<size_t>(std::max(0, rule.fixedLength));
+        if (count == 0) return true;
+        if (needSuffix) {
+            const size_t length = std::min(count, contentEnd - contentStart);
+            if (length > 0) { line.erase(contentEnd - length, length); changed = true; }
+        }
+        if (needPrefix) {
+            const size_t length = std::min(count, line.size() - contentStart);
+            if (length > 0) { line.erase(contentStart, length); changed = true; }
+        }
+        return true;
+    }
+
+    const auto replacementText = [&](std::wstring_view pattern, size_t start, size_t length) -> std::wstring {
+        if (!rule.regex) return rule.replacement;
+        try {
+            const auto flags = std::regex_constants::ECMAScript |
+                (rule.matchCase ? std::regex_constants::syntax_option_type{} : std::regex_constants::icase);
+            const std::wregex expression(std::wstring(pattern), flags);
+            const std::wstring segment = line.substr(start, length);
+            return std::regex_replace(segment, expression, rule.replacement,
+                std::regex_constants::format_default | std::regex_constants::format_first_only);
+        } catch (const std::regex_error& ex) {
+            error = L"正则表达式无效（错误代码 " + std::to_wstring(static_cast<int>(ex.code())) + L"）。";
+            return {};
+        }
+    };
+    if (needSuffix && suffixMatch.found) {
+        if (rule.operation == PrefixSuffixOperation::Remove) line.erase(suffixMatch.start, suffixMatch.length);
+        else {
+            const std::wstring replacement = replacementText(rule.suffix, suffixMatch.start, suffixMatch.length);
+            if (!error.empty()) return false;
+            line.replace(suffixMatch.start, suffixMatch.length, replacement);
+        }
+        changed = true;
+    }
+    if (needPrefix && prefixMatch.found) {
+        if (rule.operation == PrefixSuffixOperation::Remove) line.erase(prefixMatch.start, prefixMatch.length);
+        else {
+            const std::wstring replacement = replacementText(rule.prefix, prefixMatch.start, prefixMatch.length);
+            if (!error.empty()) return false;
+            line.replace(prefixMatch.start, prefixMatch.length, replacement);
+        }
+        changed = true;
+    }
+    return true;
+}
+
+PrefixSuffixResult TransformPrefixSuffix(const std::wstring& text, const PrefixSuffixRule& rule, std::wstring& error) {
+    PrefixSuffixResult result;
+    std::vector<std::wstring> lines = SplitLines(text);
+    result.totalLines = static_cast<int>(lines.size());
+    for (std::wstring& line : lines) {
+        if (rule.skipBlank && TrimCopy(line).empty()) { ++result.skippedLines; continue; }
+        const std::wstring before = line;
+        bool changed = false;
+        if (!PrefixSuffixApplyLine(rule, line, changed, error)) return {};
+        if (changed && line != before) ++result.changedLines;
+        else ++result.skippedLines;
+    }
+    result.text = JoinLines(lines, L"\r");
+    return result;
+}
+
+void RememberPrefixSuffixRule(const PrefixSuffixRule& rule) {
+    auto same = [&](const PrefixSuffixRule& other) {
+        return rule.operation == other.operation && rule.target == other.target && rule.scope == other.scope &&
+            rule.prefix == other.prefix && rule.suffix == other.suffix && rule.replacement == other.replacement &&
+            rule.fixedLength == other.fixedLength && rule.regex == other.regex && rule.matchCase == other.matchCase &&
+            rule.skipBlank == other.skipBlank && rule.skipExisting == other.skipExisting &&
+            rule.trimWhitespace == other.trimWhitespace;
+    };
+    std::erase_if(g_recentPrefixSuffixRules, same);
+    g_recentPrefixSuffixRules.insert(g_recentPrefixSuffixRules.begin(), rule);
+    if (g_recentPrefixSuffixRules.size() > kPrefixSuffixHistoryLimit) g_recentPrefixSuffixRules.resize(kPrefixSuffixHistoryLimit);
+    SavePrefixSuffixHistory();
+}
+
+const wchar_t* PrefixSuffixOperationName(PrefixSuffixOperation operation) {
+    switch (operation) {
+    case PrefixSuffixOperation::Add: return L"添加";
+    case PrefixSuffixOperation::Remove: return L"删除";
+    case PrefixSuffixOperation::Replace: return L"替换";
+    case PrefixSuffixOperation::FixedDelete: return L"定长删除";
+    default: return L"操作";
+    }
+}
+
+const wchar_t* PrefixSuffixTargetName(PrefixSuffixTarget target) {
+    switch (target) {
+    case PrefixSuffixTarget::Prefix: return L"前缀";
+    case PrefixSuffixTarget::Suffix: return L"后缀";
+    case PrefixSuffixTarget::Both: return L"前缀+后缀";
+    default: return L"目标";
+    }
+}
+
+std::wstring PrefixSuffixShortText(std::wstring_view value) {
+    constexpr size_t kMax = 22;
+    if (value.size() <= kMax) return std::wstring(value);
+    return std::wstring(value.substr(0, kMax)) + L"…";
+}
+
+std::wstring PrefixSuffixRuleLabel(const PrefixSuffixRule& rule) {
+    std::wstring label = std::wstring(PrefixSuffixOperationName(rule.operation)) + L" · " +
+        PrefixSuffixTargetName(rule.target);
+    if (!rule.prefix.empty()) label += L" · 前缀: " + PrefixSuffixShortText(rule.prefix);
+    if (!rule.suffix.empty()) label += L" · 后缀: " + PrefixSuffixShortText(rule.suffix);
+    if (rule.operation == PrefixSuffixOperation::Replace && !rule.replacement.empty()) {
+        label += L" → " + PrefixSuffixShortText(rule.replacement);
+    }
+    if (rule.operation == PrefixSuffixOperation::FixedDelete) {
+        label += L" · " + std::to_wstring(rule.fixedLength) + L" 字符";
+    }
+    return label;
+}
+
+fs::path PrefixSuffixHistoryPath() {
+    return g_app.dataDirectory / L"prefix-suffix-history.dat";
+}
+
+void SavePrefixSuffixHistory() {
+    std::ostringstream output;
+    output << "MCPREFIXHISTORY\t1\n";
+    for (const PrefixSuffixRule& rule : g_recentPrefixSuffixRules) {
+        output << static_cast<int>(rule.operation) << '\t'
+               << static_cast<int>(rule.target) << '\t'
+               << static_cast<int>(rule.scope) << '\t'
+               << rule.fixedLength << '\t'
+               << (rule.regex ? 1 : 0) << '\t'
+               << (rule.matchCase ? 1 : 0) << '\t'
+               << (rule.skipBlank ? 1 : 0) << '\t'
+               << (rule.skipExisting ? 1 : 0) << '\t'
+               << (rule.trimWhitespace ? 1 : 0) << '\t'
+               << HexEncode(WideToUtf8(rule.prefix)) << '\t'
+               << HexEncode(WideToUtf8(rule.suffix)) << '\t'
+               << HexEncode(WideToUtf8(rule.replacement)) << '\n';
+    }
+    WriteAtomicFile(PrefixSuffixHistoryPath(), output.str());
+}
+
+void LoadPrefixSuffixHistory() {
+    if (g_prefixSuffixHistoryLoaded) return;
+    g_prefixSuffixHistoryLoaded = true;
+    std::ifstream input(PrefixSuffixHistoryPath(), std::ios::binary);
+    if (!input) return;
+    std::string line;
+    while (std::getline(input, line) && g_recentPrefixSuffixRules.size() < kPrefixSuffixHistoryLimit) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::vector<std::string> parts = SplitTabs(line);
+        if (parts.size() < 12 || parts[0] == "MCPREFIXHISTORY") continue;
+        PrefixSuffixRule rule;
+        int operation = 0, target = 0, scope = 0, fixedLength = 1;
+        int regex = 0, matchCase = 0, skipBlank = 1, skipExisting = 1, trimWhitespace = 1;
+        if (!ParseInt(parts[0], operation) || !ParseInt(parts[1], target) || !ParseInt(parts[2], scope) ||
+            !ParseInt(parts[3], fixedLength) || !ParseInt(parts[4], regex) || !ParseInt(parts[5], matchCase) ||
+            !ParseInt(parts[6], skipBlank) || !ParseInt(parts[7], skipExisting) || !ParseInt(parts[8], trimWhitespace)) continue;
+        rule.operation = static_cast<PrefixSuffixOperation>(std::clamp(operation, 0, 3));
+        rule.target = static_cast<PrefixSuffixTarget>(std::clamp(target, 0, 2));
+        rule.scope = static_cast<PrefixSuffixScope>(std::clamp(scope, 0, 2));
+        rule.fixedLength = std::max(0, fixedLength);
+        rule.regex = regex != 0;
+        rule.matchCase = matchCase != 0;
+        rule.skipBlank = skipBlank != 0;
+        rule.skipExisting = skipExisting != 0;
+        rule.trimWhitespace = trimWhitespace != 0;
+        rule.prefix = Utf8ToWide(HexDecode(parts[9]));
+        rule.suffix = Utf8ToWide(HexDecode(parts[10]));
+        rule.replacement = Utf8ToWide(HexDecode(parts[11]));
+        g_recentPrefixSuffixRules.push_back(std::move(rule));
+    }
+}
+
+struct PrefixSuffixDialogState {
+    PrefixSuffixRule rule;
+    HWND operation = nullptr, target = nullptr, scope = nullptr, history = nullptr;
+    HWND prefix = nullptr, suffix = nullptr, replacement = nullptr, fixedLength = nullptr;
+    HWND regex = nullptr, matchCase = nullptr, skipBlank = nullptr, skipExisting = nullptr, trimWhitespace = nullptr;
+    HWND summary = nullptr, addHistory = nullptr, deleteHistory = nullptr;
+    bool done = false;
+    bool accepted = false;
+    bool populating = false;
+};
+
+enum : int {
+    kPsOperation = 50101, kPsTarget, kPsScope, kPsHistory, kPsPrefix, kPsSuffix, kPsReplacement, kPsFixedLength,
+    kPsRegex, kPsMatchCase, kPsSkipBlank, kPsSkipExisting, kPsTrimWhitespace, kPsSummary, kPsAddHistory, kPsDeleteHistory,
+};
+
+void PrefixSuffixSetControlText(HWND control, const std::wstring& value) {
+    SetWindowTextW(control, value.c_str());
+}
+
+void PrefixSuffixLoadControls(PrefixSuffixDialogState& state) {
+    state.populating = true;
+    SendMessageW(state.operation, CB_SETCURSEL, static_cast<WPARAM>(state.rule.operation), 0);
+    SendMessageW(state.target, CB_SETCURSEL, static_cast<WPARAM>(state.rule.target), 0);
+    SendMessageW(state.scope, CB_SETCURSEL, static_cast<WPARAM>(state.rule.scope), 0);
+    PrefixSuffixSetControlText(state.prefix, state.rule.prefix);
+    PrefixSuffixSetControlText(state.suffix, state.rule.suffix);
+    PrefixSuffixSetControlText(state.replacement, state.rule.replacement);
+    PrefixSuffixSetControlText(state.fixedLength, std::to_wstring(state.rule.fixedLength));
+    SendMessageW(state.regex, BM_SETCHECK, state.rule.regex ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(state.matchCase, BM_SETCHECK, state.rule.matchCase ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(state.skipBlank, BM_SETCHECK, state.rule.skipBlank ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(state.skipExisting, BM_SETCHECK, state.rule.skipExisting ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(state.trimWhitespace, BM_SETCHECK, state.rule.trimWhitespace ? BST_CHECKED : BST_UNCHECKED, 0);
+    state.populating = false;
+}
+
+void PrefixSuffixReadControls(PrefixSuffixDialogState& state) {
+    state.rule.operation = static_cast<PrefixSuffixOperation>(SendMessageW(state.operation, CB_GETCURSEL, 0, 0));
+    state.rule.target = static_cast<PrefixSuffixTarget>(SendMessageW(state.target, CB_GETCURSEL, 0, 0));
+    state.rule.scope = static_cast<PrefixSuffixScope>(SendMessageW(state.scope, CB_GETCURSEL, 0, 0));
+    state.rule.prefix = GetWindowTextValue(state.prefix);
+    state.rule.suffix = GetWindowTextValue(state.suffix);
+    state.rule.replacement = GetWindowTextValue(state.replacement);
+    state.rule.fixedLength = std::max(0, _wtoi(GetWindowTextValue(state.fixedLength).c_str()));
+    state.rule.regex = SendMessageW(state.regex, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.rule.matchCase = SendMessageW(state.matchCase, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.rule.skipBlank = SendMessageW(state.skipBlank, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.rule.skipExisting = SendMessageW(state.skipExisting, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.rule.trimWhitespace = SendMessageW(state.trimWhitespace, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+void PrefixSuffixRefreshHistoryList(PrefixSuffixDialogState& state) {
+    if (!state.history) return;
+    SendMessageW(state.history, LB_RESETCONTENT, 0, 0);
+    for (const PrefixSuffixRule& rule : g_recentPrefixSuffixRules) {
+        const std::wstring label = PrefixSuffixRuleLabel(rule);
+        SendMessageW(state.history, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+    }
+}
+
+bool PrefixSuffixSourceForDocument(int index, const PrefixSuffixRule& rule, CHARRANGE& range, std::wstring& text) {
+    if (index < 0 || index >= static_cast<int>(g_app.documents.size())) return false;
+    HWND editor = g_app.documents[static_cast<size_t>(index)].editor;
+    if (rule.scope == PrefixSuffixScope::Selection && index == g_app.activeIndex) {
+        bool wholeDocument = false;
+        ToolRange(editor, true, range, text, wholeDocument);
+        return true;
+    }
+    const std::wstring all = GetEditorRawText(editor);
+    range = CHARRANGE{0, static_cast<LONG>(all.size())};
+    if (range.cpMax > 0 && all.back() == L'\r') --range.cpMax;
+    text = all.substr(0, static_cast<size_t>(range.cpMax));
+    return true;
+}
+
+PrefixSuffixResult BuildPrefixSuffixPreview(const PrefixSuffixRule& rule, std::wstring& original, std::wstring& error) {
+    PrefixSuffixResult aggregate;
+    original.clear();
+    const int active = g_app.activeIndex;
+    if (active < 0 || g_app.documents.empty()) return aggregate;
+    if (rule.scope == PrefixSuffixScope::AllDocuments) {
+        for (int index = 0; index < static_cast<int>(g_app.documents.size()); ++index) {
+            CHARRANGE range{}; std::wstring source;
+            if (!PrefixSuffixSourceForDocument(index, rule, range, source)) continue;
+            PrefixSuffixResult item = TransformPrefixSuffix(source, rule, error);
+            if (!error.empty()) return {};
+            aggregate.totalLines += item.totalLines;
+            aggregate.changedLines += item.changedLines;
+            aggregate.skippedLines += item.skippedLines;
+            if (index == active) { original = std::move(source); aggregate.text = std::move(item.text); }
+        }
+    } else {
+        CHARRANGE range{}; std::wstring source;
+        PrefixSuffixSourceForDocument(active, rule, range, source);
+        original = source;
+        aggregate = TransformPrefixSuffix(source, rule, error);
+    }
+    return aggregate;
+}
+
+void PrefixSuffixRefreshPreview(HWND window, PrefixSuffixDialogState& state) {
+    if (state.populating) return;
+    PrefixSuffixReadControls(state);
+    std::wstring original, error;
+    const PrefixSuffixResult result = BuildPrefixSuffixPreview(state.rule, original, error);
+    const std::wstring summary = error.empty()
+        ? L"总行数：" + std::to_wstring(result.totalLines) + L"    修改：" + std::to_wstring(result.changedLines) +
+          L"    跳过：" + std::to_wstring(result.skippedLines)
+        : error;
+    SetWindowTextW(state.summary, summary.c_str());
+    const bool replacement = state.rule.operation == PrefixSuffixOperation::Replace;
+    const bool fixed = state.rule.operation == PrefixSuffixOperation::FixedDelete;
+    EnableWindow(state.replacement, replacement);
+    EnableWindow(state.fixedLength, fixed);
+    EnableWindow(state.skipExisting, state.rule.operation == PrefixSuffixOperation::Add);
+    (void)window;
+}
+
+void PrefixSuffixApply(PrefixSuffixDialogState& state) {
+    std::wstring original, error;
+    const PrefixSuffixResult preview = BuildPrefixSuffixPreview(state.rule, original, error);
+    if (!error.empty()) { MessageBoxW(g_app.window, error.c_str(), kWindowTitle, MB_ICONWARNING); return; }
+    if (preview.changedLines == 0) { ShowNotice(L"没有需要修改的行"); return; }
+    RememberPrefixSuffixRule(state.rule);
+    const int oldActive = g_app.activeIndex;
+    g_app.loading = true;
+    int changedDocuments = 0;
+    for (int index = 0; index < static_cast<int>(g_app.documents.size()); ++index) {
+        if (state.rule.scope != PrefixSuffixScope::AllDocuments && index != oldActive) continue;
+        CHARRANGE range{}; std::wstring source;
+        PrefixSuffixSourceForDocument(index, state.rule, range, source);
+        PrefixSuffixResult item = TransformPrefixSuffix(source, state.rule, error);
+        if (!error.empty()) break;
+        if (item.text == source) continue;
+        TabDocument& document = g_app.documents[static_cast<size_t>(index)];
+        SendMessageW(document.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+        SendMessageW(document.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(item.text.c_str()));
+        document.textHash = HashText(GetEditorRawText(document.editor));
+        document.modified = true;
+        document.syntaxStale = true;
+        MarkRecoveryDirty(index);
+        UpdateTabTitle(index);
+        ++changedDocuments;
+    }
+    g_app.loading = false;
+    if (!error.empty()) { MessageBoxW(g_app.window, error.c_str(), kWindowTitle, MB_ICONWARNING); return; }
+    RefreshGutter();
+    UpdateStatusBar();
+    SetMenuState();
+    ShowNotice(L"已处理 " + std::to_wstring(preview.changedLines) + L" 行（" + std::to_wstring(changedDocuments) + L" 个标签）");
+}
+
+LRESULT CALLBACK PrefixSuffixDialogProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<PrefixSuffixDialogState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE: {
+        state = static_cast<PrefixSuffixDialogState*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        auto label = [&](const wchar_t* text, int x, int y, int width = 150) {
+            HWND control = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, Scale(x), Scale(y), Scale(width), Scale(22), window, nullptr, g_app.instance, nullptr);
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE); return control;
+        };
+        auto combo = [&](int id, int x, int y, int width) {
+            HWND control = CreateWindowExW(0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+                Scale(x), Scale(y), Scale(width), Scale(180), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE); if (g_app.darkTheme) SetWindowTheme(control, L"DarkMode_CFD", nullptr); return control;
+        };
+        auto edit = [&](int id, int x, int y, int width, DWORD style = ES_AUTOHSCROLL) {
+            HWND control = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | style,
+                Scale(x), Scale(y), Scale(width), Scale(26), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            SetWindowTheme(control, g_app.darkTheme ? L"DarkMode_CFD" : L"Explorer", nullptr);
+            return control;
+        };
+        label(L"操作类型", 16, 14); state->operation = combo(kPsOperation, 16, 36, 170);
+        for (const wchar_t* item : {L"添加", L"删除", L"替换", L"定长删除"}) SendMessageW(state->operation, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        label(L"处理目标", 202, 14); state->target = combo(kPsTarget, 202, 36, 170);
+        for (const wchar_t* item : {L"前缀（行首）", L"后缀（行尾）", L"前缀和后缀"}) SendMessageW(state->target, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        label(L"处理范围", 388, 14); state->scope = combo(kPsScope, 388, 36, 230);
+        for (const wchar_t* item : {L"当前选中文本（按整行）", L"当前文档", L"所有已打开文档"}) SendMessageW(state->scope, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        label(L"前缀内容", 16, 140); state->prefix = edit(kPsPrefix, 16, 162, 290);
+        label(L"后缀内容", 326, 140); state->suffix = edit(kPsSuffix, 326, 162, 292);
+        label(L"替换内容（替换模式）", 16, 202); state->replacement = edit(kPsReplacement, 16, 224, 290);
+        label(L"定长删除数量", 326, 202); state->fixedLength = edit(kPsFixedLength, 326, 224, 120);
+        const auto check = [&](int id, const wchar_t* text, int x, int y, bool checked) {
+            HWND control = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                Scale(x), Scale(y), Scale(280), Scale(24), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app.instance, nullptr);
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE); SendMessageW(control, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0); ThemeCheckbox(control); return control;
+        };
+        state->regex = check(kPsRegex, L"使用正则表达式匹配", 16, 266, false);
+        state->matchCase = check(kPsMatchCase, L"区分大小写", 206, 266, false);
+        state->skipBlank = check(kPsSkipBlank, L"跳过空白行", 326, 266, true);
+        state->skipExisting = check(kPsSkipExisting, L"跳过已有相同前缀/后缀", 16, 294, true);
+        state->trimWhitespace = check(kPsTrimWhitespace, L"忽略行首、行尾空白进行匹配", 326, 294, true);
+        label(L"执行前统计", 16, 334, 300); state->summary = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE,
+            Scale(16), Scale(358), Scale(600), Scale(24), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPsSummary)), g_app.instance, nullptr);
+        SendMessageW(state->summary, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"执行处理", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            Scale(566), Scale(400), Scale(92), Scale(30), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), g_app.instance, nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(666), Scale(400), Scale(92), Scale(30), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
+        ThemePushButtons({ok, cancel}); SendMessageW(ok, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE); SendMessageW(cancel, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        label(L"历史操作（最近100条）", 790, 14, 230);
+        state->history = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            Scale(790), Scale(36), Scale(320), Scale(354), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPsHistory)), g_app.instance, nullptr);
+        SendMessageW(state->history, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        SetWindowTheme(state->history, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        state->addHistory = CreateWindowExW(0, L"BUTTON", L"添加记录", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(790), Scale(400), Scale(150), Scale(30), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPsAddHistory)), g_app.instance, nullptr);
+        state->deleteHistory = CreateWindowExW(0, L"BUTTON", L"删除记录", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(960), Scale(400), Scale(150), Scale(30), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPsDeleteHistory)), g_app.instance, nullptr);
+        ThemePushButtons({state->addHistory, state->deleteHistory});
+        SendMessageW(state->addHistory, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        SendMessageW(state->deleteHistory, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        PrefixSuffixRefreshHistoryList(*state);
+        PrefixSuffixLoadControls(*state);
+        SetTimer(window, 1, 120, nullptr);
+        return 0;
+    }
+    case WM_TIMER:
+        if (wParam == 1) { KillTimer(window, 1); PrefixSuffixRefreshPreview(window, *state); return 0; }
+        break;
+    case WM_COMMAND:
+        if (!state) break;
+        if (LOWORD(wParam) == IDOK) { PrefixSuffixReadControls(*state); state->accepted = true; state->done = true; return 0; }
+        if (LOWORD(wParam) == IDCANCEL) { state->done = true; return 0; }
+        if (LOWORD(wParam) == kPsHistory && HIWORD(wParam) == LBN_SELCHANGE) {
+            const int selected = static_cast<int>(SendMessageW(state->history, LB_GETCURSEL, 0, 0));
+            if (selected >= 0 && selected < static_cast<int>(g_recentPrefixSuffixRules.size())) {
+                state->rule = g_recentPrefixSuffixRules[static_cast<size_t>(selected)];
+                PrefixSuffixLoadControls(*state);
+                PrefixSuffixRefreshPreview(window, *state);
+            }
+            return 0;
+        }
+        if (LOWORD(wParam) == kPsAddHistory && HIWORD(wParam) == BN_CLICKED) {
+            PrefixSuffixReadControls(*state);
+            RememberPrefixSuffixRule(state->rule);
+            PrefixSuffixRefreshHistoryList(*state);
+            SendMessageW(state->history, LB_SETCURSEL, 0, 0);
+            return 0;
+        }
+        if (LOWORD(wParam) == kPsDeleteHistory && HIWORD(wParam) == BN_CLICKED) {
+            const int selected = static_cast<int>(SendMessageW(state->history, LB_GETCURSEL, 0, 0));
+            if (selected >= 0 && selected < static_cast<int>(g_recentPrefixSuffixRules.size())) {
+                g_recentPrefixSuffixRules.erase(g_recentPrefixSuffixRules.begin() + selected);
+                SavePrefixSuffixHistory();
+                PrefixSuffixRefreshHistoryList(*state);
+            }
+            return 0;
+        }
+        if (HIWORD(wParam) == CBN_SELCHANGE || HIWORD(wParam) == EN_CHANGE || HIWORD(wParam) == BN_CLICKED) SetTimer(window, 1, 120, nullptr);
+        return 0;
+    case WM_CLOSE:
+        if (state) state->done = true;
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT client{}; GetClientRect(window, &client); FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.windowBrush); return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        const ThemePalette& palette = CurrentPalette();
+        const HWND control = reinterpret_cast<HWND>(lParam);
+        const bool panelText = control == state->summary;
+        SetTextColor(dc, panelText ? palette.statusText : palette.controlText);
+        SetBkColor(dc, (message == WM_CTLCOLOREDIT || message == WM_CTLCOLORLISTBOX)
+            ? palette.controlBackground : palette.windowBackground);
+        return reinterpret_cast<LRESULT>((message == WM_CTLCOLOREDIT || message == WM_CTLCOLORLISTBOX)
+            ? g_app.controlBrush : g_app.windowBrush);
+    }
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void OpenPrefixSuffixDialog() {
+    if (!ActiveDocument()) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{}; klass.hInstance = g_app.instance; klass.lpfnWndProc = PrefixSuffixDialogProc; klass.lpszClassName = L"MCnotepadPrefixSuffix"; klass.hCursor = LoadCursorW(nullptr, IDC_ARROW); registered = RegisterClassW(&klass) != 0;
+    }
+    PrefixSuffixDialogState state;
+    RECT owner{}; GetWindowRect(g_app.window, &owner);
+    LoadPrefixSuffixHistory();
+    RECT frame{0, 0, Scale(1140), Scale(450)}; AdjustWindowRectExForDpi(&frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME, g_app.dpi);
+    const int width = frame.right - frame.left, height = frame.bottom - frame.top;
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"MCnotepadPrefixSuffix", L"前缀与后缀批量处理",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, owner.left + (owner.right - owner.left - width) / 2,
+        owner.top + (owner.bottom - owner.top - height) / 2, width, height, g_app.window, nullptr, g_app.instance, &state);
+    if (!dialog) return;
+    ApplyWindowFrameTheme(dialog); EnableWindow(g_app.window, FALSE); ShowWindow(dialog, SW_SHOW); PrefixSuffixRefreshPreview(dialog, state);
+    MSG message{};
+    while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dialog, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
+    }
+    if (message.message == WM_QUIT) PostQuitMessage(static_cast<int>(message.wParam));
+    EnableWindow(g_app.window, TRUE); DestroyWindow(dialog); SetForegroundWindow(g_app.window);
+    if (state.accepted) PrefixSuffixApply(state);
+    if (TabDocument* document = ActiveDocument()) SetFocus(document->editor);
+}
+
 // ---- Text tools -------------------------------------------------------------------
 
 std::vector<std::wstring> SplitLines(std::wstring_view text) {
@@ -6137,7 +7628,7 @@ std::vector<std::wstring> SplitLines(std::wstring_view text) {
     return lines;
 }
 
-std::wstring JoinLines(const std::vector<std::wstring>& lines, std::wstring_view separator = L"\r") {
+std::wstring JoinLines(const std::vector<std::wstring>& lines, std::wstring_view separator) {
     std::wstring result;
     for (size_t i = 0; i < lines.size(); ++i) {
         if (i > 0) result += separator;
@@ -6342,6 +7833,664 @@ bool IsTextToolCommand(int command) {
     return command >= kIdTextToolFirst && command <= kIdTextToolLast;
 }
 
+bool IsDataGeneratorCommand(int command) {
+    return command >= kIdDataFirst && command <= kIdDataLast;
+}
+
+void AppendDataGeneratorMenus(HMENU menu) {
+    auto add = [](HMENU target, int id, const wchar_t* text) {
+        AppendMenuW(target, MF_STRING, id, text);
+    };
+    HMENU basic = CreatePopupMenu();
+    add(basic, kDataLineNumber, L"连续行号");
+    add(basic, kDataArithmetic, L"等差数列");
+    add(basic, kDataGeometric, L"等比数列");
+    add(basic, kDataRandomInteger, L"随机整数");
+    add(basic, kDataRandomDecimal, L"随机小数");
+    add(basic, kDataRandomPercent, L"随机百分比");
+    add(basic, kDataRandomLetter, L"随机字母");
+    add(basic, kDataRandomString, L"随机字符串");
+    add(basic, kDataBoolean, L"随机布尔值");
+    add(basic, kDataPassword, L"随机密码");
+    add(basic, kDataCaptcha, L"随机验证码");
+    add(basic, kDataColor, L"随机颜色（HEX / RGB / HSL）");
+    add(basic, kDataChineseCharacter, L"随机中文字符");
+    add(basic, kDataEnglishWord, L"随机英文单词");
+
+    HMENU ids = CreatePopupMenu();
+    add(ids, kDataUuid, L"UUID"); add(ids, kDataGuid, L"GUID"); add(ids, kDataUlid, L"ULID");
+    add(ids, kDataNanoId, L"NanoID"); add(ids, kDataSnowflake, L"Snowflake ID");
+    add(ids, kDataOrderNumber, L"随机订单编号"); add(ids, kDataSku, L"随机商品 SKU");
+    add(ids, kDataBarcode, L"随机条形码（UPC / EAN）"); add(ids, kDataSerialNumber, L"随机序列号");
+
+    HMENU dates = CreatePopupMenu();
+    add(dates, kDataCurrentDate, L"当前日期"); add(dates, kDataCurrentTime, L"当前时间");
+    add(dates, kDataCurrentDateTime, L"当前日期时间"); add(dates, kDataUnixTimestamp, L"Unix 时间戳");
+    add(dates, kDataIsoTime, L"ISO 8601 时间"); add(dates, kDataRandomDate, L"随机日期");
+    add(dates, kDataRandomTime, L"随机时间"); add(dates, kDataDateSequence, L"连续日期序列");
+    add(dates, kDataTimeSequence, L"自定义时间间隔序列");
+
+    HMENU people = CreatePopupMenu();
+    add(people, kDataChineseName, L"随机中文姓名"); add(people, kDataEnglishName, L"随机英文姓名");
+    add(people, kDataUsername, L"随机用户名"); add(people, kDataEmail, L"随机电子邮箱");
+    add(people, kDataPhone, L"虚拟手机号码"); add(people, kDataTelephone, L"虚拟电话号码");
+    add(people, kDataGender, L"随机性别"); add(people, kDataAge, L"随机年龄");
+    add(people, kDataBirthDate, L"随机出生日期"); add(people, kDataCountry, L"虚拟国家及地区");
+    add(people, kDataCity, L"虚拟城市"); add(people, kDataStreet, L"虚拟街道地址");
+    add(people, kDataPostcode, L"虚拟邮政编码"); add(people, kDataCompany, L"虚拟公司名称");
+    add(people, kDataJob, L"虚拟职业名称"); add(people, kDataProfile, L"虚拟个人资料");
+    add(people, kDataFullProfile, L"完整个人信息");
+
+    HMENU network = CreatePopupMenu();
+    add(network, kDataIpv4, L"随机 IPv4 地址"); add(network, kDataIpv6, L"随机 IPv6 地址");
+    add(network, kDataMac, L"随机 MAC 地址"); add(network, kDataPort, L"随机端口号");
+    add(network, kDataDomain, L"虚拟域名"); add(network, kDataUrl, L"虚拟 URL");
+    add(network, kDataUserAgent, L"随机 User-Agent"); add(network, kDataApiKey, L"随机 API Key（测试用）");
+    add(network, kDataToken, L"随机 Token（测试用）"); add(network, kDataJwt, L"随机 JWT（测试用）");
+    add(network, kDataHex, L"随机十六进制数据"); add(network, kDataBinary, L"随机二进制数据");
+    add(network, kDataBase64, L"随机 Base64 数据"); add(network, kDataHash, L"随机哈希值");
+    add(network, kDataHttpHeaders, L"虚拟 HTTP 请求头");
+
+    HMENU text = CreatePopupMenu();
+    add(text, kDataLorem, L"Lorem Ipsum 占位文本"); add(text, kDataChineseLorem, L"中文占位文本");
+    add(text, kDataEnglishLorem, L"英文占位文本"); add(text, kDataSentence, L"随机句子");
+    add(text, kDataParagraph, L"随机段落"); add(text, kDataRepeatText, L"重复文本");
+    add(text, kDataRepeatChar, L"重复字符"); add(text, kDataBlankLines, L"指定数量空行");
+    add(text, kDataDivider, L"文本分隔线"); add(text, kDataMarkdownTable, L"Markdown 表格");
+    add(text, kDataMarkdownToc, L"Markdown 目录"); add(text, kDataMarkdownTasks, L"Markdown 任务清单");
+
+    HMENU structured = CreatePopupMenu();
+    add(structured, kDataJson, L"JSON 测试数据"); add(structured, kDataJsonl, L"JSONL 测试数据");
+    add(structured, kDataXml, L"XML 测试数据"); add(structured, kDataCsv, L"CSV 测试数据");
+    add(structured, kDataTsv, L"TSV 测试数据"); add(structured, kDataYaml, L"YAML 测试数据");
+    add(structured, kDataToml, L"TOML 测试数据"); add(structured, kDataSql, L"SQL INSERT 测试数据");
+    add(structured, kDataHtmlTable, L"HTML 表格"); add(structured, kDataTemplate, L"自定义模板数据");
+    add(structured, kDataMultiField, L"多字段组合数据"); add(structured, kDataUsers, L"批量虚拟用户数据");
+    add(structured, kDataProducts, L"批量虚拟商品数据"); add(structured, kDataOrders, L"批量虚拟订单数据");
+    add(structured, kDataLogs, L"模拟系统日志"); add(structured, kDataApiResponse, L"模拟 API 响应数据");
+
+    // Clicking “数据” opens the categories directly. Keep one level of
+    // navigation so every generator is reachable without an extra “生成” hop.
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(basic), L"基础数据生成");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(ids), L"标识符生成");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(dates), L"日期与时间生成");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(people), L"虚拟个人信息");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(network), L"网络与开发数据");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(text), L"文本内容生成");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(structured), L"结构化测试数据");
+}
+
+struct DataGeneratorOptions {
+    int count = 10;
+    int64_t start = 1;
+    int64_t end = 100;
+    int64_t step = 1;
+    int length = 12;
+    int padding = 0;
+    uint64_t seed = 0;
+    std::wstring prefix;
+    std::wstring suffix;
+    std::wstring separator = L"\\n";
+    std::wstring charset = L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    std::wstring repeatText = L"示例文本";
+    bool unique = false;
+    bool descending = false;
+    int locale = 0;   // 0 zh_CN, 1 en_US, 2 ja_JP, 3 de_DE, 4 fr_FR
+};
+
+faker::Locale DataLocale(int index) {
+    switch (index) {
+    case 1: return faker::Locale::en_US;
+    case 2: return faker::Locale::ja_JP;
+    case 3: return faker::Locale::de_DE;
+    case 4: return faker::Locale::fr_FR;
+    default: return faker::Locale::zh_CN;
+    }
+}
+
+std::wstring DataUnescape(std::wstring value) {
+    std::wstring result;
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == L'\\' && i + 1 < value.size()) {
+            const wchar_t next = value[++i];
+            if (next == L'n') result += L"\r\n";
+            else if (next == L'r') result += L'\r';
+            else if (next == L't') result += L'\t';
+            else result += next;
+        } else result += value[i];
+    }
+    return result;
+}
+
+std::wstring DataJoin(const std::vector<std::wstring>& values, const DataGeneratorOptions& options) {
+    const std::wstring separator = DataUnescape(options.separator);
+    std::wstring result;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) result += separator;
+        result += options.prefix;
+        result += values[i];
+        result += options.suffix;
+    }
+    return result;
+}
+
+std::wstring DataNow(const wchar_t* format) {
+    std::time_t now = std::time(nullptr);
+    tm local{};
+    localtime_s(&local, &now);
+    wchar_t buffer[80]{};
+    wcsftime(buffer, std::size(buffer), format, &local);
+    return buffer;
+}
+
+std::wstring DataRandomString(std::mt19937_64& rng, int length, const std::wstring& charset) {
+    const std::wstring pool = charset.empty() ? L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" : charset;
+    std::uniform_int_distribution<size_t> pick(0, pool.size() - 1);
+    std::wstring result;
+    result.reserve(static_cast<size_t>(length));
+    for (int i = 0; i < length; ++i) result += pool[pick(rng)];
+    return result;
+}
+
+std::wstring DataPad(int64_t value, int width) {
+    std::wstring result = std::to_wstring(value);
+    if (width > static_cast<int>(result.size())) result.insert(0, static_cast<size_t>(width - result.size()), L'0');
+    return result;
+}
+
+std::wstring DataJsonEscape(std::wstring value) {
+    std::wstring out;
+    for (wchar_t c : value) {
+        if (c == L'\\') out += L"\\\\";
+        else if (c == L'\"') out += L"\\\"";
+        else if (c == L'\r') out += L"\\r";
+        else if (c == L'\n') out += L"\\n";
+        else out += c;
+    }
+    return out;
+}
+
+void DataReplaceAll(std::wstring& value, std::wstring_view needle, std::wstring_view replacement) {
+    if (needle.empty()) return;
+    size_t position = 0;
+    while ((position = value.find(needle, position)) != std::wstring::npos) {
+        value.replace(position, needle.size(), replacement);
+        position += replacement.size();
+    }
+}
+
+std::wstring DataGeneratorLabel(int command) {
+    static const std::unordered_map<int, std::wstring> labels{
+        {kDataLineNumber,L"连续行号"},{kDataArithmetic,L"等差数列"},{kDataGeometric,L"等比数列"},
+        {kDataRandomInteger,L"随机整数"},{kDataRandomDecimal,L"随机小数"},{kDataRandomPercent,L"随机百分比"},
+        {kDataRandomLetter,L"随机字母"},{kDataRandomString,L"随机字符串"},{kDataBoolean,L"随机布尔值"},
+        {kDataPassword,L"随机密码"},{kDataCaptcha,L"随机验证码"},{kDataColor,L"随机颜色"},
+        {kDataChineseCharacter,L"随机中文字符"},{kDataEnglishWord,L"随机英文单词"},{kDataUuid,L"UUID"},
+        {kDataGuid,L"GUID"},{kDataUlid,L"ULID"},{kDataNanoId,L"NanoID"},{kDataSnowflake,L"Snowflake ID"},
+        {kDataOrderNumber,L"随机订单编号"},{kDataSku,L"随机商品 SKU"},{kDataBarcode,L"随机条形码"},
+        {kDataSerialNumber,L"随机序列号"},{kDataCurrentDate,L"当前日期"},{kDataCurrentTime,L"当前时间"},
+        {kDataCurrentDateTime,L"当前日期时间"},{kDataUnixTimestamp,L"Unix 时间戳"},{kDataIsoTime,L"ISO 8601 时间"},
+        {kDataRandomDate,L"随机日期"},{kDataRandomTime,L"随机时间"},{kDataDateSequence,L"连续日期序列"},
+        {kDataTimeSequence,L"时间间隔序列"},{kDataChineseName,L"随机中文姓名"},{kDataEnglishName,L"随机英文姓名"},
+        {kDataUsername,L"随机用户名"},{kDataEmail,L"随机电子邮箱"},{kDataPhone,L"虚拟手机号码"},
+        {kDataTelephone,L"虚拟电话号码"},{kDataGender,L"随机性别"},{kDataAge,L"随机年龄"},
+        {kDataBirthDate,L"随机出生日期"},{kDataCountry,L"虚拟国家及地区"},{kDataCity,L"虚拟城市"},
+        {kDataStreet,L"虚拟街道地址"},{kDataPostcode,L"虚拟邮政编码"},{kDataCompany,L"虚拟公司名称"},
+        {kDataJob,L"虚拟职业名称"},{kDataProfile,L"虚拟个人资料"},{kDataFullProfile,L"完整个人信息"},{kDataIpv4,L"随机 IPv4"},{kDataIpv6,L"随机 IPv6"},
+        {kDataMac,L"随机 MAC"},{kDataPort,L"随机端口"},{kDataDomain,L"虚拟域名"},{kDataUrl,L"虚拟 URL"},
+        {kDataUserAgent,L"随机 User-Agent"},{kDataApiKey,L"随机 API Key"},{kDataToken,L"随机 Token"},
+        {kDataJwt,L"随机 JWT"},{kDataHex,L"随机十六进制"},{kDataBinary,L"随机二进制"},{kDataBase64,L"随机 Base64"},
+        {kDataHash,L"随机哈希"},{kDataHttpHeaders,L"虚拟 HTTP 请求头"},{kDataLorem,L"Lorem Ipsum"},
+        {kDataChineseLorem,L"中文占位文本"},{kDataEnglishLorem,L"英文占位文本"},{kDataSentence,L"随机句子"},
+        {kDataParagraph,L"随机段落"},{kDataRepeatText,L"重复文本"},{kDataRepeatChar,L"重复字符"},
+        {kDataBlankLines,L"指定数量空行"},{kDataDivider,L"文本分隔线"},{kDataMarkdownTable,L"Markdown 表格"},
+        {kDataMarkdownToc,L"Markdown 目录"},{kDataMarkdownTasks,L"Markdown 任务清单"},{kDataJson,L"JSON 测试数据"},
+        {kDataJsonl,L"JSONL 测试数据"},{kDataXml,L"XML 测试数据"},{kDataCsv,L"CSV 测试数据"},
+        {kDataTsv,L"TSV 测试数据"},{kDataYaml,L"YAML 测试数据"},{kDataToml,L"TOML 测试数据"},
+        {kDataSql,L"SQL INSERT 测试数据"},{kDataHtmlTable,L"HTML 表格"},{kDataTemplate,L"自定义模板数据"},
+        {kDataMultiField,L"多字段组合数据"},{kDataUsers,L"批量虚拟用户数据"},{kDataProducts,L"批量虚拟商品数据"},
+        {kDataOrders,L"批量虚拟订单数据"},{kDataLogs,L"模拟系统日志"},{kDataApiResponse,L"模拟 API 响应数据"}
+    };
+    const auto it = labels.find(command);
+    return it == labels.end() ? L"数据生成" : it->second;
+}
+
+std::wstring GenerateDataValue(int command, const DataGeneratorOptions& options, std::mt19937_64& rng, int index) {
+    const faker::Locale locale = DataLocale(options.locale);
+    const auto randomInt = [&](int64_t lo, int64_t hi) {
+        if (lo > hi) std::swap(lo, hi);
+        return std::uniform_int_distribution<int64_t>(lo, hi)(rng);
+    };
+    switch (command) {
+    case kDataLineNumber: return DataPad(options.start + options.step * index, options.padding);
+    case kDataArithmetic: return DataPad(options.start + options.step * index, options.padding);
+    case kDataGeometric: return DataPad(static_cast<int64_t>(std::llround(options.start * std::pow(static_cast<double>(options.step), index))), options.padding);
+    case kDataRandomInteger: return std::to_wstring(randomInt(options.start, options.end));
+    case kDataRandomDecimal: { std::uniform_real_distribution<double> d(static_cast<double>(std::min(options.start, options.end)), static_cast<double>(std::max(options.start, options.end))); std::wostringstream s; s << std::fixed << std::setprecision(4) << d(rng); return s.str(); }
+    case kDataRandomPercent: { std::wostringstream s; s << randomInt(0, 100) << L"%"; return s.str(); }
+    case kDataRandomLetter: { const wchar_t letters[] = L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"; return std::wstring(1, letters[randomInt(0, 51)]); }
+    case kDataRandomString: return DataRandomString(rng, options.length, options.charset);
+    case kDataBoolean: return randomInt(0, 1) ? L"true" : L"false";
+    case kDataPassword: return Utf8ToWide(faker::internet::password(std::max(4, options.length)));
+    case kDataCaptcha: { std::wstring chars = L"0123456789"; return DataRandomString(rng, std::max(1, options.length), chars); }
+    case kDataColor: { const int kind = index % 3; return Utf8ToWide(kind == 0 ? faker::color::hex() : kind == 1 ? faker::color::rgb() : faker::color::hsl()); }
+    case kDataChineseCharacter: { static const wchar_t chars[] = L"的一是不了人我在有他这为之大来以个中上们到说时国和地要就出会可也你对生能而子那得于着下自之年过发后作里用道行所然家种事成方多经么去法学如都同现当没动面起看定天分还进好小部其些主样理心她本前开但因只从想实日军者意无力它与长把机十民第手"; return std::wstring(1, chars[randomInt(0, static_cast<int64_t>(std::size(chars) - 2))]); }
+    case kDataEnglishWord: return Utf8ToWide(faker::word::sample(std::nullopt, faker::Locale::en_US));
+    case kDataUuid: case kDataGuid: return Utf8ToWide(faker::string::uuidV4());
+    case kDataUlid: return Utf8ToWide(faker::string::ulid());
+    case kDataNanoId: return Utf8ToWide(faker::string::nanoId(std::max(4, options.length)));
+    case kDataSnowflake: { const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()); return std::to_wstring((now << 12) | (static_cast<uint64_t>(index) & 0xFFF)); }
+    case kDataOrderNumber: return L"ORD-" + DataNow(L"%Y%m%d") + DataPad(randomInt(0, 999999), 6);
+    case kDataSku: return Utf8ToWide(faker::commerce::sku(std::max(4, options.length)));
+    case kDataBarcode: return Utf8ToWide((index % 2) ? faker::commerce::EAN13() : faker::commerce::EAN8());
+    case kDataSerialNumber: return L"SN-" + DataRandomString(rng, std::max(6, options.length), L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789");
+    case kDataCurrentDate: return DataNow(L"%Y-%m-%d");
+    case kDataCurrentTime: return DataNow(L"%H:%M:%S");
+    case kDataCurrentDateTime: return DataNow(L"%Y-%m-%d %H:%M:%S");
+    case kDataUnixTimestamp: return std::to_wstring(std::time(nullptr));
+    case kDataIsoTime: return Utf8ToWide(faker::date::anytime(faker::date::DateFormat::ISO));
+    case kDataRandomDate: return Utf8ToWide(faker::date::anytime(faker::date::DateFormat::ISO)).substr(0, 10);
+    case kDataRandomTime: return Utf8ToWide(faker::date::anytime(faker::date::DateFormat::ISO)).substr(11, 8);
+    case kDataDateSequence: { std::time_t t = std::time(nullptr) + static_cast<time_t>(options.step * index * 86400); tm local{}; localtime_s(&local, &t); wchar_t b[32]{}; wcsftime(b, std::size(b), L"%Y-%m-%d", &local); return b; }
+    case kDataTimeSequence: { std::time_t t = std::time(nullptr) + static_cast<time_t>(options.step * index * 60); tm local{}; localtime_s(&local, &t); wchar_t b[32]{}; wcsftime(b, std::size(b), L"%Y-%m-%d %H:%M:%S", &local); return b; }
+    case kDataChineseName: return Utf8ToWide(faker::person::fullName(locale));
+    case kDataEnglishName: return Utf8ToWide(faker::person::fullName(faker::Locale::en_US));
+    case kDataUsername: return Utf8ToWide(faker::internet::username(std::nullopt, std::nullopt, locale));
+    case kDataEmail: return Utf8ToWide(faker::internet::exampleEmail(std::nullopt, std::nullopt, locale));
+    case kDataPhone: return Utf8ToWide(faker::phone::phoneNumberByFormat());
+    case kDataTelephone: return Utf8ToWide(faker::phone::phoneNumberByFormat());
+    case kDataGender: return Utf8ToWide(faker::person::gender());
+    case kDataAge: return std::to_wstring(randomInt(18, 80));
+    case kDataBirthDate: return Utf8ToWide(faker::date::birthdateByAge(18, 80));
+    case kDataCountry: return Utf8ToWide(faker::location::country());
+    case kDataCity: return Utf8ToWide(faker::location::city(locale));
+    case kDataStreet: return Utf8ToWide(faker::location::streetAddress(locale));
+    case kDataPostcode: return Utf8ToWide(faker::location::zipCode(locale));
+    case kDataCompany: return Utf8ToWide(faker::company::companyName(std::nullopt, locale));
+    case kDataJob: return Utf8ToWide(faker::person::jobTitle());
+    case kDataProfile: return Utf8ToWide(faker::person::bio());
+    case kDataFullProfile: {
+        // Build one coherent profile from the same first/last name pair so
+        // the generated username and e-mail belong to the displayed person.
+        const std::string firstName = std::string{faker::person::firstName(locale)};
+        const std::string lastName = std::string{faker::person::lastName(locale)};
+        const bool familyNameFirst = options.locale == 0 || options.locale == 2;
+        const std::string fullName = familyNameFirst ? lastName + firstName : firstName + " " + lastName;
+        const std::wstring username = Utf8ToWide(faker::internet::username(firstName, lastName, locale));
+        const std::wstring email = Utf8ToWide(faker::internet::exampleEmail(firstName, lastName, locale));
+        const std::wstring mobile = Utf8ToWide(faker::phone::phoneNumberByFormat());
+        const std::wstring telephone = Utf8ToWide(faker::phone::phoneNumberByFormat());
+        const std::wstring gender = Utf8ToWide(faker::person::sex(locale));
+        const int age = static_cast<int>(randomInt(18, 80));
+        const std::string birthDateValue = faker::date::birthdateByAge(static_cast<unsigned>(age), static_cast<unsigned>(age), faker::date::DateFormat::ISO);
+        const std::wstring birthDate = Utf8ToWide(birthDateValue.substr(0, 10));
+        const std::wstring country = Utf8ToWide(faker::location::country());
+        const std::wstring city = Utf8ToWide(faker::location::city(locale));
+        const std::wstring street = Utf8ToWide(faker::location::streetAddress(locale));
+        const std::wstring postcode = Utf8ToWide(faker::location::zipCode(locale));
+        const std::wstring company = Utf8ToWide(faker::company::companyName(std::nullopt, locale));
+        const std::wstring job = Utf8ToWide(faker::person::jobTitle());
+        const std::wstring profile = Utf8ToWide(faker::person::bio());
+
+        std::wstring result;
+        result += L"姓名：" + Utf8ToWide(fullName) + L"\r\n";
+        result += L"用户名：" + username + L"\r\n";
+        result += L"电子邮箱：" + email + L"\r\n";
+        result += L"手机号码：" + mobile + L"\r\n";
+        result += L"电话号码：" + telephone + L"\r\n";
+        result += L"性别：" + gender + L"\r\n";
+        result += L"年龄：" + std::to_wstring(age) + L"\r\n";
+        result += L"出生日期：" + birthDate + L"\r\n";
+        result += L"国家/地区：" + country + L"\r\n";
+        result += L"城市：" + city + L"\r\n";
+        result += L"街道地址：" + street + L"\r\n";
+        result += L"邮政编码：" + postcode + L"\r\n";
+        result += L"公司：" + company + L"\r\n";
+        result += L"职业：" + job + L"\r\n";
+        result += L"个人简介：" + profile;
+        return result;
+    }
+    case kDataIpv4: return Utf8ToWide(faker::internet::ipv4());
+    case kDataIpv6: return Utf8ToWide(faker::internet::ipv6());
+    case kDataMac: return Utf8ToWide(faker::internet::mac());
+    case kDataPort: return std::to_wstring(faker::internet::port());
+    case kDataDomain: return Utf8ToWide(faker::internet::domainName(locale));
+    case kDataUrl: return Utf8ToWide(faker::internet::url());
+    case kDataUserAgent: return L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/" + std::to_wstring(randomInt(110, 130)) + L".0 Safari/537.36";
+    case kDataApiKey: return L"test_" + DataRandomString(rng, std::max(16, options.length), L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
+    case kDataToken: return DataRandomString(rng, std::max(24, options.length), L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_~");
+    case kDataJwt: return Utf8ToWide(faker::internet::jwtToken());
+    case kDataHex: return DataRandomString(rng, std::max(2, options.length), L"0123456789abcdef");
+    case kDataBinary: return DataRandomString(rng, std::max(2, options.length), L"01");
+    case kDataBase64: return Base64Encode(DataRandomString(rng, std::max(4, options.length), options.charset));
+    case kDataHash: return Utf8ToWide(faker::crypto::sha256());
+    case kDataHttpHeaders: return Utf8ToWide(faker::internet::httpRequestHeader()) + L": " + Utf8ToWide(faker::internet::httpMediaType());
+    case kDataLorem: return Utf8ToWide(faker::lorem::sentence());
+    case kDataChineseLorem: return L"这是用于测试和演示的中文占位文本，内容会根据生成数量自动重复。";
+    case kDataEnglishLorem: return Utf8ToWide(faker::lorem::sentence());
+    case kDataSentence: return Utf8ToWide(faker::lorem::sentence());
+    case kDataParagraph: return Utf8ToWide(faker::lorem::paragraph());
+    case kDataRepeatText: return options.repeatText;
+    case kDataRepeatChar: return std::wstring(std::max(1, options.length), options.repeatText.empty() ? L'喵' : options.repeatText.front());
+    case kDataBlankLines: return {};
+    case kDataDivider: return L"────────────────────────────────────────";
+    case kDataMarkdownTable: return L"| 字段 | 示例值 |\r\n| --- | --- |\r\n| id | " + Utf8ToWide(faker::string::uuidV4()) + L" |";
+    case kDataMarkdownToc: return L"- [概述](#概述)\r\n- [安装](#安装)\r\n- [使用方法](#使用方法)";
+    case kDataMarkdownTasks: return L"- [ ] 待办事项\r\n- [ ] 测试数据\r\n- [x] 已完成事项";
+    case kDataJson: return L"{\"id\":\"" + Utf8ToWide(faker::string::uuidV4()) + L"\",\"name\":\"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\",\"email\":\"" + Utf8ToWide(faker::internet::exampleEmail()) + L"\"}";
+    case kDataJsonl: return L"{\"id\":\"" + Utf8ToWide(faker::string::uuidV4()) + L"\",\"value\":" + std::to_wstring(randomInt(1, 9999)) + L"}";
+    case kDataXml: return L"<item><id>" + Utf8ToWide(faker::string::uuidV4()) + L"</id><name>" + DataJsonEscape(Utf8ToWide(faker::commerce::productName())) + L"</name></item>";
+    case kDataCsv: return L"id,name,email\r\n" + Utf8ToWide(faker::string::uuidV4()) + L"," + Utf8ToWide(faker::person::fullName(locale)) + L"," + Utf8ToWide(faker::internet::exampleEmail());
+    case kDataTsv: return L"id\tname\temail\r\n" + Utf8ToWide(faker::string::uuidV4()) + L"\t" + Utf8ToWide(faker::person::fullName(locale)) + L"\t" + Utf8ToWide(faker::internet::exampleEmail());
+    case kDataYaml: return L"id: " + Utf8ToWide(faker::string::uuidV4()) + L"\r\nname: \"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\"\r\nactive: true";
+    case kDataToml: return L"id = \"" + Utf8ToWide(faker::string::uuidV4()) + L"\"\r\nname = \"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\"";
+    case kDataSql: return L"INSERT INTO users (id, name, email) VALUES ('" + Utf8ToWide(faker::string::uuidV4()) + L"', '" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"', '" + Utf8ToWide(faker::internet::exampleEmail()) + L"');";
+    case kDataHtmlTable: return L"<table>\r\n  <tr><th>ID</th><th>Name</th></tr>\r\n  <tr><td>" + Utf8ToWide(faker::string::uuidV4()) + L"</td><td>" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"</td></tr>\r\n</table>";
+    case kDataTemplate: {
+        std::wstring result = options.repeatText.empty() ? L"{{id}} {{name}} {{email}}" : options.repeatText;
+        DataReplaceAll(result, L"{{id}}", Utf8ToWide(faker::string::uuidV4()));
+        DataReplaceAll(result, L"{{uuid}}", Utf8ToWide(faker::string::uuidV4()));
+        DataReplaceAll(result, L"{{name}}", Utf8ToWide(faker::person::fullName(locale)));
+        DataReplaceAll(result, L"{{email}}", Utf8ToWide(faker::internet::exampleEmail()));
+        DataReplaceAll(result, L"{{date}}", DataNow(L"%Y-%m-%d"));
+        DataReplaceAll(result, L"{{index}}", std::to_wstring(index + 1));
+        return result;
+    }
+    case kDataMultiField: return Utf8ToWide(faker::string::uuidV4()) + L" | " + Utf8ToWide(faker::person::fullName(locale)) + L" | " + Utf8ToWide(faker::internet::exampleEmail());
+    case kDataUsers: return L"{\"id\":\"" + Utf8ToWide(faker::string::uuidV4()) + L"\",\"name\":\"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\",\"email\":\"" + Utf8ToWide(faker::internet::exampleEmail()) + L"\"}";
+    case kDataProducts: return L"{\"sku\":\"" + Utf8ToWide(faker::commerce::sku()) + L"\",\"name\":\"" + DataJsonEscape(Utf8ToWide(faker::commerce::productFullName())) + L"\"}";
+    case kDataOrders: return L"{\"orderNo\":\"ORD-" + DataNow(L"%Y%m%d") + DataPad(randomInt(0, 999999), 6) + L"\",\"status\":\"paid\"}";
+    case kDataLogs: return DataNow(L"%Y-%m-%d %H:%M:%S") + L" [INFO] request_id=" + Utf8ToWide(faker::string::uuidV4()) + L" status=200 latency=" + std::to_wstring(randomInt(1, 999)) + L"ms";
+    case kDataApiResponse: return L"{\"code\":200,\"message\":\"ok\",\"data\":{\"id\":\"" + Utf8ToWide(faker::string::uuidV4()) + L"\",\"timestamp\":" + std::to_wstring(std::time(nullptr)) + L"}}";
+    default: return {};
+    }
+}
+
+std::wstring GenerateDataText(int command, const DataGeneratorOptions& options) {
+    std::mt19937_64 rng(options.seed ? options.seed : std::random_device{}());
+    const int count = std::clamp(options.count, 1, 100000);
+    std::vector<std::wstring> values;
+    values.reserve(static_cast<size_t>(count));
+    std::unordered_set<std::wstring> seen;
+    for (int i = 0; i < count; ++i) {
+        std::wstring value;
+        int attempts = 0;
+        do {
+            value = GenerateDataValue(command, options, rng, options.descending ? count - i - 1 : i);
+        } while (options.unique && !seen.insert(value).second && ++attempts < 100);
+        values.push_back(std::move(value));
+    }
+    if (command == kDataBlankLines) values.assign(static_cast<size_t>(count), L"");
+    return DataJoin(values, options);
+}
+
+struct DataGeneratorDialogState {
+    int command = kDataRandomString;
+    HWND window = nullptr;
+    std::vector<HWND> edits;
+    HWND locale = nullptr;
+    HWND output = nullptr;
+    HWND unique = nullptr;
+    HWND descending = nullptr;
+    HWND preview = nullptr;
+    bool done = false;
+    int action = 0;
+    CHARRANGE target{};
+};
+
+std::wstring DataDialogText(HWND window) {
+    return window ? GetWindowTextValue(window) : std::wstring{};
+}
+
+DataGeneratorOptions DataDialogOptions(const DataGeneratorDialogState& state) {
+    DataGeneratorOptions options;
+    auto number = [&](size_t index, int fallback) {
+        return index < state.edits.size() ? std::max(0, _wtoi(DataDialogText(state.edits[index]).c_str())) : fallback;
+    };
+    auto int64Value = [&](size_t index, int64_t fallback) {
+        if (index >= state.edits.size()) return fallback;
+        try { return std::stoll(DataDialogText(state.edits[index])); } catch (...) { return fallback; }
+    };
+    options.count = std::clamp(number(0, 10), 1, 100000);
+    options.start = int64Value(1, 1);
+    options.end = int64Value(2, 100);
+    options.step = int64Value(3, 1);
+    options.length = std::clamp(number(4, 12), 1, 4096);
+    options.prefix = DataDialogText(state.edits[5]);
+    options.suffix = DataDialogText(state.edits[6]);
+    options.separator = DataDialogText(state.edits[7]);
+    options.padding = std::clamp(number(8, 0), 0, 64);
+    try { options.seed = static_cast<uint64_t>(std::stoull(DataDialogText(state.edits[9]))); } catch (...) { options.seed = 0; }
+    options.charset = DataDialogText(state.edits[10]);
+    options.repeatText = DataDialogText(state.edits[11]);
+    options.locale = state.locale ? static_cast<int>(SendMessageW(state.locale, CB_GETCURSEL, 0, 0)) : 0;
+    options.unique = state.unique && SendMessageW(state.unique, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    options.descending = state.descending && SendMessageW(state.descending, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    return options;
+}
+
+fs::path DataTemplatePath() {
+    return g_app.dataDirectory / L"data-generator-template.dat";
+}
+
+bool SaveDataTemplate(const DataGeneratorOptions& options) {
+    std::ostringstream output;
+    output << "DATA_TEMPLATE\t1\t" << options.count << '\t' << options.start << '\t' << options.end << '\t'
+           << options.step << '\t' << options.length << '\t' << options.padding << '\t' << options.seed << '\t'
+           << options.locale << '\t' << (options.unique ? 1 : 0) << '\t' << (options.descending ? 1 : 0) << '\t'
+           << HexEncode(WideToUtf8(options.prefix)) << '\t' << HexEncode(WideToUtf8(options.suffix)) << '\t'
+           << HexEncode(WideToUtf8(options.separator)) << '\t' << HexEncode(WideToUtf8(options.charset)) << '\t'
+           << HexEncode(WideToUtf8(options.repeatText)) << '\n';
+    return WriteAtomicFile(DataTemplatePath(), output.str());
+}
+
+bool LoadDataTemplate(DataGeneratorOptions& options) {
+    std::ifstream input(DataTemplatePath(), std::ios::binary);
+    if (!input) return false;
+    std::string line; std::getline(input, line);
+    const std::vector<std::string> parts = SplitTabs(line);
+    if (parts.size() < 17 || parts[0] != "DATA_TEMPLATE") return false;
+    ParseInt(parts[2], options.count); ParseInt64(parts[3], options.start); ParseInt64(parts[4], options.end);
+    ParseInt64(parts[5], options.step); ParseInt(parts[6], options.length); ParseInt(parts[7], options.padding);
+    int64_t seed = 0; ParseInt64(parts[8], seed); options.seed = seed >= 0 ? static_cast<uint64_t>(seed) : 0;
+    ParseInt(parts[9], options.locale);
+    int unique = 0, descending = 0; ParseInt(parts[10], unique); ParseInt(parts[11], descending);
+    options.unique = unique != 0; options.descending = descending != 0;
+    options.prefix = Utf8ToWide(HexDecode(parts[12])); options.suffix = Utf8ToWide(HexDecode(parts[13]));
+    options.separator = Utf8ToWide(HexDecode(parts[14])); options.charset = Utf8ToWide(HexDecode(parts[15]));
+    options.repeatText = Utf8ToWide(HexDecode(parts[16]));
+    options.count = std::clamp(options.count, 1, 100000); options.length = std::clamp(options.length, 1, 4096);
+    options.padding = std::clamp(options.padding, 0, 64); options.locale = std::clamp(options.locale, 0, 4);
+    return true;
+}
+
+void DataDialogSetOptions(DataGeneratorDialogState& state, const DataGeneratorOptions& options) {
+    const std::wstring values[] = {std::to_wstring(options.count), std::to_wstring(options.start), std::to_wstring(options.end),
+        std::to_wstring(options.step), std::to_wstring(options.length), options.prefix, options.suffix, options.separator,
+        std::to_wstring(options.padding), std::to_wstring(options.seed), options.charset, options.repeatText};
+    for (size_t i = 0; i < std::size(values) && i < state.edits.size(); ++i) SetWindowTextW(state.edits[i], values[i].c_str());
+    if (state.locale) SendMessageW(state.locale, CB_SETCURSEL, options.locale, 0);
+    if (state.unique) SendMessageW(state.unique, BM_SETCHECK, options.unique ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (state.descending) SendMessageW(state.descending, BM_SETCHECK, options.descending ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+void DataDialogUpdatePreview(DataGeneratorDialogState& state) {
+    if (!state.preview) return;
+    const DataGeneratorOptions options = DataDialogOptions(state);
+    DataGeneratorOptions previewOptions = options;
+    previewOptions.count = std::min(options.count, 20);
+    std::wstring result = GenerateDataText(state.command, previewOptions);
+    if (options.count > previewOptions.count) result += L"\r\n…（预览显示前 " + std::to_wstring(previewOptions.count) + L" 条）";
+    SetWindowTextW(state.preview, result.c_str());
+}
+
+void DataDialogAddControl(HWND control) {
+    if (!control) return;
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+    if (g_app.darkTheme) SetWindowTheme(control, L"DarkMode_CFD", nullptr);
+}
+
+LRESULT CALLBACK DataGeneratorDialogProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<DataGeneratorDialogState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE: {
+        state = static_cast<DataGeneratorDialogState*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+        state->window = window;
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        const ThemePalette& palette = CurrentPalette();
+        const std::pair<int, const wchar_t*> fields[] = {
+            {kIdDataDialogCount,L"生成数量"},{kIdDataDialogStart,L"起始值"},{kIdDataDialogEnd,L"结束值"},
+            {kIdDataDialogStep,L"步长 / 间隔"},{kIdDataDialogLength,L"字符长度"},{kIdDataDialogPrefix,L"前缀"},
+            {kIdDataDialogSuffix,L"后缀"},{kIdDataDialogSeparator,L"分隔符（\\n 表示换行）"},{kIdDataDialogPadding,L"补零位数"},
+            {kIdDataDialogSeed,L"随机种子（0=随机）"},{kIdDataDialogCharset,L"字符集"},{kIdDataDialogRepeat,L"模板 / 重复文本"}
+        };
+        const std::wstring defaults[] = {L"10",L"1",L"100",L"1",L"12",L"",L"",L"\\n",L"0",L"0",DataGeneratorOptions{}.charset,L"示例文本"};
+        // Keep the dialog compact enough for small laptop resolutions while
+        // retaining two full parameter columns beside the preview.
+        const int columnWidth = 205;
+        const int rightColumnX = 240;
+        for (size_t i = 0; i < std::size(fields); ++i) {
+            const int column = i < 6 ? 0 : 1;
+            const int row = static_cast<int>(i < 6 ? i : i - 6);
+            const int x = column == 0 ? 18 : rightColumnX;
+            const int y = 16 + row * 42;
+            HWND label = CreateWindowExW(0, L"STATIC", fields[i].second, WS_CHILD | WS_VISIBLE,
+                Scale(x), Scale(y), Scale(columnWidth), Scale(18), window, nullptr, g_app.instance, nullptr);
+            HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", defaults[i].c_str(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, Scale(x), Scale(y + 18), Scale(columnWidth), Scale(24),
+                window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(fields[i].first)), g_app.instance, nullptr);
+            DataDialogAddControl(label);
+            DataDialogAddControl(edit);
+            state->edits.push_back(edit);
+            (void)palette;
+        }
+        HWND localeLabel = CreateWindowExW(0, L"STATIC", L"个人信息国家 / 地区", WS_CHILD | WS_VISIBLE,
+            Scale(18), Scale(270), Scale(columnWidth), Scale(18), window, nullptr, g_app.instance, nullptr);
+        state->locale = CreateWindowExW(0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+            Scale(18), Scale(288), Scale(columnWidth), Scale(140), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDataDialogLocale)), g_app.instance, nullptr);
+        for (const wchar_t* item : {L"中国（简体中文）",L"美国（英文）",L"日本（日文）",L"德国（德文）",L"法国（法文）"}) SendMessageW(state->locale, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        SendMessageW(state->locale, CB_SETCURSEL, 0, 0);
+        DataDialogAddControl(localeLabel); DataDialogAddControl(state->locale);
+        state->unique = CreateWindowExW(0, L"BUTTON", L"允许重复以外的值尽量不重复", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            Scale(rightColumnX), Scale(270), Scale(220), Scale(24), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDataDialogUnique)), g_app.instance, nullptr);
+        state->descending = CreateWindowExW(0, L"BUTTON", L"序列降序生成", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            Scale(rightColumnX), Scale(298), Scale(220), Scale(24), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDataDialogDescending)), g_app.instance, nullptr);
+        ThemeCheckbox(state->unique); ThemeCheckbox(state->descending);
+        DataDialogAddControl(state->unique); DataDialogAddControl(state->descending);
+        HWND outputLabel = CreateWindowExW(0, L"STATIC", L"输出方式", WS_CHILD | WS_VISIBLE,
+            Scale(rightColumnX), Scale(330), Scale(100), Scale(18), window, nullptr, g_app.instance, nullptr);
+        state->output = CreateWindowExW(0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+            Scale(rightColumnX), Scale(348), Scale(220), Scale(140), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDataDialogOutput)), g_app.instance, nullptr);
+        for (const wchar_t* item : {L"插入到光标位置",L"替换选中文本",L"追加到文档末尾",L"生成到新建文档",L"复制到剪贴板"}) SendMessageW(state->output, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        SendMessageW(state->output, CB_SETCURSEL, state->target.cpMax > state->target.cpMin ? 1 : 0, 0);
+        DataDialogAddControl(outputLabel); DataDialogAddControl(state->output);
+        state->preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+            Scale(450), Scale(16), Scale(310), Scale(310), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDataDialogPreview)), g_app.instance, nullptr);
+        DataDialogAddControl(state->preview);
+        HWND execute = CreateWindowExW(0, L"BUTTON", L"生成并执行", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            Scale(450), Scale(338), Scale(100), Scale(30), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDataDialogExecute)), g_app.instance, nullptr);
+        HWND copy = CreateWindowExW(0, L"BUTTON", L"复制", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(558), Scale(338), Scale(62), Scale(30), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDataDialogCopy)), g_app.instance, nullptr);
+        HWND newTab = CreateWindowExW(0, L"BUTTON", L"新标签", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(628), Scale(338), Scale(70), Scale(30), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDataDialogNewTab)), g_app.instance, nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(700), Scale(338), Scale(60), Scale(30), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
+        HWND saveTemplate = CreateWindowExW(0, L"BUTTON", L"保存模板", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(18), Scale(338), Scale(100), Scale(30), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdDataDialogSaveTemplate)), g_app.instance, nullptr);
+        for (HWND button : {execute, copy, newTab, cancel, saveTemplate}) { DataDialogAddControl(button); ThemePushButtons({button}); }
+        DataGeneratorOptions templateOptions;
+        if (LoadDataTemplate(templateOptions)) DataDialogSetOptions(*state, templateOptions);
+        DataDialogUpdatePreview(*state);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (!state) break;
+        if (LOWORD(wParam) == kIdDataDialogExecute || LOWORD(wParam) == kIdDataDialogCopy || LOWORD(wParam) == kIdDataDialogNewTab || LOWORD(wParam) == kIdDataDialogSaveTemplate) {
+            state->action = LOWORD(wParam) == kIdDataDialogExecute ? 1 : LOWORD(wParam) == kIdDataDialogCopy ? 2 : LOWORD(wParam) == kIdDataDialogNewTab ? 3 : 4;
+            state->done = true;
+            return 0;
+        }
+        if (LOWORD(wParam) == IDCANCEL) { state->action = 0; state->done = true; return 0; }
+        if (HIWORD(wParam) == EN_CHANGE || HIWORD(wParam) == CBN_SELCHANGE || HIWORD(wParam) == BN_CLICKED) DataDialogUpdatePreview(*state);
+        return 0;
+    case WM_CLOSE:
+        if (state) { state->action = 0; state->done = true; }
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT client{}; GetClientRect(window, &client); FillRect(reinterpret_cast<HDC>(wParam), &client, g_app.windowBrush); return 1;
+    }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam); SetTextColor(dc, CurrentPalette().controlText); SetBkColor(dc, CurrentPalette().windowBackground); return reinterpret_cast<LRESULT>(g_app.windowBrush);
+    }
+    case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: {
+        HDC dc = reinterpret_cast<HDC>(wParam); SetTextColor(dc, CurrentPalette().controlText); SetBkColor(dc, CurrentPalette().controlBackground); return reinterpret_cast<LRESULT>(g_app.controlBrush);
+    }
+    default: break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void OpenDataGeneratorDialog(int command) {
+    if (!ActiveDocument()) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW klass{}; klass.hInstance = g_app.instance; klass.lpfnWndProc = DataGeneratorDialogProc;
+        klass.lpszClassName = L"MCnotepadDataGenerator"; klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        registered = RegisterClassW(&klass) != 0;
+    }
+    DataGeneratorDialogState state; state.command = command;
+    SendMessageW(ActiveDocument()->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&state.target));
+    RECT workArea{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    const int workWidth = std::max(1, static_cast<int>(workArea.right - workArea.left));
+    const int workHeight = std::max(1, static_cast<int>(workArea.bottom - workArea.top));
+    const int width = std::min(Scale(800), std::max(Scale(640), workWidth - Scale(16)));
+    const int height = std::min(Scale(430), std::max(Scale(400), workHeight - Scale(16)));
+    const int left = workArea.left + (workWidth - width) / 2;
+    const int top = workArea.top + (workHeight - height) / 2;
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"MCnotepadDataGenerator",
+        (L"数据生成 - " + DataGeneratorLabel(command)).c_str(), WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        left, top, width, height,
+        g_app.window, nullptr, g_app.instance, &state);
+    if (!dialog) return;
+    ApplyWindowFrameTheme(dialog);
+    EnableWindow(g_app.window, FALSE); ShowWindow(dialog, SW_SHOW); SetFocus(state.edits.empty() ? state.preview : state.edits[0]);
+    MSG message{};
+    while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dialog, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
+    }
+    if (state.action == 0) {
+        EnableWindow(g_app.window, TRUE); DestroyWindow(dialog); SetForegroundWindow(g_app.window);
+        return;
+    }
+    DataGeneratorOptions options = DataDialogOptions(state);
+    if (state.action == 4) {
+        const bool saved = SaveDataTemplate(options);
+        EnableWindow(g_app.window, TRUE); DestroyWindow(dialog); SetForegroundWindow(g_app.window);
+        ShowNotice(saved ? L"数据生成模板已保存" : L"数据生成模板保存失败");
+        return;
+    }
+    std::wstring generated = GenerateDataText(command, options);
+    const int outputSelection = state.output ? static_cast<int>(SendMessageW(state.output, CB_GETCURSEL, 0, 0)) : 0;
+    EnableWindow(g_app.window, TRUE); DestroyWindow(dialog); SetForegroundWindow(g_app.window);
+    if (generated.empty() && command != kDataBlankLines) return;
+    TabDocument* document = ActiveDocument(); if (!document) return;
+    if (state.action == 2 || (state.action == 1 && outputSelection == 4)) {
+        CopyTextToClipboard(generated); ShowNotice(L"数据生成结果已复制到剪贴板"); return;
+    }
+    if (state.action == 3 || (state.action == 1 && outputSelection == 3)) {
+        ApplyToolResult(*document, state.target, generated, 1, DataGeneratorLabel(command), L"已生成数据"); return;
+    }
+    const int output = state.action == 1 ? outputSelection : 0;
+    if (output == 2) {
+        const LONG end = static_cast<LONG>(GetEditorRawText(document->editor).size());
+        ApplyToolResult(*document, CHARRANGE{end, end}, generated, 2, DataGeneratorLabel(command), L"已生成数据");
+    } else {
+        ApplyToolResult(*document, output == 1 ? state.target : CHARRANGE{state.target.cpMax, state.target.cpMax}, generated, 0, DataGeneratorLabel(command), L"已生成数据");
+    }
+}
+
 void AppendTextToolMenus(HMENU menu) {
     HMENU lines = CreatePopupMenu();
     AppendMenuW(lines, MF_STRING, kIdJoinLines, L"合并为一行");
@@ -6393,6 +8542,14 @@ void AppendTextToolMenus(HMENU menu) {
 
     HMENU developer = CreatePopupMenu();
     AppendMenuW(developer, MF_STRING, kIdToolbarFormat, L"格式化 JSON\tShift+Alt+F");
+    AppendMenuW(developer, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(developer, MF_STRING, kIdFormatCss, L"CSS 美化");
+    AppendMenuW(developer, MF_STRING, kIdMinifyCss, L"CSS 压缩");
+    AppendMenuW(developer, MF_STRING, kIdFormatJavaScript, L"JavaScript 美化");
+    AppendMenuW(developer, MF_STRING, kIdMinifyJavaScript, L"JavaScript 压缩");
+    AppendMenuW(developer, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(developer, MF_STRING, kIdMarkdownToHtml, L"Markdown 转 HTML");
+    AppendMenuW(developer, MF_STRING, kIdHtmlToMarkdown, L"HTML 转 Markdown");
     AppendMenuW(developer, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(developer, MF_STRING, kIdBase64Encode, L"Base64 编码");
     AppendMenuW(developer, MF_STRING, kIdBase64Decode, L"Base64 解码");
@@ -6938,6 +9095,51 @@ void RunTextTool(int command) {
     TabDocument* document = ActiveDocument();
     if (!document) return;
     HWND editor = document->editor;
+
+    if (command == kIdFormatCss || command == kIdMinifyCss ||
+        command == kIdFormatJavaScript || command == kIdMinifyJavaScript ||
+        command == kIdMarkdownToHtml || command == kIdHtmlToMarkdown) {
+        CHARRANGE range{};
+        std::wstring text;
+        bool wholeDocument = false;
+        ToolRange(editor, false, range, text, wholeDocument);
+        if (text.empty()) {
+            ShowNotice(L"当前没有可处理的内容");
+            return;
+        }
+        const bool css = command == kIdFormatCss || command == kIdMinifyCss;
+        const bool beautify = command == kIdFormatCss || command == kIdFormatJavaScript;
+        const bool markdownToHtml = command == kIdMarkdownToHtml;
+        const std::wstring name = command == kIdFormatCss ? L"CSS 美化" :
+            command == kIdMinifyCss ? L"CSS 压缩" :
+            command == kIdFormatJavaScript ? L"JavaScript 美化" :
+            command == kIdMinifyJavaScript ? L"JavaScript 压缩" :
+            command == kIdMarkdownToHtml ? L"Markdown 转 HTML" : L"HTML 转 Markdown";
+        std::wstring result;
+        if (command == kIdMarkdownToHtml || command == kIdHtmlToMarkdown) {
+            std::wstring error;
+            if (!ShowdownConvert(text, markdownToHtml, result, error)) {
+                MessageBoxW(g_app.window, (name + L"失败：\n" + error).c_str(), kWindowTitle, MB_ICONWARNING);
+                return;
+            }
+        } else {
+            result = css
+                ? (beautify ? FormatCss(text) : MinifyCss(text))
+                : (beautify ? FormatJavaScript(text) : MinifyJavaScript(text));
+        }
+        if (result == text) {
+            ShowNotice(name + L"：内容无需修改");
+            return;
+        }
+        int outputMode = g_app.toolOutputMode;
+        if (g_app.previewTextTools) {
+            outputMode = ConfirmChange(name.c_str(), text, result, outputMode);
+            if (outputMode < 0) return;
+        }
+        ApplyToolResult(*document, range, result, outputMode, name,
+            (beautify ? name + L"完成" : name + L"完成") + (wholeDocument ? L"（全文）" : L"（选中内容）"));
+        return;
+    }
 
     bool lineTool = (command >= kIdJoinLines && command <= kIdNumberLines) ||
         (command >= kIdTrimLeading && command <= kIdTabsToSpaces);
@@ -13769,15 +15971,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         SetMenuState();
         SetTimer(window, kTimerAutosave, 2000, nullptr);
 
-        if (g_app.previousRunWasUnclean) {
-            MessageBoxW(window,
-                L"检测到上次程序没有正常退出，已自动恢复上次会话和未保存内容。",
-                kWindowTitle, MB_ICONINFORMATION);
-        }
         return 0;
     }
     case WM_SIZE:
         LayoutChildren(window);
+        if (wParam == SIZE_MINIMIZED && g_app.minimizeToTray && !g_app.closing) {
+            HideMainWindowToTray();
+        }
         return 0;
     case WM_TIMER:
         if (wParam == kTimerAutosave) {
@@ -13792,10 +15992,63 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             }
         }
         return 0;
+    case kMessageTrayIcon: {
+        // Legacy shells pass the icon ID in wParam and the mouse event in
+        // lParam. NOTIFYICON_VERSION_4 packs the event in LOWORD(lParam),
+        // the icon ID in HIWORD(lParam), and uses wParam for coordinates.
+        UINT trayEvent = 0;
+        if (HIWORD(lParam) == kTrayIconId) {
+            trayEvent = LOWORD(lParam);
+        } else if (static_cast<UINT>(wParam) == kTrayIconId) {
+            trayEvent = static_cast<UINT>(lParam);
+        } else {
+            return 0;
+        }
+        if (trayEvent == WM_LBUTTONDBLCLK || trayEvent == NIN_SELECT || trayEvent == NIN_KEYSELECT) {
+            RestoreMainWindowFromTray();
+            return 0;
+        }
+        // With NOTIFYICON_VERSION_4 Windows reports a tray right-click as
+        // WM_CONTEXTMENU. Older shells use WM_RBUTTONUP, so accept both.
+        if (trayEvent == WM_CONTEXTMENU || trayEvent == WM_RBUTTONUP) {
+            HMENU trayMenu = CreatePopupMenu();
+            AppendMenuW(trayMenu, MF_STRING, kIdTrayShow, L"显示 MCnotepad");
+            AppendMenuW(trayMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(trayMenu, MF_STRING, kIdTrayExit, L"退出软件");
+            POINT point{};
+            GetCursorPos(&point);
+            SetForegroundWindow(window);
+            // Return the selected command directly. This remains reliable
+            // while the main window is hidden, where routing WM_COMMAND back
+            // through the owner window can be swallowed by some shells.
+            const UINT command = TrackPopupMenu(trayMenu,
+                TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+                point.x, point.y, 0, window, nullptr);
+            DestroyMenu(trayMenu);
+            PostMessageW(window, WM_NULL, 0, 0);
+            if (command == kIdTrayShow) {
+                RestoreMainWindowFromTray();
+            } else if (command == kIdTrayExit) {
+                g_app.windowCloseBehavior = WindowCloseBehavior::Exit;
+                HandleMainWindowClose(true);
+            }
+            return 0;
+        }
+        return 0;
+    }
     case WM_COMMAND: {
         const int command = LOWORD(wParam);
         const int notification = HIWORD(wParam);
         HWND source = reinterpret_cast<HWND>(lParam);
+        if (command == kIdTrayShow) {
+            RestoreMainWindowFromTray();
+            return 0;
+        }
+        if (command == kIdTrayExit) {
+            g_app.windowCloseBehavior = WindowCloseBehavior::Exit;
+            HandleMainWindowClose(true);
+            return 0;
+        }
         if (notification == EN_CHANGE && source != nullptr && !g_app.loading) {
             for (size_t index = 0; index < g_app.documents.size(); ++index) {
                 if (g_app.documents[index].editor == source) {
@@ -13827,6 +16080,16 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             UpdateStatusBar();
             return 0;
         }
+        if (command == kIdLineSpacingSingle || command == kIdLineSpacing115 ||
+            command == kIdLineSpacing150 || command == kIdLineSpacing200) {
+            static constexpr int values[] = {100, 115, 150, 200};
+            SetLineSpacingPercent(values[command - kIdLineSpacingFirst]);
+            return 0;
+        }
+        if (command == kIdLineSpacingCustom) {
+            OpenCustomLineSpacingDialog();
+            return 0;
+        }
         if (command >= kIdEncodingFirst && command < kIdEncodingFirst + kEncodingCount) {
             SetActiveEncoding(command - kIdEncodingFirst);
             SetMenuState();
@@ -13845,6 +16108,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
         if (command >= kIdSearchHistoryFirst && command < kIdSearchHistoryFirst + 20) {
             RunSearchFromHistory(command - kIdSearchHistoryFirst);
+            return 0;
+        }
+        if (IsDataGeneratorCommand(command)) {
+            OpenDataGeneratorDialog(command);
             return 0;
         }
         if (IsTextToolCommand(command)) {
@@ -13907,6 +16174,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToolbarSettings:
             OpenSettingsDialog();
             break;
+        case kIdPrefixSuffix:
+            OpenPrefixSuffixDialog();
+            break;
         case kIdThemeDark:
             SetThemeKind(ThemeKind::Dark);
             break;
@@ -13924,7 +16194,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdFileSave: SaveDocument(g_app.activeIndex, false); break;
         case kIdFileSaveAs: SaveDocument(g_app.activeIndex, true); break;
         case kIdFileClose: CloseDocument(g_app.activeIndex); break;
-        case kIdFileExit: SendMessageW(window, WM_CLOSE, 0, 0); break;
+        case kIdFileExit: HandleMainWindowClose(true); break;
         case kIdHelpAbout:
             MessageBoxW(window,
                 L"MCnotepad 0.1.0\n轻量、快速、可恢复的 Windows 文本编辑器。",
@@ -14004,21 +16274,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         return 0;
     }
     case WM_CLOSE:
-        if (!g_app.closing) {
-            if (!PrepareApplicationClose()) {
-                return 0;
-            }
-            g_app.closing = true;
-            KillTimer(window, kTimerAutosave);
-            CancelSearch(true);
-            SaveSearchState();
-            const bool persisted = PersistAll(true);
-            if (!persisted) {
-                MessageBoxW(window, L"会话恢复数据保存失败，程序将继续退出。", kWindowTitle, MB_ICONWARNING);
-            }
-            RemoveRunningMarker();
-            DestroyWindow(window);
-        }
+        HandleMainWindowClose();
         return 0;
     case WM_COPYDATA: {
         const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
@@ -14106,6 +16362,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         return 0;
     case WM_DESTROY:
+        RemoveTrayIcon();
         DeleteObject(g_app.editorBrush);
         g_app.toolbarIconImages.clear();
         DeleteObject(g_app.toolbarBrush);
@@ -14250,6 +16507,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
         ShowWindow(window, showCommand);
     }
     UpdateWindow(window);
+    UpdateTrayIcon();
     if (g_app.toolboxVisible) ToggleToolbox(true);
     OpenCommandLineFiles();
     PostMessageW(window, kMessageCheckExternalChanges, 0, 0);

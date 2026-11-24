@@ -1,0 +1,12 @@
+MCnotepad third-party components
+
+Showdown 2.1.0
+Copyright (c) ShowdownJS contributors
+License: MIT
+
+Duktape 2.7.0
+Copyright (c) 2013-2022 Duktape authors
+License: MIT
+
+The bundled showdown.js is used for Markdown <-> HTML conversion.
+showdown-dom.js is a small DOM adapter used by Showdown's HTML-to-Markdown path.
