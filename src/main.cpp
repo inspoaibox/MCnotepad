@@ -125,6 +125,10 @@ constexpr int kIdCompareFolders = 1232;
 constexpr int kIdCompareStructure = 1233;
 constexpr int kIdOpenLogViewer = 1234;
 constexpr int kIdToggleToolbox = 1235;
+constexpr int kIdViewToggleBookmark = 1236;
+constexpr int kIdViewNextBookmark = 1237;
+constexpr int kIdViewPreviousBookmark = 1238;
+constexpr int kIdViewClearBookmarks = 1239;
 constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
@@ -280,6 +284,7 @@ struct TabDocument {
     bool syntaxStale = true;     // tokens no longer match the text
     bool syntaxHadColors = false;
     uint64_t textHash = 0;       // to tell real edits from formatting-only EN_CHANGE
+    std::vector<int> bookmarks;  // 1-based logical line numbers
 };
 
 struct ClosedTab {
@@ -295,6 +300,7 @@ struct ClosedTab {
     int lineEnding = 0;
     int language = 0;
     uint64_t fileTimestamp = 0;
+    std::vector<int> bookmarks;
 };
 
 constexpr const wchar_t* kEncodingNames[] = {L"UTF-8", L"UTF-8 BOM", L"UTF-16 LE", L"UTF-16 BE", L"ANSI"};
@@ -508,6 +514,8 @@ bool ToolRange(HWND editor, bool wholeLines, CHARRANGE& range, std::wstring& tex
 
 LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lParam);
 void ApplyEditorFont();
+void CreateUiFonts();
+void UpdateStatusBar();
 void SetMenuState();
 
 // Colour roles. "Chrome" is the menu bar, toolbar, tab strip and status bar;
@@ -2156,6 +2164,78 @@ int GutterWidthFor(HWND editor) {
     return digits * digit.cx + Scale(20);
 }
 
+bool HasBookmark(const TabDocument& document, int line) {
+    return std::binary_search(document.bookmarks.begin(), document.bookmarks.end(), line);
+}
+
+void NormalizeBookmarks(TabDocument& document) {
+    const int lineCount = document.editor
+        ? static_cast<int>(SendMessageW(document.editor, EM_GETLINECOUNT, 0, 0)) : 1;
+    document.bookmarks.erase(std::remove_if(document.bookmarks.begin(), document.bookmarks.end(),
+        [lineCount](int line) { return line < 1 || line > lineCount; }), document.bookmarks.end());
+    std::sort(document.bookmarks.begin(), document.bookmarks.end());
+    document.bookmarks.erase(std::unique(document.bookmarks.begin(), document.bookmarks.end()), document.bookmarks.end());
+}
+
+void ToggleBookmarkAtLine(int index, int line) {
+    if (index < 0 || index >= static_cast<int>(g_app.documents.size()) || line < 1) return;
+    TabDocument& document = g_app.documents[static_cast<size_t>(index)];
+    const auto it = std::lower_bound(document.bookmarks.begin(), document.bookmarks.end(), line);
+    if (it != document.bookmarks.end() && *it == line) document.bookmarks.erase(it);
+    else document.bookmarks.insert(it, line);
+    g_app.stateDirty = true;
+    RefreshGutter();
+    UpdateStatusBar();
+}
+
+void ToggleBookmarkAtCaret() {
+    if (g_app.activeIndex < 0 || g_app.activeIndex >= static_cast<int>(g_app.documents.size())) return;
+    TabDocument& document = g_app.documents[static_cast<size_t>(g_app.activeIndex)];
+    CHARRANGE selection{};
+    SendMessageW(document.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const long line = static_cast<long>(SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, selection.cpMin)) + 1;
+    ToggleBookmarkAtLine(g_app.activeIndex, static_cast<int>(line));
+}
+
+void GotoBookmark(int direction) {
+    if (g_app.activeIndex < 0 || g_app.activeIndex >= static_cast<int>(g_app.documents.size())) return;
+    TabDocument& document = g_app.documents[static_cast<size_t>(g_app.activeIndex)];
+    NormalizeBookmarks(document);
+    if (document.bookmarks.empty()) {
+        ShowNotice(L"当前文档没有书签");
+        return;
+    }
+    CHARRANGE selection{};
+    SendMessageW(document.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const int current = static_cast<int>(SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, selection.cpMin)) + 1;
+    int target = direction > 0 ? document.bookmarks.front() : document.bookmarks.back();
+    if (direction > 0) {
+        for (int line : document.bookmarks) if (line > current) { target = line; break; }
+    } else {
+        for (auto it = document.bookmarks.rbegin(); it != document.bookmarks.rend(); ++it) {
+            if (*it < current) { target = *it; break; }
+        }
+    }
+    const LONG position = static_cast<LONG>(SendMessageW(document.editor, EM_LINEINDEX, target - 1, 0));
+    if (position >= 0) {
+        SendMessageW(document.editor, EM_SETSEL, position, position);
+        SendMessageW(document.editor, EM_SCROLLCARET, 0, 0);
+        SetFocus(document.editor);
+        RefreshGutter();
+        UpdateStatusBar();
+    }
+}
+
+void ClearBookmarks() {
+    if (g_app.activeIndex < 0 || g_app.activeIndex >= static_cast<int>(g_app.documents.size())) return;
+    TabDocument& document = g_app.documents[static_cast<size_t>(g_app.activeIndex)];
+    if (document.bookmarks.empty()) return;
+    document.bookmarks.clear();
+    g_app.stateDirty = true;
+    RefreshGutter();
+    ShowNotice(L"已清除当前文档书签");
+}
+
 // Numbers are drawn where RichEdit actually places each visible line, so they
 // line up for any font size. With word wrap a long line spans several visual
 // rows; only its first row gets a number, and numbers count real lines.
@@ -2206,6 +2286,20 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 if (y > client.bottom) break;
                 const long paragraph = paragraphOf(static_cast<LONG>(start));
                 if (paragraph != previousParagraph) {
+                    if (HasBookmark(g_app.documents[static_cast<size_t>(g_app.activeIndex)], static_cast<int>(paragraph))) {
+                        const int markerX = Scale(5);
+                        const int markerY = y + metrics.tmHeight / 2;
+                        HBRUSH markerBrush = CreateSolidBrush(CurrentPalette().accent);
+                        HPEN markerPen = CreatePen(PS_SOLID, 1, CurrentPalette().accent);
+                        HGDIOBJ oldBrush = SelectObject(dc, markerBrush);
+                        HGDIOBJ oldPen = SelectObject(dc, markerPen);
+                        POINT marker[3]{{markerX, markerY - Scale(5)}, {markerX + Scale(8), markerY}, {markerX, markerY + Scale(5)}};
+                        Polygon(dc, marker, 3);
+                        SelectObject(dc, oldPen);
+                        SelectObject(dc, oldBrush);
+                        DeleteObject(markerPen);
+                        DeleteObject(markerBrush);
+                    }
                     wchar_t number[16]{};
                     swprintf_s(number, L"%ld", paragraph);
                     SetTextColor(dc, paragraph == caretParagraph ? CurrentPalette().tabActiveText : GutterForeground());
@@ -2217,6 +2311,19 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         SelectObject(dc, previous);
         EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (g_app.activeIndex < 0 || g_app.activeIndex >= static_cast<int>(g_app.documents.size())) return 0;
+        HWND editor = g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor;
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        MapWindowPoints(window, editor, &point, 1);
+        const LRESULT character = SendMessageW(editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&point));
+        const LONG position = static_cast<LONG>(character);
+        const int line = position >= 0
+            ? static_cast<int>(SendMessageW(editor, EM_EXLINEFROMCHAR, 0, position)) + 1 : 1;
+        ToggleBookmarkAtLine(g_app.activeIndex, line);
+        SetFocus(editor);
         return 0;
     }
     default:
@@ -3061,7 +3168,12 @@ bool SaveSessionFile() {
                << document.fileTimestamp << '\t'
                << document.encoding << '\t'
                << document.lineEnding << '\t'
-               << document.language << '\n';
+               << document.language << '\t';
+        for (size_t bookmark = 0; bookmark < document.bookmarks.size(); ++bookmark) {
+            if (bookmark != 0) output << ',';
+            output << document.bookmarks[bookmark];
+        }
+        output << '\n';
     }
 
     return WriteAtomicFile(g_app.sessionPath, output.str());
@@ -3116,6 +3228,10 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
 
     if (message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
         (GetKeyState(VK_MENU) & 0x8000) == 0) {
+        if (wParam == VK_F2) {
+            SendMessageW(g_app.window, WM_COMMAND, kIdViewToggleBookmark, 0);
+            return 0;
+        }
         switch (static_cast<UINT>(wParam)) {
         case 'A':
             SendMessageW(editor, EM_SETSEL, 0, -1);
@@ -3138,6 +3254,27 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         default:
             break;
         }
+    }
+
+    if (message == WM_KEYDOWN && wParam == VK_F4) {
+        if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+            SendMessageW(g_app.window, WM_COMMAND, kIdViewPreviousBookmark, 0);
+            return 0;
+        }
+        SendMessageW(g_app.window, WM_COMMAND, kIdViewNextBookmark, 0);
+        return 0;
+    }
+
+    if (message == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0) {
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        if (delta != 0) {
+            g_app.fontSize = std::clamp(g_app.fontSize + (delta > 0 ? 1 : -1), 10, 32);
+            CreateUiFonts();
+            ApplyEditorFont();
+            g_app.stateDirty = true;
+            ShowNotice(L"编辑器字号 " + std::to_wstring(g_app.fontSize) + L" px");
+        }
+        return 0;
     }
 
     const LRESULT result = oldProc != nullptr
@@ -3555,6 +3692,7 @@ void RememberClosedTab(TabDocument& document) {
     closed.lineEnding = document.lineEnding;
     closed.language = document.language;
     closed.fileTimestamp = document.fileTimestamp;
+    closed.bookmarks = document.bookmarks;
     g_app.closedTabs.insert(g_app.closedTabs.begin(), std::move(closed));
     constexpr size_t kClosedTabHistoryLimit = 30;
     if (g_app.closedTabs.size() > kClosedTabHistoryLimit) {
@@ -3585,6 +3723,8 @@ void ReopenClosedDocument() {
     const int index = CreateDocument(closed.path, closed.title, std::move(closed.text), closed.untitled,
         closed.modified, closed.caret, closed.anchor, closed.firstVisibleLine, nullptr, format);
     if (index < 0) return;
+    g_app.documents[static_cast<size_t>(index)].bookmarks = std::move(closed.bookmarks);
+    NormalizeBookmarks(g_app.documents[static_cast<size_t>(index)]);
     SelectTab(index);
     PersistAll(false);
 }
@@ -3787,6 +3927,11 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(search, MF_STRING, kIdToolbarGoto, L"跳转到行\tCtrl+G");
     AppendMenuW(view, MF_STRING, kIdToolbarLineNumbers, L"行号");
     AppendMenuW(view, MF_STRING, kIdToolbarWrap, L"自动换行");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, MF_STRING, kIdViewToggleBookmark, L"切换书签\tCtrl+F2");
+    AppendMenuW(view, MF_STRING, kIdViewNextBookmark, L"下一个书签\tF4");
+    AppendMenuW(view, MF_STRING, kIdViewPreviousBookmark, L"上一个书签\tShift+F4");
+    AppendMenuW(view, MF_STRING, kIdViewClearBookmarks, L"清除当前文档书签");
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacingSingle, L"1.0 倍");
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacing115, L"1.15 倍");
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacing150, L"1.5 倍");
@@ -3843,6 +3988,7 @@ struct SessionEntry {
     int horizontalScroll = 0;
     bool modified = false;
     bool untitled = false;
+    std::vector<int> bookmarks;
     DocumentFormat format;
 };
 
@@ -3947,6 +4093,20 @@ void LoadPersistedSession() {
                 ParseInt(parts[13], entry.format.lineEnding);
                 ParseInt(parts[14], entry.format.language);
             }
+            if (parts.size() >= 16 && !parts[15].empty()) {
+                size_t start = 0;
+                while (start < parts[15].size()) {
+                    const size_t comma = parts[15].find(',', start);
+                    const std::string_view token(parts[15].data() + start,
+                        comma == std::string::npos ? parts[15].size() - start : comma - start);
+                    int bookmark = 0;
+                    if (ParseInt(token, bookmark) && bookmark > 0) entry.bookmarks.push_back(bookmark);
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+                std::sort(entry.bookmarks.begin(), entry.bookmarks.end());
+                entry.bookmarks.erase(std::unique(entry.bookmarks.begin(), entry.bookmarks.end()), entry.bookmarks.end());
+            }
             entry.path = Utf8ToWide(HexDecode(parts[2]));
             entry.title = Utf8ToWide(HexDecode(parts[3]));
             entry.snapshot = fs::path(Utf8ToWide(HexDecode(parts[4])));
@@ -4020,6 +4180,8 @@ void LoadPersistedSession() {
         if (index >= 0) {
             TabDocument& created = g_app.documents[static_cast<size_t>(index)];
             created.horizontalScroll = entry.horizontalScroll;
+            created.bookmarks = std::move(entry.bookmarks);
+            NormalizeBookmarks(created);
             // A tab that had to get a fresh snapshot (missing or shared by an
             // earlier tab in an old session) must write it on the next autosave.
             created.recoveryDirty = !SamePath(created.snapshotPath, entry.snapshot);
@@ -16136,6 +16298,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     UpdateHorizontalScrollbar(source);
                     RefreshGutter();
                     TabDocument& changed = g_app.documents[index];
+                    NormalizeBookmarks(changed);
                     changed.syntaxStale = true;  // tokens no longer match; scrolling re-tokenizes
                     if (EffectiveLanguage(changed) != kLanguagePlain || changed.syntaxHadColors ||
                         (changed.untitled && changed.language == kLanguageAuto)) {
@@ -16239,6 +16402,18 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             g_app.stateDirty = true;
             ApplyWordWrapAll();
             LayoutChildren(window);
+            break;
+        case kIdViewToggleBookmark:
+            ToggleBookmarkAtCaret();
+            break;
+        case kIdViewNextBookmark:
+            GotoBookmark(1);
+            break;
+        case kIdViewPreviousBookmark:
+            GotoBookmark(-1);
+            break;
+        case kIdViewClearBookmarks:
+            ClearBookmarks();
             break;
         case kIdToolbarTheme:
             ShowThemeMenu(ToolbarItemScreenRect(kIdToolbarTheme));
