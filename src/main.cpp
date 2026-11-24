@@ -96,6 +96,8 @@ constexpr int kIdFileSaveAs = 1004;
 constexpr int kIdFileClose = 1005;
 constexpr int kIdFileExit = 1006;
 constexpr int kIdFileReopenClosed = 1008;
+constexpr int kIdFileSaveAll = 1009;
+constexpr int kIdFileCloseAll = 1010;
 constexpr int kIdEditUndo = 1101;
 constexpr int kIdEditRedo = 1102;
 constexpr int kIdEditCut = 1103;
@@ -119,6 +121,7 @@ constexpr int kIdClearSearchResults = 1218;
 constexpr int kIdSearchErrorLog = 1219;
 constexpr int kIdUndoReplaceInFiles = 1220;
 constexpr int kIdCopySearchResults = 1221;
+constexpr int kIdBookmarkSearchResult = 1222;
 constexpr int kIdCompareFiles = 1230;
 constexpr int kIdCompareWithFile = 1231;
 constexpr int kIdCompareFolders = 1232;
@@ -3629,6 +3632,18 @@ bool SaveDocument(int index, bool saveAs) {
     return PersistAll(false);
 }
 
+bool SaveAllDocuments() {
+    bool saved = true;
+    for (int index = 0; index < static_cast<int>(g_app.documents.size()); ++index) {
+        if (g_app.documents[static_cast<size_t>(index)].modified && !SaveDocument(index, false)) {
+            saved = false;
+            break;
+        }
+    }
+    if (saved) ShowNotice(L"已保存全部标签");
+    return saved;
+}
+
 bool OpenLogViewer(const std::wstring& path);
 
 bool OpenFileInNewTab(const fs::path& path) {
@@ -3779,6 +3794,14 @@ bool CloseDocument(int index) {
     return true;
 }
 
+bool CloseAllDocuments() {
+    while (g_app.documents.size() > 1) {
+        if (!CloseDocument(static_cast<int>(g_app.documents.size()) - 1)) return false;
+    }
+    if (!g_app.documents.empty() && !CloseDocument(0)) return false;
+    return true;
+}
+
 bool PrepareApplicationClose() {
     std::vector<int> modified;
     for (size_t index = 0; index < g_app.documents.size(); ++index) {
@@ -3848,6 +3871,8 @@ void SetMenuState() {
     EnableMenuItem(menu, kIdFileSave, MF_BYCOMMAND | (hasActive ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu, kIdFileSaveAs, MF_BYCOMMAND | (hasActive ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu, kIdFileClose, MF_BYCOMMAND | (hasActive ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, kIdFileSaveAll, MF_BYCOMMAND | (hasActive ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(menu, kIdFileCloseAll, MF_BYCOMMAND | (hasActive ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(menu, kIdFileReopenClosed, MF_BYCOMMAND |
         (g_app.closedTabs.empty() ? MF_GRAYED : MF_ENABLED));
     if (g_app.themeMenu) {
@@ -3898,9 +3923,11 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(file, MF_STRING, kIdFileOpen, L"打开...\tCtrl+O");
     AppendMenuW(file, MF_STRING, kIdFileSave, L"保存\tCtrl+S");
     AppendMenuW(file, MF_STRING, kIdFileSaveAs, L"另存为...\tCtrl+Shift+S");
+    AppendMenuW(file, MF_STRING, kIdFileSaveAll, L"保存全部\tCtrl+Alt+S");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, kIdFileRename, L"重命名...\tF2");
     AppendMenuW(file, MF_STRING, kIdFileClose, L"关闭标签\tCtrl+W");
+    AppendMenuW(file, MF_STRING, kIdFileCloseAll, L"关闭全部标签\tCtrl+Shift+W");
     AppendMenuW(file, MF_STRING, kIdFileReopenClosed, L"重新打开关闭的标签\tCtrl+Shift+T");
     AppendMenuW(file, MF_STRING, kIdFileExit, L"退出");
 
@@ -3937,6 +3964,7 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(results, MF_STRING, kIdCopySearchResults, L"复制全部结果");
     AppendMenuW(results, MF_STRING, kIdExportSearchResults, L"导出搜索结果...");
     AppendMenuW(results, MF_STRING, kIdClearSearchResults, L"清空搜索结果");
+    AppendMenuW(results, MF_STRING, kIdBookmarkSearchResult, L"将选中结果标记为书签");
     AppendMenuW(results, MF_STRING, kIdSearchErrorLog, L"查看错误日志");
     AppendMenuW(results, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(results, MF_STRING, kIdUndoReplaceInFiles, L"撤销上次在文件中替换...");
@@ -4453,7 +4481,9 @@ HACCEL CreateAccelerators() {
         { FCONTROL | FVIRTKEY, 'O', kIdFileOpen },
         { FCONTROL | FVIRTKEY, 'S', kIdFileSave },
         { FCONTROL | FSHIFT | FVIRTKEY, 'S', kIdFileSaveAs },
+        { FCONTROL | FALT | FVIRTKEY, 'S', kIdFileSaveAll },
         { FCONTROL | FVIRTKEY, 'W', kIdFileClose },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'W', kIdFileCloseAll },
         { FCONTROL | FSHIFT | FVIRTKEY, 'T', kIdFileReopenClosed },
         { FCONTROL | FVIRTKEY, 'Z', kIdEditUndo },
         { FCONTROL | FVIRTKEY, 'Y', kIdEditRedo },
@@ -11273,6 +11303,38 @@ void ReplaceSelectedResultHere() {
     ShowNotice(L"已在编辑器中替换此处（未保存，可按 Ctrl+Z 撤销）");
 }
 
+void BookmarkSelectedSearchResult() {
+    const int itemIndex = SelectedSearchItem();
+    if (itemIndex < 0 || itemIndex >= static_cast<int>(g_search.items.size())) return;
+    const SearchItemRef ref = g_search.items[static_cast<size_t>(itemIndex)];
+    if (ref.file < 0 || ref.file >= static_cast<int>(g_search.results.size())) return;
+    const SearchFileResult& file = *g_search.results[static_cast<size_t>(ref.file)];
+    if (file.hits.empty() || file.hits.front().line <= 0) {
+        ShowNotice(L"该结果没有可标记的行");
+        return;
+    }
+    OpenSearchResult(itemIndex);
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    std::vector<int> lines;
+    if (ref.hit >= 0) {
+        lines.push_back(file.hits[static_cast<size_t>(ref.hit)].line);
+    } else {
+        for (const SearchHit& hit : file.hits) {
+            if (hit.line > 0 && HitPassesFilter(file, hit)) lines.push_back(hit.line);
+        }
+    }
+    for (int line : lines) {
+        if (!HasBookmark(*document, line)) {
+            document->bookmarks.insert(std::lower_bound(document->bookmarks.begin(), document->bookmarks.end(), line), line);
+        }
+    }
+    NormalizeBookmarks(*document);
+    g_app.stateDirty = true;
+    RefreshGutter();
+    ShowNotice(L"已将搜索结果标记为 " + std::to_wstring(lines.size()) + L" 个书签");
+}
+
 void ShowSearchTreeMenu(POINT screen) {
     int itemIndex = SelectedSearchItem();
     if (itemIndex >= 0 && g_search.items[static_cast<size_t>(itemIndex)].file == kLoadMoreItem) itemIndex = -1;
@@ -11293,6 +11355,7 @@ void ShowSearchTreeMenu(POINT screen) {
     AppendMenuW(menu, MF_STRING | (hasResults ? 0 : MF_GRAYED), 8, L"全部折叠");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (hasResults ? 0 : MF_GRAYED), 9, L"清空结果");
+    AppendMenuW(menu, MF_STRING | ((isHit || hasItem) ? 0 : MF_GRAYED), 10, L"将选中结果标记为书签");
     const int command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, g_app.window, nullptr);
     DestroyMenu(menu);
     const SearchItemRef ref = hasItem ? g_search.items[static_cast<size_t>(itemIndex)] : SearchItemRef{-1, -1, 0};
@@ -11324,6 +11387,7 @@ void ShowSearchTreeMenu(POINT screen) {
         InvalidateRect(g_search.tree, nullptr, TRUE);
         break;
     case 9: ClearSearchResults(); break;
+    case 10: BookmarkSelectedSearchResult(); break;
     default: break;
     }
 }
@@ -16378,6 +16442,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToolbarOpen: OpenFileDialog(); break;
         case kIdToolbarSave: SaveDocument(g_app.activeIndex, false); break;
         case kIdToolbarSaveAs: SaveDocument(g_app.activeIndex, true); break;
+        case kIdFileSaveAll: SaveAllDocuments(); break;
         case kIdToolbarClose: CloseDocument(g_app.activeIndex); break;
         case kIdToolbarUndo: HandleEditCommand(kIdEditUndo); break;
         case kIdToolbarRedo: HandleEditCommand(kIdEditRedo); break;
@@ -16397,6 +16462,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToggleSearchPanel: ToggleSearchPanel(); break;
         case kIdExportSearchResults: ExportSearchResults(); break;
         case kIdCopySearchResults: CopyTextToClipboard(SearchResultsAsText()); ShowNotice(L"已复制全部搜索结果"); break;
+        case kIdBookmarkSearchResult: BookmarkSelectedSearchResult(); break;
         case kIdClearSearchResults: ClearSearchResults(); break;
         case kIdSearchErrorLog: ShowSearchErrorLog(); break;
         case kIdUndoReplaceInFiles: UndoLastReplaceInFiles(); break;
@@ -16459,6 +16525,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdFileSave: SaveDocument(g_app.activeIndex, false); break;
         case kIdFileSaveAs: SaveDocument(g_app.activeIndex, true); break;
         case kIdFileClose: CloseDocument(g_app.activeIndex); break;
+        case kIdFileCloseAll: CloseAllDocuments(); break;
         case kIdFileReopenClosed: ReopenClosedDocument(); break;
         case kIdFileExit: HandleMainWindowClose(true); break;
         case kIdHelpAbout:
