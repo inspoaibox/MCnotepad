@@ -18225,16 +18225,76 @@ int RunSelfTests() {
     failures += expect(!ParseShortcutText(L"Ctrl+Unknown", modifiers, key));
     const auto lines = SplitLines(L"a\r\nb\nc");
     failures += expect(lines.size() == 3 && JoinLines(lines, L"\r") == L"a\rb\rc");
-    const std::wstring cjkLabel = L"姓名：用户名：";
-    failures += expect(Utf8ToWide(WideToUtf8(cjkLabel)) == cjkLabel);
+    const auto utf8Safe = [](const std::wstring& value) {
+        return value.find(L'\uFFFD') == std::wstring::npos &&
+            Utf8ToWide(WideToUtf8(value)) == value;
+    };
+    const auto containsCjk = [](const std::wstring& value) {
+        return std::any_of(value.begin(), value.end(), [](wchar_t character) {
+            return (character >= 0x3400 && character <= 0x4DBF) ||
+                (character >= 0x4E00 && character <= 0x9FFF);
+        });
+    };
+    // Exercise Chinese, punctuation, supplementary-plane characters and line breaks.
+    const std::wstring unicodeSample = L"中文转换：你好，世界！\r\n第二行 \xD83D\xDE00";
+    failures += expect(utf8Safe(unicodeSample));
+    failures += expect(Utf8ToWide("\xE4\xB8\xAD\xE6\x96\x87\xE6\xB5\x8B\xE8\xAF\x95") == L"中文测试");
+    for (int encoding = 0; encoding <= 3; ++encoding) {
+        std::string bytes;
+        std::wstring decoded;
+        int detected = -1;
+        failures += expect(EncodeTextBytes(unicodeSample, encoding, bytes));
+        failures += expect(DecodeTextBytes(std::vector<char>(bytes.begin(), bytes.end()), &detected) == unicodeSample);
+        failures += expect(detected == encoding);
+    }
+    const std::wstring encodedBase64 = Base64Encode(unicodeSample);
+    std::wstring decodedBase64;
+    failures += expect(Base64Decode(encodedBase64, decodedBase64) && decodedBase64 == unicodeSample);
+    int decodedUrlParts = 0;
+    failures += expect(UrlDecode(UrlEncode(unicodeSample), decodedUrlParts) == unicodeSample && decodedUrlParts > 0);
+
+    std::wstring formattedJson;
+    std::wstring formatError;
+    failures += expect(FormatJson(L"{\"名称\":\"中文\",\"内容\":\"你好\"}", formattedJson, formatError) && utf8Safe(formattedJson));
+    failures += expect(utf8Safe(FormatCss(L".标题 { content: \"中文\"; }")));
+    failures += expect(utf8Safe(FormatJavaScript(L"const 文本 = \"中文\";")));
+    failures += expect(utf8Safe(MinifyCss(L".标题 { content: \"中文\"; }")));
+    failures += expect(utf8Safe(MinifyJavaScript(L"const 文本 = \"中文\";")));
+
+    std::wstring converted;
+    failures += expect(ConvertChineseScript(L"汉字转换：干燥", true, converted) &&
+        converted.find(L"漢字") != std::wstring::npos && utf8Safe(converted));
+    int pinyinCount = 0;
+    std::wstring pinyinError;
+    std::wstring pinyin;
+    failures += expect(ConvertToPinyin(L"中文测试", PinyinMode::Plain, pinyin, pinyinCount, pinyinError) &&
+        pinyinCount > 0 && utf8Safe(pinyin));
+    std::wstring markdownResult;
+    std::wstring markdownError;
+    failures += expect(ShowdownConvert(L"# 中文标题\r\n\r\n你好，世界！", true, markdownResult, markdownError) &&
+        utf8Safe(markdownResult));
+    std::wstring htmlResult;
+    failures += expect(ShowdownConvert(L"<h1>中文标题</h1><p>你好，世界！</p>", false, htmlResult, markdownError) &&
+        utf8Safe(htmlResult));
+
     for (int locale = 0; locale < 5; ++locale) {
         DataGeneratorOptions profile;
-        profile.count = 1;
+        profile.count = 2;
+        profile.seed = 0xC0DE2026u + static_cast<uint64_t>(locale);
         profile.locale = locale;
         const std::wstring generated = GenerateDataText(kDataFullProfile, profile);
         failures += expect(!generated.empty() &&
             generated.find(L"姓名：") != std::wstring::npos &&
-            generated.find(L'\uFFFD') == std::wstring::npos);
+            generated.find(L"用户名：") != std::wstring::npos &&
+            generated.find(L"电子邮箱：") != std::wstring::npos &&
+            generated.find(L"个人简介：") != std::wstring::npos &&
+            (locale != 0 || containsCjk(generated)) &&
+            generated.find(L'\uFFFD') == std::wstring::npos && utf8Safe(generated));
+        for (int command = kIdDataFirst; command <= kIdDataLast; ++command) {
+            const std::wstring value = GenerateDataText(command, profile);
+            failures += expect(value.find(L'\uFFFD') == std::wstring::npos &&
+                value.find(L"[数据生成失败]") == std::wstring::npos && utf8Safe(value));
+        }
     }
     return failures == 0 ? 0 : 1;
 }
