@@ -105,6 +105,12 @@ constexpr int kIdEditCopy = 1104;
 constexpr int kIdEditPaste = 1105;
 constexpr int kIdEditSelectAll = 1106;
 constexpr int kIdPrefixSuffix = 1107;
+constexpr int kIdMultiCaretNext = 1108;
+constexpr int kIdRectangleSelection = 1109;
+constexpr int kIdClearMultiCaret = 1110;
+constexpr int kIdMacroToggle = 1111;
+constexpr int kIdMacroPlay = 1112;
+constexpr int kIdMacroClear = 1113;
 constexpr int kIdHelpAbout = 1201;
 constexpr int kIdFindNext = 1206;
 constexpr int kIdFindPrevious = 1207;
@@ -282,6 +288,17 @@ struct FoldRegion {
     bool collapsed = false;
 };
 
+struct MultiCaret {
+    LONG anchor = 0;
+    LONG caret = 0;
+};
+
+struct MacroAction {
+    bool command = false;
+    UINT commandId = 0;
+    std::wstring text;
+};
+
 struct TabDocument {
     HWND editor = nullptr;
     std::wstring path;
@@ -311,6 +328,9 @@ struct TabDocument {
     LONG bracketMatchEnd = -1;
     std::vector<FoldRegion> folds;
     uint64_t foldTextHash = 0;
+    std::vector<MultiCaret> multiCarets;
+    bool rectangleSelection = false;
+    bool largeFileMode = false;
 };
 
 struct ClosedTab {
@@ -449,6 +469,9 @@ struct AppState {
     bool showTrayIcon = true;
     bool trayIconAdded = false;
     bool hiddenToTray = false;
+    bool macroRecording = false;
+    bool macroPlaying = false;
+    std::vector<MacroAction> macroActions;
     int languageIndex = 1;
     int encodingIndex = 0;
     int lineEndingIndex = 0;
@@ -588,6 +611,7 @@ void RebuildAccelerators();
 uint64_t HashText(std::wstring_view text);
 TabDocument* ActiveDocument();
 std::wstring GetEditorRawText(HWND editor);
+HWND ActiveEditor();
 std::vector<std::wstring> SplitLines(std::wstring_view text);
 std::wstring JoinLines(const std::vector<std::wstring>& lines, std::wstring_view separator = L"\r");
 bool ToolRange(HWND editor, bool wholeLines, CHARRANGE& range, std::wstring& text, bool& wholeDocument);
@@ -1109,6 +1133,178 @@ void UnfoldAllBlocks() {
     for (FoldRegion& region : document->folds) region.collapsed = false;
     ApplyFoldVisibility(*document);
     g_app.stateDirty = true;
+}
+
+void ClearMultiCarets() {
+    if (TabDocument* document = ActiveDocument()) {
+        document->multiCarets.clear();
+        document->rectangleSelection = false;
+        InvalidateRect(document->editor, nullptr, FALSE);
+    }
+}
+
+void AddNextLineCaret() {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    CHARRANGE selection{};
+    SendMessageW(document->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    LONG caret = selection.cpMax;
+    const LRESULT line = SendMessageW(document->editor, EM_EXLINEFROMCHAR, 0, caret);
+    const LONG lineStart = static_cast<LONG>(SendMessageW(document->editor, EM_LINEINDEX, line, 0));
+    const LONG column = std::max<LONG>(0, caret - lineStart);
+    const LRESULT lineCount = SendMessageW(document->editor, EM_GETLINECOUNT, 0, 0);
+    if (line + 1 >= lineCount) return;
+    const LONG nextStart = static_cast<LONG>(SendMessageW(document->editor, EM_LINEINDEX, line + 1, 0));
+    const LONG nextLength = static_cast<LONG>(SendMessageW(document->editor, EM_LINELENGTH, nextStart, 0));
+    const LONG nextCaret = nextStart + std::min(column, nextLength);
+    if (document->multiCarets.empty()) document->multiCarets.push_back({caret, caret});
+    if (std::none_of(document->multiCarets.begin(), document->multiCarets.end(),
+        [nextCaret](const MultiCaret& value) { return value.caret == nextCaret; })) {
+        document->multiCarets.push_back({nextCaret, nextCaret});
+    }
+    SendMessageW(document->editor, EM_SETSEL, nextCaret, nextCaret);
+    InvalidateRect(document->editor, nullptr, FALSE);
+}
+
+void CreateRectangleCarets() {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    CHARRANGE selection{};
+    SendMessageW(document->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    if (selection.cpMin == selection.cpMax) {
+        document->multiCarets.clear();
+        document->multiCarets.push_back({selection.cpMin, selection.cpMax});
+        document->rectangleSelection = true;
+        InvalidateRect(document->editor, nullptr, FALSE);
+        return;
+    }
+    const LONG firstLine = static_cast<LONG>(SendMessageW(document->editor, EM_EXLINEFROMCHAR, 0, selection.cpMin));
+    const LONG lastLine = static_cast<LONG>(SendMessageW(document->editor, EM_EXLINEFROMCHAR, 0, selection.cpMax));
+    const LONG firstStart = static_cast<LONG>(SendMessageW(document->editor, EM_LINEINDEX, firstLine, 0));
+    const LONG lastStart = static_cast<LONG>(SendMessageW(document->editor, EM_LINEINDEX, lastLine, 0));
+    const LONG leftColumn = selection.cpMin - firstStart;
+    const LONG rightColumn = std::max(leftColumn, selection.cpMax - lastStart);
+    document->multiCarets.clear();
+    for (LONG line = firstLine; line <= lastLine; ++line) {
+        const LONG start = static_cast<LONG>(SendMessageW(document->editor, EM_LINEINDEX, line, 0));
+        if (start < 0) continue;
+        const LONG length = static_cast<LONG>(SendMessageW(document->editor, EM_LINELENGTH, start, 0));
+        const LONG a = start + std::min(leftColumn, length);
+        const LONG b = start + std::min(rightColumn, length);
+        document->multiCarets.push_back({a, b});
+    }
+    document->rectangleSelection = true;
+    SendMessageW(document->editor, EM_SETSEL, selection.cpMin, selection.cpMin);
+    InvalidateRect(document->editor, nullptr, FALSE);
+}
+
+bool ApplyMultiCaretReplacement(HWND editor, const std::wstring& replacement) {
+    TabDocument* document = ActiveDocument();
+    if (!document || document->multiCarets.size() < 2) return false;
+    std::vector<MultiCaret> ranges = document->multiCarets;
+    std::sort(ranges.begin(), ranges.end(), [](const MultiCaret& left, const MultiCaret& right) {
+        return std::min(left.anchor, left.caret) > std::min(right.anchor, right.caret);
+    });
+    EditorEventMute mute(editor);
+    for (const MultiCaret& range : ranges) {
+        const LONG start = std::min(range.anchor, range.caret);
+        const LONG end = std::max(range.anchor, range.caret);
+        SendMessageW(editor, EM_SETSEL, start, end);
+        SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
+    }
+    for (MultiCaret& range : document->multiCarets) {
+        range.anchor = range.caret = std::min(range.anchor, range.caret) + static_cast<LONG>(replacement.size());
+    }
+    SendMessageW(editor, EM_SETSEL, document->multiCarets.front().caret, document->multiCarets.front().caret);
+    InvalidateRect(editor, nullptr, FALSE);
+    return true;
+}
+
+bool ApplyMultiCaretBackspace(HWND editor, bool forward) {
+    TabDocument* document = ActiveDocument();
+    if (!document || document->multiCarets.size() < 2) return false;
+    std::vector<MultiCaret> ranges = document->multiCarets;
+    std::sort(ranges.begin(), ranges.end(), [](const MultiCaret& left, const MultiCaret& right) {
+        return std::min(left.anchor, left.caret) > std::min(right.anchor, right.caret);
+    });
+    EditorEventMute mute(editor);
+    for (const MultiCaret& range : ranges) {
+        LONG start = std::min(range.anchor, range.caret);
+        LONG end = std::max(range.anchor, range.caret);
+        if (start == end) {
+            if (forward) end = start + 1;
+            else start = std::max<LONG>(0, start - 1);
+        }
+        SendMessageW(editor, EM_SETSEL, start, end);
+        SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L""));
+    }
+    for (MultiCaret& range : document->multiCarets) {
+        LONG position = std::min(range.anchor, range.caret);
+        if (range.anchor == range.caret && !forward) position = std::max<LONG>(0, position - 1);
+        range.anchor = range.caret = position;
+    }
+    SendMessageW(editor, EM_SETSEL, document->multiCarets.front().caret, document->multiCarets.front().caret);
+    InvalidateRect(editor, nullptr, FALSE);
+    return true;
+}
+
+void DrawMultiCaretOverlay(HWND editor) {
+    TabDocument* document = ActiveDocument();
+    if (!document || document->editor != editor || document->multiCarets.size() < 2) return;
+    HDC dc = GetDC(editor);
+    if (!dc) return;
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, Scale(1)), CurrentPalette().accent);
+    HPEN old = static_cast<HPEN>(SelectObject(dc, pen));
+    for (const MultiCaret& range : document->multiCarets) {
+        if (range.anchor != range.caret) continue;
+        POINT point{};
+        SendMessageW(editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&point), range.caret);
+        MoveToEx(dc, point.x, point.y, nullptr);
+        LineTo(dc, point.x, point.y + Scale(18));
+    }
+    SelectObject(dc, old);
+    DeleteObject(pen);
+    ReleaseDC(editor, dc);
+}
+
+void RecordMacroText(const std::wstring& text) {
+    if (g_app.macroRecording && !g_app.macroPlaying && !text.empty())
+        g_app.macroActions.push_back({false, 0, text});
+}
+
+void RecordMacroCommand(UINT command) {
+    if (!g_app.macroRecording || g_app.macroPlaying || command == kIdMacroToggle ||
+        command == kIdMacroPlay || command == kIdMacroClear) return;
+    g_app.macroActions.push_back({true, command, {}});
+}
+
+void ToggleMacroRecording() {
+    if (g_app.macroRecording) {
+        g_app.macroRecording = false;
+        ShowNotice(L"宏录制已停止，共记录 " + std::to_wstring(g_app.macroActions.size()) + L" 个动作");
+    } else {
+        g_app.macroActions.clear();
+        g_app.macroRecording = true;
+        ShowNotice(L"宏录制已开始");
+    }
+}
+
+void PlayMacro() {
+    if (g_app.macroActions.empty() || g_app.macroPlaying) {
+        ShowNotice(L"没有可播放的宏");
+        return;
+    }
+    g_app.macroPlaying = true;
+    const std::vector<MacroAction> actions = g_app.macroActions;
+    for (const MacroAction& action : actions) {
+        if (action.command) SendMessageW(g_app.window, WM_COMMAND, action.commandId, 0);
+        else if (HWND editor = ActiveEditor()) {
+            if (!ApplyMultiCaretReplacement(editor, action.text))
+                SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(action.text.c_str()));
+        }
+    }
+    g_app.macroPlaying = false;
+    ShowNotice(L"宏播放完成");
 }
 
 void SetSelectionColor(HWND editor, LONG start, LONG end, COLORREF color) {
@@ -3786,6 +3982,27 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
     }
 
     if (message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
+        (GetKeyState(VK_MENU) & 0x8000) != 0 && wParam == VK_DOWN) {
+        AddNextLineCaret();
+        return 0;
+    }
+    if (message == WM_KEYDOWN && (wParam == VK_BACK || wParam == VK_DELETE) &&
+        ApplyMultiCaretBackspace(editor, wParam == VK_DELETE)) {
+        return 0;
+    }
+
+    if (message == WM_CHAR && (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+        (GetKeyState(VK_MENU) & 0x8000) == 0 &&
+        (wParam >= 0x20 || wParam == L'\r' || wParam == L'\t')) {
+        const std::wstring typed(1, static_cast<wchar_t>(wParam));
+        if (ApplyMultiCaretReplacement(editor, typed)) {
+            RecordMacroText(typed);
+            return 0;
+        }
+        RecordMacroText(typed);
+    }
+
+    if (message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
         (GetKeyState(VK_MENU) & 0x8000) == 0) {
         if (wParam == VK_F2) {
             SendMessageW(g_app.window, WM_COMMAND, kIdViewToggleBookmark, 0);
@@ -3868,7 +4085,10 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         UpdateHorizontalScrollbar(editor);
         if (message == WM_SIZE) SyntaxOnViewChanged(editor);
     }
-    if (message == WM_PAINT) DrawEditorGuides(editor);
+    if (message == WM_PAINT) {
+        DrawEditorGuides(editor);
+        DrawMultiCaretOverlay(editor);
+    }
     return result;
 }
 
@@ -4122,6 +4342,13 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     // Enable change/scroll notifications only after the initial text is in,
     // so loading a file does not mark it as modified.
     document.textHash = HashText(GetEditorRawText(document.editor));
+    document.largeFileMode = text.size() >= (8ull << 20);
+    if (document.largeFileMode) {
+        // RichEdit's undo journal can otherwise duplicate a large buffer for
+        // every edit. The document remains fully editable and is saved by the
+        // normal path; only the memory-heavy journal is disabled.
+        SendMessageW(document.editor, EM_SETUNDOLIMIT, 0, 0);
+    }
     SendMessageW(document.editor, EM_SETEVENTMASK, 0, kEditorEventMask);
     ShowWindow(document.editor, SW_HIDE);
 
@@ -4218,7 +4445,7 @@ bool OpenFileInNewTab(const fs::path& path) {
     const uintmax_t bytes = fs::file_size(path, sizeError);
     if (!sizeError && bytes > (100ull << 20)) {
         const std::wstring question = L"“" + path.filename().wstring() + L"”有 " + std::to_wstring(bytes >> 20) +
-            L" MB。\n\n是：用日志查看器打开（只读，不整体载入内存，支持筛选和实时跟踪）\n否：仍在编辑器中打开（可能很慢、占用大量内存）";
+            L" MB。\n\n是：用日志查看器打开（只读，不整体载入内存，支持筛选和实时跟踪）\n否：进入大文件编辑模式（关闭内存密集型撤销，仍可编辑和保存）";
         const int choice = MessageBoxW(g_app.window, question.c_str(), kWindowTitle, MB_YESNOCANCEL | MB_ICONQUESTION);
         if (choice == IDCANCEL) return false;
         if (choice == IDYES) return OpenLogViewer(path.wstring());
@@ -4505,6 +4732,14 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(edit, MF_STRING, kIdEditSelectAll, L"全选\tCtrl+A");
     AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(edit, MF_STRING, kIdPrefixSuffix, L"前缀与后缀批量处理...");
+    AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(edit, MF_STRING, kIdMultiCaretNext, L"添加下一行光标\tCtrl+Alt+Down");
+    AppendMenuW(edit, MF_STRING, kIdRectangleSelection, L"矩形选择（按当前选区创建）");
+    AppendMenuW(edit, MF_STRING, kIdClearMultiCaret, L"清除多光标");
+    AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(edit, MF_STRING, kIdMacroToggle, L"开始/停止宏录制");
+    AppendMenuW(edit, MF_STRING, kIdMacroPlay, L"播放最近宏");
+    AppendMenuW(edit, MF_STRING, kIdMacroClear, L"清除最近宏");
     AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
     AppendTextToolMenus(edit);
     AppendDataGeneratorMenus(data);
@@ -5277,6 +5512,7 @@ HACCEL CreateAccelerators() {
         { FCONTROL | FVIRTKEY, 'C', kIdEditCopy },
         { FCONTROL | FVIRTKEY, 'V', kIdEditPaste },
         { FCONTROL | FVIRTKEY, 'A', kIdEditSelectAll },
+        { FCONTROL | FALT | FVIRTKEY, VK_DOWN, kIdMultiCaretNext },
         { FALT | FSHIFT | FVIRTKEY, 'F', kIdToolbarFormat },
         { FCONTROL | FSHIFT | FVIRTKEY, 'H', kIdReplaceInFolder },
         { FVIRTKEY, VK_F5, kIdToolbarRun },
@@ -7805,6 +8041,11 @@ LRESULT CALLBACK StatusBarProc(HWND bar, UINT message, WPARAM wParam, LPARAM lPa
             const std::wstring state = document->untitled ? L"新文件" : L"已保存";
             DrawLabel(dc, state, RECT{x, 0, x + Scale(80), client.bottom}, palette.statusText);
             x += TextWidth(dc, state);
+        }
+        if (document->largeFileMode) {
+            const std::wstring mode = L"  ·  大文件编辑";
+            DrawLabel(dc, mode, RECT{x, 0, x + Scale(150), client.bottom}, palette.accent);
+            x += TextWidth(dc, mode);
         }
 
         int line = 1, column = 1, selected = 0;
@@ -17229,6 +17470,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         const int command = LOWORD(wParam);
         const int notification = HIWORD(wParam);
         HWND source = reinterpret_cast<HWND>(lParam);
+        RecordMacroCommand(static_cast<UINT>(command));
         if (command == kIdTrayShow) {
             RestoreMainWindowFromTray();
             return 0;
@@ -17401,6 +17643,25 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             break;
         case kIdPrefixSuffix:
             OpenPrefixSuffixDialog();
+            break;
+        case kIdMultiCaretNext:
+            AddNextLineCaret();
+            break;
+        case kIdRectangleSelection:
+            CreateRectangleCarets();
+            break;
+        case kIdClearMultiCaret:
+            ClearMultiCarets();
+            break;
+        case kIdMacroToggle:
+            ToggleMacroRecording();
+            break;
+        case kIdMacroPlay:
+            PlayMacro();
+            break;
+        case kIdMacroClear:
+            g_app.macroActions.clear();
+            ShowNotice(L"最近宏已清除");
             break;
         case kIdThemeDark:
             SetThemeKind(ThemeKind::Dark);
@@ -17665,6 +17926,13 @@ int RunSelfTests() {
     failures += expect(HashText(L"abc") == HashText(L"abc"));
     failures += expect(HashText(L"abc") != HashText(L"abd"));
     failures += expect(DataUnescape(L"a\\nb\\t") == L"a\r\nb\t");
+    BYTE modifiers = 0;
+    WORD key = 0;
+    failures += expect(ParseShortcutText(L"Ctrl+Shift+S", modifiers, key) &&
+        (modifiers & FCONTROL) && (modifiers & FSHIFT) && key == 'S');
+    failures += expect(!ParseShortcutText(L"Ctrl+Unknown", modifiers, key));
+    const auto lines = SplitLines(L"a\r\nb\nc");
+    failures += expect(lines.size() == 3 && JoinLines(lines, L"\r") == L"a\rb\rc");
     return failures == 0 ? 0 : 1;
 }
 
