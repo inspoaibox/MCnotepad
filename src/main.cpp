@@ -208,6 +208,7 @@ constexpr int kIdShortcutEditFirst = 2120;
 constexpr int kIdShortcutApply = 2500;
 constexpr int kIdShortcutReset = 2501;
 constexpr int kIdShortcutCancel = 2502;
+constexpr int kIdShortcutTabs = 2503;
 constexpr int kIdTrayShow = 1720;
 constexpr int kIdTrayExit = 1721;
 constexpr int kIdEncodingFirst = 1601;    // 1601..1605
@@ -537,6 +538,7 @@ std::vector<ShortcutBinding> g_shortcuts;
 HACCEL g_accelerators = nullptr;
 HWND g_shortcutDialog = nullptr;
 HWND g_shortcutDialogOwner = nullptr;
+HWND g_shortcutTabs = nullptr;
 std::vector<HWND> g_shortcutEditControls;
 struct ShortcutDialogControl {
     HWND window = nullptr;
@@ -544,6 +546,7 @@ struct ShortcutDialogControl {
     int y = 0;
     int width = 0;
     int height = 0;
+    int page = 0;
 };
 std::vector<ShortcutDialogControl> g_shortcutDialogControls;
 HWND g_shortcutDialogHint = nullptr;
@@ -552,6 +555,13 @@ HWND g_shortcutDialogReset = nullptr;
 HWND g_shortcutDialogCancel = nullptr;
 int g_shortcutDialogContentHeight = 0;
 int g_shortcutDialogScrollOffset = 0;
+int g_shortcutDialogPage = 0;
+
+constexpr int kShortcutPageCount = 10;
+constexpr const wchar_t* kShortcutPageNames[kShortcutPageCount] = {
+    L"文件", L"编辑", L"标签", L"搜索", L"视图",
+    L"工具", L"开发者", L"数据", L"设置", L"其他"
+};
 
 std::string HexEncode(std::string_view value);
 std::string WideToUtf8(std::wstring_view value);
@@ -5919,15 +5929,37 @@ bool ParseShortcutText(std::wstring value, BYTE& modifiers, WORD& key) {
     return key >= VK_F1 && key <= VK_F24;
 }
 
+int ShortcutPageForLabel(std::wstring_view label) {
+    const size_t separator = label.find(L'：');
+    const std::wstring_view category = label.substr(0, separator);
+    if (category == L"文件") return 0;
+    if (category == L"编辑" || category == L"文本") return 1;
+    if (category == L"标签") return 2;
+    if (category == L"搜索") return 3;
+    if (category == L"视图" || category == L"编码" || category == L"换行符" || category == L"语言") return 4;
+    if (category == L"工具" || category == L"运行") return 5;
+    if (category == L"开发者") return 6;
+    if (category == L"数据") return 7;
+    if (category == L"设置") return 8;
+    return 9;
+}
+
 void LayoutShortcutDialog(HWND window) {
     if (!window) return;
-    constexpr int kTop = 42;
+    constexpr int kTop = 72;
     constexpr int kBottomArea = 58;
     RECT client{};
     GetClientRect(window, &client);
     const int clientHeight = MulDiv(static_cast<int>(client.bottom), 96, static_cast<int>(g_app.dpi));
     const int viewportBottom = std::max(kTop + 1, clientHeight - kBottomArea);
     const int viewportHeight = viewportBottom - kTop;
+    g_shortcutDialogContentHeight = 0;
+    for (const ShortcutDialogControl& control : g_shortcutDialogControls) {
+        if (control.page == g_shortcutDialogPage) {
+            g_shortcutDialogContentHeight = std::max(g_shortcutDialogContentHeight,
+                control.y + control.height);
+        }
+    }
     const int maxOffset = std::max(0, g_shortcutDialogContentHeight - viewportHeight);
     g_shortcutDialogScrollOffset = std::clamp(g_shortcutDialogScrollOffset, 0, maxOffset);
 
@@ -5941,6 +5973,10 @@ void LayoutShortcutDialog(HWND window) {
     SetScrollInfo(window, SB_VERT, &scroll, TRUE);
 
     for (ShortcutDialogControl& control : g_shortcutDialogControls) {
+        if (control.page != g_shortcutDialogPage) {
+            ShowWindow(control.window, SW_HIDE);
+            continue;
+        }
         const int y = kTop + control.y - g_shortcutDialogScrollOffset;
         const bool visible = y + control.height > kTop && y < viewportBottom;
         if (visible) {
@@ -5950,8 +5986,12 @@ void LayoutShortcutDialog(HWND window) {
             ShowWindow(control.window, SW_HIDE);
         }
     }
+    if (g_shortcutTabs) {
+        SetWindowPos(g_shortcutTabs, nullptr, Scale(18), Scale(6), Scale(644), Scale(30),
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    }
     if (g_shortcutDialogHint) {
-        SetWindowPos(g_shortcutDialogHint, nullptr, Scale(24), Scale(10), Scale(620), Scale(24),
+        SetWindowPos(g_shortcutDialogHint, nullptr, Scale(24), Scale(42), Scale(620), Scale(24),
             SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
     }
     const int buttonY = Scale(std::max(kTop + 4, clientHeight - 44));
@@ -5966,11 +6006,28 @@ LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LP
         g_shortcutEditControls.clear();
         g_shortcutDialogControls.clear();
         g_shortcutDialogScrollOffset = 0;
-        constexpr int kTop = 42;
+        g_shortcutDialogPage = 0;
+        constexpr int kTop = 72;
         constexpr int kRowHeight = 28;
+        std::vector<int> rowByPage(kShortcutPageCount, 0);
+        g_shortcutTabs = CreateWindowExW(0, WC_TABCONTROLW, nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(18), Scale(6), Scale(644), Scale(30), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShortcutTabs)), g_app.instance, nullptr);
+        if (g_shortcutTabs) {
+            SendMessageW(g_shortcutTabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            for (int page = 0; page < kShortcutPageCount; ++page) {
+                TCITEMW item{};
+                item.mask = TCIF_TEXT;
+                item.pszText = const_cast<wchar_t*>(kShortcutPageNames[page]);
+                TabCtrl_InsertItem(g_shortcutTabs, page, &item);
+            }
+            TabCtrl_SetCurSel(g_shortcutTabs, g_shortcutDialogPage);
+        }
         for (size_t index = 0; index < g_shortcuts.size(); ++index) {
             const ShortcutBinding& binding = g_shortcuts[index];
-            const int rowY = static_cast<int>(index) * kRowHeight;
+            const int page = std::clamp(ShortcutPageForLabel(binding.label), 0, kShortcutPageCount - 1);
+            const int rowY = rowByPage[page]++ * kRowHeight;
             HWND label = CreateWindowExW(0, L"STATIC", binding.label.c_str(),
                 WS_CHILD | WS_VISIBLE, Scale(24), Scale(kTop + rowY + 3), Scale(270), Scale(22),
                 window, nullptr, g_app.instance, nullptr);
@@ -5983,13 +6040,12 @@ LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LP
             SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
             if (g_app.darkTheme) SetWindowTheme(edit, L"DarkMode_Explorer", nullptr);
             g_shortcutEditControls.push_back(edit);
-            g_shortcutDialogControls.push_back({label, 24, rowY + 3, 270, 22});
-            g_shortcutDialogControls.push_back({edit, 310, rowY, 300, 24});
+            g_shortcutDialogControls.push_back({label, 24, rowY + 3, 270, 22, page});
+            g_shortcutDialogControls.push_back({edit, 310, rowY, 300, 24, page});
         }
-        g_shortcutDialogContentHeight = static_cast<int>(g_shortcuts.size()) * kRowHeight;
         g_shortcutDialogHint = CreateWindowExW(0, L"STATIC",
-            L"支持 Ctrl/Shift/Alt + 字母、数字、F1-F24、方向键等；留空表示取消快捷键。",
-            WS_CHILD | WS_VISIBLE, Scale(24), Scale(10), Scale(620), Scale(24),
+            L"按主菜单分类设置快捷键；支持 Ctrl/Shift/Alt、字母、数字、F1-F24 和方向键，留空表示取消。",
+            WS_CHILD | WS_VISIBLE, Scale(24), Scale(42), Scale(620), Scale(24),
             window, nullptr, g_app.instance, nullptr);
         SendMessageW(g_shortcutDialogHint, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
         g_shortcutDialogApply = CreateWindowExW(0, L"BUTTON", L"应用",
@@ -6039,6 +6095,16 @@ LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LP
         g_shortcutDialogScrollOffset -= GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA * 56;
         LayoutShortcutDialog(window);
         return 0;
+    case WM_NOTIFY: {
+        const NMHDR* header = reinterpret_cast<const NMHDR*>(lParam);
+        if (header != nullptr && header->hwndFrom == g_shortcutTabs && header->code == TCN_SELCHANGE) {
+            g_shortcutDialogPage = std::clamp(TabCtrl_GetCurSel(g_shortcutTabs), 0, kShortcutPageCount - 1);
+            g_shortcutDialogScrollOffset = 0;
+            LayoutShortcutDialog(window);
+            return 0;
+        }
+        break;
+    }
     case WM_COMMAND: {
         const int command = LOWORD(wParam);
         if (command == kIdShortcutReset) {
@@ -6088,6 +6154,7 @@ LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LP
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        g_shortcutTabs = nullptr;
         g_shortcutEditControls.clear();
         g_shortcutDialogControls.clear();
         g_shortcutDialogHint = nullptr;
@@ -6096,6 +6163,7 @@ LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LP
         g_shortcutDialogCancel = nullptr;
         g_shortcutDialogContentHeight = 0;
         g_shortcutDialogScrollOffset = 0;
+        g_shortcutDialogPage = 0;
         g_shortcutDialog = nullptr;
         {
             HWND owner = g_shortcutDialogOwner ? g_shortcutDialogOwner : g_app.window;
