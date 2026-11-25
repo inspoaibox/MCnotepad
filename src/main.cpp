@@ -332,6 +332,7 @@ struct TabDocument {
     LONG bracketMatchEnd = -1;
     std::vector<FoldRegion> folds;
     uint64_t foldTextHash = 0;
+    int logicalLineCount = 1;     // real lines (paragraphs), to shift bookmarks on edits
     std::vector<MultiCaret> multiCarets;
     bool rectangleSelection = false;
     bool largeFileMode = false;
@@ -1179,6 +1180,13 @@ public:
     }
 
     // Character position where the real line containing `position` starts.
+    // Character position where real line `index` (1-based) starts, or -1.
+    LONG StartOfParagraph(long index) {
+        long start = -1;
+        if (range_ && index >= 1 && SUCCEEDED(range_->SetIndex(tomParagraph, index, 0))) range_->GetStart(&start);
+        return static_cast<LONG>(start);
+    }
+
     LONG ParagraphStart(LONG position) {
         long start = 0;
         if (range_ && SUCCEEDED(range_->SetRange(position, position)) &&
@@ -1249,27 +1257,32 @@ private:
     ITextRange* range_ = nullptr;
 };
 
+// Folds are {...} blocks spanning more than one real line. Re-detected only
+// when the text changed (textHash is kept current by the EN_CHANGE handler);
+// a block stays collapsed after an edit as long as its text is still hidden.
 void DetectFoldRegions(TabDocument& document) {
     if (!document.editor) return;
     if (document.largeFileMode) return;
+    if (document.foldTextHash != 0 && document.foldTextHash == document.textHash) return;
+    const bool hadCollapsed = std::any_of(document.folds.begin(), document.folds.end(), [](const FoldRegion& region) { return region.collapsed; });
     const std::wstring text = GetEditorRawText(document.editor);
-    const uint64_t hash = HashText(text);
-    if (document.foldTextHash == hash && !document.folds.empty()) return;
     document.folds.clear();
-    document.foldTextHash = hash;
-    std::vector<LONG> stack;
+    document.foldTextHash = document.textHash != 0 ? document.textHash : HashText(text);
+    struct Open { LONG position; int line; };
+    std::vector<Open> stack;
+    int line = 0;  // real line, 0-based
     for (LONG position = 0; position < static_cast<LONG>(text.size()); ++position) {
         const wchar_t character = text[static_cast<size_t>(position)];
-        if (character == L'{' && (position == 0 || text[static_cast<size_t>(position - 1)] != L'\\')) {
-            stack.push_back(position);
+        if (character == L'\r') {
+            ++line;
+        } else if (character == L'{' && (position == 0 || text[static_cast<size_t>(position - 1)] != L'\\')) {
+            stack.push_back({position, line});
         } else if (character == L'}' && !stack.empty()) {
-            const LONG opening = stack.back();
+            const Open opening = stack.back();
             stack.pop_back();
-            const LRESULT line = SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, opening);
-            const LRESULT closingLine = SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, position);
-            if (line >= 0 && closingLine > line) {
+            if (line > opening.line) {
                 const LONG end = std::min<LONG>(static_cast<LONG>(text.size()), position + 1);
-                document.folds.push_back({opening + 1, end, static_cast<int>(line), false});
+                document.folds.push_back({opening.position + 1, end, opening.line, false});
             }
         }
     }
@@ -1277,6 +1290,22 @@ void DetectFoldRegions(TabDocument& document) {
         if (left.line != right.line) return left.line < right.line;
         return left.start < right.start;
     });
+    if (hadCollapsed) {
+        TextDocumentRef tom(document.editor);
+        ITextRange* range = nullptr;
+        if (tom && SUCCEEDED(tom.document()->Range(0, 0, &range)) && range) {
+            for (FoldRegion& region : document.folds) {
+                ITextFont* font = nullptr;
+                long hidden = tomFalse;
+                if (SUCCEEDED(range->SetRange(region.start, region.end)) && SUCCEEDED(range->GetFont(&font)) && font) {
+                    font->GetHidden(&hidden);
+                    font->Release();
+                }
+                region.collapsed = hidden == tomTrue;
+            }
+            range->Release();
+        }
+    }
 }
 
 void ApplyFoldVisibility(TabDocument& document) {
@@ -1301,7 +1330,9 @@ void FoldCurrentBlock() {
     DetectFoldRegions(*document);
     CHARRANGE selection{};
     SendMessageW(document->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-    const int line = static_cast<int>(SendMessageW(document->editor, EM_EXLINEFROMCHAR, 0, selection.cpMin));
+    TextDocumentRef tom(document->editor);
+    const int line = tom ? static_cast<int>(tom.ParagraphIndex(selection.cpMin)) - 1
+                         : static_cast<int>(SendMessageW(document->editor, EM_EXLINEFROMCHAR, 0, selection.cpMin));
     auto it = std::find_if(document->folds.begin(), document->folds.end(), [line](const FoldRegion& region) {
         return region.line == line;
     });
@@ -1320,6 +1351,13 @@ void UnfoldAllBlocks() {
     DetectFoldRegions(*document);
     for (FoldRegion& region : document->folds) region.collapsed = false;
     ApplyFoldVisibility(*document);
+    // Also text hidden by a block whose braces were edited away since.
+    TextDocumentRef tom(document->editor);
+    if (tom) {
+        tom.document()->Undo(tomSuspend, nullptr);
+        tom.SetHidden(0, static_cast<LONG>(GetEditorRawText(document->editor).size()) + 1, false);
+        tom.document()->Undo(tomResume, nullptr);
+    }
     g_app.stateDirty = true;
 }
 
@@ -2750,6 +2788,37 @@ bool IsEditorImeComposing(HWND editor) {
     return editor != nullptr && g_imeComposingEditors.find(editor) != g_imeComposingEditors.end();
 }
 
+// The selection including which end the caret is on. EM_EXGETSEL/EXSETSEL
+// lose that: restoring a selection made upwards (Shift+Up) would move the
+// caret to its bottom end and the next Shift+Up would shrink it instead.
+struct SelectionState {
+    CHARRANGE range{};
+    bool caretAtStart = false;
+};
+
+SelectionState CaptureSelection(HWND editor) {
+    SelectionState state;
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&state.range));
+    if (state.range.cpMin == state.range.cpMax) return state;
+    TextDocumentRef tom(editor);
+    ITextSelection* selection = nullptr;
+    if (tom && SUCCEEDED(tom.document()->GetSelection(&selection)) && selection) {
+        long flags = 0;
+        if (SUCCEEDED(selection->GetFlags(&flags))) state.caretAtStart = (flags & tomSelStartActive) != 0;
+        selection->Release();
+    }
+    return state;
+}
+
+// Puts the selection back only if something moved it, keeping its direction.
+void RestoreSelection(HWND editor, const SelectionState& state) {
+    CHARRANGE now{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&now));
+    if (now.cpMin == state.range.cpMin && now.cpMax == state.range.cpMax) return;
+    if (state.caretAtStart) SendMessageW(editor, EM_SETSEL, state.range.cpMax, state.range.cpMin);
+    else SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&state.range));
+}
+
 void ApplyCurrentLineHighlight(TabDocument& document, bool force) {
     HWND editor = document.editor;
     if (!editor || !IsWindow(editor) || !IsWindowVisible(editor)) return;
@@ -2758,8 +2827,8 @@ void ApplyCurrentLineHighlight(TabDocument& document, bool force) {
     // window flash and move, especially for Chinese pinyin input.
     if (IsEditorImeComposing(editor)) return;
 
-    CHARRANGE selection{};
-    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const SelectionState savedSelection = CaptureSelection(editor);
+    const CHARRANGE selection = savedSelection.range;
     const LONG length = static_cast<LONG>(GetWindowTextLengthW(editor));
     const LONG caret = std::clamp(selection.cpMin, 0L, length);
     const int lineIndex = static_cast<int>(SendMessageW(editor, EM_EXLINEFROMCHAR, 0, caret));
@@ -2793,7 +2862,7 @@ void ApplyCurrentLineHighlight(TabDocument& document, bool force) {
     tom.document()->Unfreeze(&freezeCount);
     tom.document()->Undo(tomResume, nullptr);
     document.highlightedLine = line;
-    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    RestoreSelection(editor, savedSelection);
     InvalidateRect(editor, nullptr, FALSE);
 }
 
@@ -2864,8 +2933,8 @@ void ApplyBracketMatchHighlight(TabDocument& document, bool force) {
     HWND editor = document.editor;
     if (!editor || !IsWindow(editor) || !IsWindowVisible(editor)) return;
     if (IsEditorImeComposing(editor)) return;
-    CHARRANGE selection{};
-    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const SelectionState savedSelection = CaptureSelection(editor);
+    const CHARRANGE selection = savedSelection.range;
     const LONG length = static_cast<LONG>(GetWindowTextLengthW(editor));
     const LONG caret = std::clamp(selection.cpMin, 0L, length);
     const std::wstring text = GetEditorRawText(editor);
@@ -2909,7 +2978,7 @@ void ApplyBracketMatchHighlight(TabDocument& document, bool force) {
             bracketTom.document()->Undo(tomResume, nullptr);
         }
     }
-    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    RestoreSelection(editor, savedSelection);
     InvalidateRect(editor, nullptr, FALSE);
 }
 
@@ -2936,9 +3005,30 @@ bool HasBookmark(const TabDocument& document, int line) {
     return std::binary_search(document.bookmarks.begin(), document.bookmarks.end(), line);
 }
 
+int CountRealLines(const std::wstring& text) {
+    return 1 + static_cast<int>(std::count(text.begin(), text.end(), L'\r'));
+}
+
+// Lines were inserted or removed: bookmarks below the edit move with their text.
+// `caretLine` is the real line of the caret after the edit (1-based).
+void ShiftBookmarksForEdit(TabDocument& document, int newLineCount, int caretLine) {
+    const int delta = newLineCount - document.logicalLineCount;
+    document.logicalLineCount = newLineCount;
+    if (delta == 0 || document.bookmarks.empty()) return;
+    if (delta > 0) {
+        const int editLine = caretLine - delta;  // inserted lines end at the caret
+        for (int& line : document.bookmarks) if (line > editLine) line += delta;
+    } else {
+        const int removedLast = caretLine - delta;  // lines caretLine+1 .. caretLine-delta are gone
+        for (int& line : document.bookmarks) {
+            if (line > removedLast) line += delta;
+            else if (line > caretLine) line = caretLine;
+        }
+    }
+}
+
 void NormalizeBookmarks(TabDocument& document) {
-    const int lineCount = document.editor
-        ? static_cast<int>(SendMessageW(document.editor, EM_GETLINECOUNT, 0, 0)) : 1;
+    const int lineCount = document.editor ? document.logicalLineCount : 1;
     document.bookmarks.erase(std::remove_if(document.bookmarks.begin(), document.bookmarks.end(),
         [lineCount](int line) { return line < 1 || line > lineCount; }), document.bookmarks.end());
     std::sort(document.bookmarks.begin(), document.bookmarks.end());
@@ -2961,7 +3051,9 @@ void ToggleBookmarkAtCaret() {
     TabDocument& document = g_app.documents[static_cast<size_t>(g_app.activeIndex)];
     CHARRANGE selection{};
     SendMessageW(document.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-    const long line = static_cast<long>(SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, selection.cpMin)) + 1;
+    TextDocumentRef tom(document.editor);
+    const long line = tom ? tom.ParagraphIndex(selection.cpMin)
+                          : static_cast<long>(SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, selection.cpMin)) + 1;
     ToggleBookmarkAtLine(g_app.activeIndex, static_cast<int>(line));
 }
 
@@ -2975,7 +3067,9 @@ void GotoBookmark(int direction) {
     }
     CHARRANGE selection{};
     SendMessageW(document.editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-    const int current = static_cast<int>(SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, selection.cpMin)) + 1;
+    TextDocumentRef tom(document.editor);
+    const int current = tom ? static_cast<int>(tom.ParagraphIndex(selection.cpMin))
+                            : static_cast<int>(SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, selection.cpMin)) + 1;
     int target = direction > 0 ? document.bookmarks.front() : document.bookmarks.back();
     if (direction > 0) {
         for (int line : document.bookmarks) if (line > current) { target = line; break; }
@@ -2984,7 +3078,8 @@ void GotoBookmark(int direction) {
             if (*it < current) { target = *it; break; }
         }
     }
-    const LONG position = static_cast<LONG>(SendMessageW(document.editor, EM_LINEINDEX, target - 1, 0));
+    const LONG position = tom ? tom.StartOfParagraph(target)
+                              : static_cast<LONG>(SendMessageW(document.editor, EM_LINEINDEX, target - 1, 0));
     if (position >= 0) {
         SendMessageW(document.editor, EM_SETSEL, position, position);
         SendMessageW(document.editor, EM_SCROLLCARET, 0, 0);
@@ -3116,8 +3211,9 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         MapWindowPoints(window, editor, &point, 1);
         const LRESULT character = SendMessageW(editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&point));
         const LONG position = static_cast<LONG>(character);
-        const int line = position >= 0
-            ? static_cast<int>(SendMessageW(editor, EM_EXLINEFROMCHAR, 0, position)) + 1 : 1;
+        TextDocumentRef tom(editor);
+        const int line = position < 0 ? 1 : tom ? static_cast<int>(tom.ParagraphIndex(position))
+                                                : static_cast<int>(SendMessageW(editor, EM_EXLINEFROMCHAR, 0, position)) + 1;
         if (foldClick) {
             TabDocument& document = g_app.documents[static_cast<size_t>(g_app.activeIndex)];
             DetectFoldRegions(document);
@@ -4598,8 +4694,7 @@ void ApplyWordWrapAll() {
 void ApplyEditorLineSpacing(HWND editor) {
     if (!editor) return;
     EditorEventMute mute(editor);
-    CHARRANGE selection{};
-    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const SelectionState savedSelection = CaptureSelection(editor);
     const LONG firstVisibleLine = static_cast<LONG>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
     const LRESULT wasModified = SendMessageW(editor, EM_GETMODIFY, 0, 0);
 
@@ -4629,7 +4724,7 @@ void ApplyEditorLineSpacing(HWND editor) {
 
     SendMessageW(editor, EM_SETSEL, 0, -1);
     SendMessageW(editor, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format));
-    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    RestoreSelection(editor, savedSelection);
     SendMessageW(editor, EM_SETMODIFY, wasModified ? TRUE : FALSE, 0);
 
     const LONG nowVisibleLine = static_cast<LONG>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
@@ -4762,7 +4857,7 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     SendMessageW(document.editor, EM_SETMODIFY, modified ? TRUE : FALSE, 0);
     // Enable change/scroll notifications only after the initial text is in,
     // so loading a file does not mark it as modified.
-    document.textHash = HashText(GetEditorRawText(document.editor));
+    { const std::wstring loaded = GetEditorRawText(document.editor); document.textHash = HashText(loaded); document.logicalLineCount = CountRealLines(loaded); }
     SendMessageW(document.editor, EM_SETEVENTMASK, 0, kEditorEventMask);
     ShowWindow(document.editor, SW_HIDE);
 
@@ -4782,25 +4877,35 @@ bool SaveDocument(int index, bool saveAs) {
     fs::path target = document.path;
 
     if (saveAs || document.untitled || target.empty()) {
-        wchar_t fileName[MAX_PATH]{};
+        std::vector<wchar_t> fileName(32768, L'\0');  // long paths
         if (!document.path.empty()) {
-            wcsncpy_s(fileName, MAX_PATH, document.path.c_str(), _TRUNCATE);
+            wcsncpy_s(fileName.data(), fileName.size(), document.path.c_str(), _TRUNCATE);
         } else if (document.title.rfind(L"Untitled-", 0) != 0) {
-            wcsncpy_s(fileName, MAX_PATH, document.title.c_str(), _TRUNCATE);
+            wcsncpy_s(fileName.data(), fileName.size(), document.title.c_str(), _TRUNCATE);
         }
 
         OPENFILENAMEW dialog{};
         dialog.lStructSize = sizeof(dialog);
         dialog.hwndOwner = g_app.window;
         dialog.lpstrFilter = L"All files\0*.*\0Text files\0*.txt;*.md;*.log;*.json;*.cpp;*.h\0";
-        dialog.lpstrFile = fileName;
-        dialog.nMaxFile = MAX_PATH;
+        dialog.lpstrFile = fileName.data();
+        dialog.nMaxFile = static_cast<DWORD>(fileName.size());
         dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
         dialog.lpstrDefExt = L"txt";
         if (!GetSaveFileNameW(&dialog)) {
             return false;
         }
-        target = fileName;
+        target = fileName.data();
+    }
+
+    // Another program changed the file since we loaded or saved it.
+    if (!document.untitled && document.fileTimestamp != 0 && SamePath(document.path, target)) {
+        const uint64_t onDisk = FileTimestamp(target);
+        if (onDisk != 0 && onDisk != document.fileTimestamp) {
+            const std::wstring question = L"“" + document.title + L"”在打开后已被其他程序修改。\n\n"
+                L"是：用当前内容覆盖磁盘上的文件\n否：不保存（可先用“重新加载”或比较功能查看差异）";
+            if (MessageBoxW(g_app.window, question.c_str(), kWindowTitle, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return false;
+        }
     }
 
     const std::wstring text = GetWindowTextValue(document.editor);
@@ -4829,7 +4934,10 @@ bool SaveDocument(int index, bool saveAs) {
     UpdateTabTitle(index);
     UpdateStatusBar();
     g_app.stateDirty = true;
-    return PersistAll(false);
+    // The file itself is saved; a failing session/recovery write must not
+    // make closing the tab or the app think the save failed.
+    if (!PersistAll(false)) ShowNotice(L"文件已保存，但会话数据写入失败（检查磁盘空间或数据目录权限）");
+    return true;
 }
 
 bool SaveAllDocuments() {
@@ -5008,7 +5116,10 @@ bool CloseAllDocuments() {
     return true;
 }
 
+bool ConfirmCloseCompareWindows();
+
 bool PrepareApplicationClose() {
+    if (!ConfirmCloseCompareWindows()) return false;
     std::vector<int> modified;
     for (size_t index = 0; index < g_app.documents.size(); ++index) {
         if (g_app.documents[index].modified) modified.push_back(static_cast<int>(index));
@@ -5035,13 +5146,15 @@ bool PrepareApplicationClose() {
 }
 
 void OpenFileDialog() {
-    wchar_t fileName[MAX_PATH]{};
+    // Room for many selected files (the names come back as one list).
+    std::vector<wchar_t> buffer(1 << 16, L'\0');
+    wchar_t* fileName = buffer.data();
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = g_app.window;
     dialog.lpstrFilter = L"All files\0*.*\0Text files\0*.txt;*.md;*.log;*.json;*.cpp;*.h\0";
     dialog.lpstrFile = fileName;
-    dialog.nMaxFile = MAX_PATH;
+    dialog.nMaxFile = static_cast<DWORD>(buffer.size());
     dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT;
 
     if (!GetOpenFileNameW(&dialog)) {
@@ -5536,6 +5649,13 @@ void OpenCommandLineFiles() {
         return;
     }
 
+    // Paths are made absolute now: the file dialogs change the current
+    // directory, and a relative path saved later would land somewhere else.
+    const auto absolute = [](const std::wstring& path) {
+        std::error_code error;
+        const fs::path full = fs::absolute(fs::path(path), error);
+        return error ? path : full.lexically_normal().wstring();
+    };
     for (int index = 1; index < argumentCount; ++index) {
         const std::wstring argument = arguments[index];
         if (argument == L"--new-instance" || argument == L"--portable") {
@@ -5546,7 +5666,7 @@ void OpenCommandLineFiles() {
             continue;
         }
         if ((argument == L"--diff" || argument == L"--diff-struct") && index + 2 < argumentCount) {
-            const std::wstring left = arguments[index + 1], right = arguments[index + 2];
+            const std::wstring left = absolute(arguments[index + 1]), right = absolute(arguments[index + 2]);
             index += 2;
             std::error_code error;
             if (fs::is_directory(left, error) && fs::is_directory(right, error)) CompareFolderPaths(left, right);
@@ -5554,7 +5674,7 @@ void OpenCommandLineFiles() {
             continue;
         }
         if (!argument.empty() && argument[0] != L'-') {
-            OpenFileInNewTab(fs::path(argument));
+            OpenFileInNewTab(fs::path(absolute(argument)));
         }
     }
     LocalFree(arguments);
@@ -6573,7 +6693,7 @@ void ReloadDocumentFromDisk(int index) {
     document.highlightedLine = -1;
     document.bracketMatchStart = -1;
     document.bracketMatchEnd = -1;
-    document.textHash = HashText(GetEditorRawText(document.editor));
+    { const std::wstring loaded = GetEditorRawText(document.editor); document.textHash = HashText(loaded); document.logicalLineCount = CountRealLines(loaded); }
     document.fileTimestamp = FileTimestamp(document.path);
     MarkRecoveryDirty(index);
     HighlightDocument(document);
@@ -7302,23 +7422,38 @@ void RunActiveDocument() {
         return;
     }
 
+    // Interpreters are started by full path from the system folder, never
+    // found by name: a cmd.exe or powershell.exe next to an opened file (or
+    // in the current folder) must not be the one that runs.
+    wchar_t systemFolder[MAX_PATH]{};
+    GetSystemDirectoryW(systemFolder, MAX_PATH);
+    const std::wstring cmd = std::wstring(systemFolder) + L"\\cmd.exe";
+    const std::wstring powershell = std::wstring(systemFolder) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
     const std::wstring quoted = L"\"" + path.wstring() + L"\"";
+    std::wstring application;
     std::wstring command;
-    if (extension == L".bat" || extension == L".cmd") command = L"cmd.exe /k call " + quoted;
-    else if (extension == L".ps1") command = L"powershell.exe -NoLogo -NoExit -File " + quoted;
-    else if (extension == L".py" || extension == L".pyw") command = L"cmd.exe /k python " + quoted;
-    else if (extension == L".js" || extension == L".mjs" || extension == L".cjs") command = L"cmd.exe /k node " + quoted;
+    if (extension == L".bat" || extension == L".cmd") { application = cmd; command = L"\"" + cmd + L"\" /k call " + quoted; }
+    else if (extension == L".ps1") { application = powershell; command = L"\"" + powershell + L"\" -NoLogo -NoExit -File " + quoted; }
+    else if (extension == L".py" || extension == L".pyw") { application = cmd; command = L"\"" + cmd + L"\" /k python " + quoted; }
+    else if (extension == L".js" || extension == L".mjs" || extension == L".cjs") { application = cmd; command = L"\"" + cmd + L"\" /k node " + quoted; }
     if (command.empty()) {
         MessageBoxW(g_app.window,
             L"暂不支持运行这种类型的文件。\n支持：.bat .cmd .ps1 .py .js，以及在浏览器中打开 .html。",
             kWindowTitle, MB_ICONINFORMATION);
         return;
     }
+    if (application == cmd && path.wstring().find(L'%') != std::wstring::npos) {
+        MessageBoxW(g_app.window, L"文件路径中含有 %，命令提示符会把它当作变量展开而运行错误的文件。\n请重命名文件或所在文件夹后再运行。",
+            kWindowTitle, MB_ICONWARNING);
+        return;
+    }
+    // python / node are looked up through PATH only, not in the script's folder.
+    SetEnvironmentVariableW(L"NoDefaultCurrentDirectoryInExePath", L"1");
 
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE,
+    if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE,
             nullptr, directory.empty() ? nullptr : directory.c_str(), &startup, &process)) {
         MessageBoxW(g_app.window, L"启动失败，请确认对应的解释器已安装并在 PATH 中。", kWindowTitle, MB_ICONERROR);
         return;
@@ -7668,6 +7803,19 @@ int MenuBarHitTest(POINT point) {
     return -1;
 }
 
+// Popup menu windows ("#32768") showing on this thread: 1 for a drop-down,
+// more while one of its submenus is open.
+int OpenMenuLevels() {
+    int levels = 0;
+    EnumThreadWindows(GetCurrentThreadId(), [](HWND window, LPARAM count) -> BOOL {
+        wchar_t klass[16]{};
+        GetClassNameW(window, klass, 16);
+        if (wcscmp(klass, L"#32768") == 0 && IsWindowVisible(window)) ++*reinterpret_cast<int*>(count);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&levels));
+    return levels;
+}
+
 // While a drop-down is open, hovering another title or pressing Left/Right
 // moves to the neighbouring menu, like a native menu bar.
 LRESULT CALLBACK MenuBarHook(int code, WPARAM wParam, LPARAM lParam) {
@@ -7691,7 +7839,8 @@ LRESULT CALLBACK MenuBarHook(int code, WPARAM wParam, LPARAM lParam) {
                 EndMenu();
             }
         } else if (message->message == WM_KEYDOWN && count > 0) {
-            if (message->wParam == VK_LEFT) {
+            // In a submenu, Left closes just that submenu (Windows does it).
+            if (message->wParam == VK_LEFT && OpenMenuLevels() <= 1) {
                 g_menuSwitchTo = (g_menuOpen + count - 1) % count;
                 EndMenu();
                 return TRUE;
@@ -8248,6 +8397,8 @@ void ShowTabContextMenu(int index, POINT screen) {
     SetMenuState();
 }
 
+DWORD g_tabLastCloseTick = 0;
+
 LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
@@ -8456,6 +8607,7 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
         const int hit = TabHitTest(ComputeTabLayout(), POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, &onClose);
         if (pressed >= 0 && hit == pressed && onClose) {
             CloseDocument(pressed);
+            g_tabLastCloseTick = GetTickCount();
             SetMenuState();
         }
         return 0;
@@ -8469,7 +8621,13 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
         return 0;
     }
     case WM_LBUTTONDBLCLK: {
-        const int hit = TabHitTest(ComputeTabLayout(), POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, nullptr);
+        bool onClose = false;
+        const int hit = TabHitTest(ComputeTabLayout(), POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}, &onClose);
+        // The second click of a quick pair on x, the arrows or "+" is just
+        // another click; so is one on a tab that slid under the pointer
+        // because the first click closed a tab.
+        const bool justClosed = GetTickCount() - g_tabLastCloseTick <= GetDoubleClickTime();
+        if (onClose || hit < -1 || (hit >= 0 && justClosed)) return SendMessageW(strip, WM_LBUTTONDOWN, wParam, lParam);
         if (hit == -1) NewDocument();  // double-click empty space: new tab
         else if (hit >= 0) RenameDocument(hit);
         return 0;
@@ -9018,19 +9176,27 @@ bool PrefixSuffixRegexSearch(std::wstring_view line, std::wstring_view pattern, 
     try {
         const auto flags = std::regex_constants::ECMAScript |
             (matchCase ? std::regex_constants::syntax_option_type{} : std::regex_constants::icase);
-        const std::wregex expression(std::wstring(pattern), flags);
+        // Suffixes are anchored at the end of the line, so "\d+" on "a1b2"
+        // finds the trailing "2" rather than giving up on the first "1".
+        const std::wstring source = prefix ? std::wstring(pattern) : L"(?:" + std::wstring(pattern) + L")$";
+        // The live preview calls this for every line: compile once per pattern.
+        static std::wstring cachedSource;
+        static std::regex_constants::syntax_option_type cachedFlags{};
+        static std::unique_ptr<std::wregex> cached;
+        if (!cached || cachedSource != source || cachedFlags != flags) {
+            cached = std::make_unique<std::wregex>(source, flags);
+            cachedSource = source;
+            cachedFlags = flags;
+        }
+        const std::wregex& expression = *cached;
         const std::wstring value(line);
         std::wsmatch match;
         if (prefix) {
             if (!std::regex_search(value.cbegin(), value.cend(), match, expression, std::regex_constants::match_continuous)) return true;
-            result = {true, static_cast<size_t>(match.position()), static_cast<size_t>(match.length())};
         } else {
             if (!std::regex_search(value.cbegin(), value.cend(), match, expression)) return true;
-            const size_t start = static_cast<size_t>(match.position());
-            const size_t length = static_cast<size_t>(match.length());
-            if (start + length != line.size()) return true;
-            result = {true, start, length};
         }
+        result = {true, static_cast<size_t>(match.position()), static_cast<size_t>(match.length())};
         return true;
     } catch (const std::regex_error& ex) {
         error = L"正则表达式无效（错误代码 " + std::to_wstring(static_cast<int>(ex.code())) + L"）。";
@@ -9394,7 +9560,7 @@ void PrefixSuffixApply(PrefixSuffixDialogState& state) {
         TabDocument& document = g_app.documents[static_cast<size_t>(index)];
         SendMessageW(document.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
         SendMessageW(document.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(item.text.c_str()));
-        document.textHash = HashText(GetEditorRawText(document.editor));
+        { const std::wstring loaded = GetEditorRawText(document.editor); document.textHash = HashText(loaded); document.logicalLineCount = CountRealLines(loaded); }
         document.modified = true;
         document.syntaxStale = true;
         MarkRecoveryDirty(index);
@@ -9567,6 +9733,7 @@ void OpenPrefixSuffixDialog() {
 
 // ---- Text tools -------------------------------------------------------------------
 
+
 std::vector<std::wstring> SplitLines(std::wstring_view text) {
     std::vector<std::wstring> lines;
     size_t start = 0;
@@ -9617,6 +9784,26 @@ std::wstring MapCase(std::wstring_view text, DWORD flags) {
     std::wstring result(static_cast<size_t>(size), L'\0');
     LCMapStringEx(LOCALE_NAME_USER_DEFAULT, flags, text.data(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr, 0);
     return result;
+}
+
+// Breaks one line into pieces of at most `width` characters, preferring the
+// last space. Walks with an offset (copying the remainder on every break made
+// long single-line files quadratic) and never splits a surrogate pair.
+void WrapLineByWidth(const std::wstring& line, size_t width, std::vector<std::wstring>& out, int& breaks) {
+    width = std::max<size_t>(width, 1);
+    size_t position = 0;
+    while (line.size() - position > width) {
+        size_t cut = width;
+        for (size_t k = width; k > 0; --k) {
+            if (line[position + k] == L' ') { cut = k; break; }
+        }
+        if (cut > 1 && IS_HIGH_SURROGATE(line[position + cut - 1])) --cut;
+        out.push_back(TrimRight(line.substr(position, cut)));
+        position += cut;
+        while (position < line.size() && (line[position] == L' ' || line[position] == L'\t')) ++position;
+        ++breaks;
+    }
+    out.push_back(line.substr(position));
 }
 
 // Mandarin pinyin, loaded on first use from <exe dir>/dict/mandarin.
@@ -10933,12 +11120,14 @@ void ExtractToNewTab(int command) {
     std::vector<std::wstring> results;
     std::wstring what;
 
-    const auto collect = [&](const wchar_t* pattern, bool unique) {
+    // `group` picks the capture that holds the value when the pattern also
+    // has to consume a guard character before it.
+    const auto collect = [&](const wchar_t* pattern, bool unique, int group = 0) {
         std::unordered_map<std::wstring, bool> seen;
         try {
             const std::wregex expression(pattern, std::regex_constants::ECMAScript | std::regex_constants::icase);
             for (std::wsregex_iterator it(text.begin(), text.end(), expression), end; it != end; ++it) {
-                std::wstring value = it->str();
+                std::wstring value = it->str(group);
                 // Trailing sentence punctuation is rarely part of a link.
                 while (!value.empty() && std::wstring(L".,;:!?)]}'\"").find(value.back()) != std::wstring::npos) value.pop_back();
                 if (value.empty() || (unique && !seen.emplace(value, true).second)) continue;
@@ -10959,16 +11148,13 @@ void ExtractToNewTab(int command) {
         break;
     case kIdExtractIps:
         what = L"IP 地址";
-        collect(LR"((?:^|[^\d.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})(?![\d.]))", true);
-        for (std::wstring& value : results) {  // drop the leading guard character
-            const size_t first = value.find_first_of(L"0123456789");
-            value = value.substr(first);
-        }
+        collect(LR"((?:^|[^\d.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})(?![\d.]))", true, 1);
         break;
     case kIdExtractNumbers:
         what = L"数字";
         // Whole dotted tokens first, so IPs and version numbers aren't split into "numbers".
-        collect(LR"(-?\d+(?:\.\d+)*)", false);
+        // A minus sign only right after a non-digit, so "2024-01-05" gives 2024, 01, 05.
+        collect(LR"((?:^|[^\d.])(-?\d+(?:\.\d+)*))", false, 1);
         std::erase_if(results, [](const std::wstring& value) { return std::count(value.begin(), value.end(), L'.') > 1; });
         break;
     case kIdExtractKeywordLines: {
@@ -11259,20 +11445,9 @@ void RunTextTool(int command) {
         break;
     }
     case kIdWrapWidth: {
-        const size_t width = static_cast<size_t>(_wtoi(g_wrapWidth.c_str()));
+        const size_t width = static_cast<size_t>(std::max(1, _wtoi(g_wrapWidth.c_str())));
         std::vector<std::wstring> wrapped;
-        for (const std::wstring& line : lines) {
-            std::wstring rest = line;
-            while (rest.size() > width) {
-                // Prefer breaking at the last space for Latin text.
-                size_t cut = rest.find_last_of(L' ', width);
-                if (cut == std::wstring::npos || cut == 0) cut = width;
-                wrapped.push_back(TrimRight(rest.substr(0, cut)));
-                rest = TrimLeft(rest.substr(cut));
-                ++count;
-            }
-            wrapped.push_back(rest);
-        }
+        for (const std::wstring& line : lines) WrapLineByWidth(line, width, wrapped, count);
         result = JoinLines(wrapped);
         notice = L"已插入 " + std::to_wstring(count) + L" 处换行";
         break;
@@ -11729,7 +11904,10 @@ struct SearchFileResult {
     std::wstring before;    // replace mode only, \n line breaks
     std::wstring after;
     int replacements = 0;
+    size_t unlistedHits = 0;  // matches beyond the per-file list limit
 };
+
+constexpr size_t kMaxListedHitsPerFile = 2000;
 
 struct SearchSource {       // text of an open tab, captured on the UI thread
     std::wstring path;
@@ -11933,8 +12111,8 @@ void DescribeHits(const std::wstring& text, const std::vector<std::pair<size_t, 
     for (const auto& [offset, length] : matches) {
         const size_t line = static_cast<size_t>(std::upper_bound(lineStarts.begin(), lineStarts.end(), offset) - lineStarts.begin()) - 1;
         const size_t start = lineStarts[line];
-        size_t end = text.find(L'\n', start);
-        if (end == std::wstring::npos) end = text.size();
+        // The next line start is known: no rescan of (possibly huge) lines per hit.
+        const size_t end = line + 1 < lineStarts.size() ? lineStarts[line + 1] - 1 : text.size();
         SearchHit hit;
         hit.line = static_cast<int>(line + 1);
         hit.column = static_cast<int>(offset - start + 1);
@@ -12144,8 +12322,8 @@ void EnumerateSearchFiles(SearchJob& job, std::vector<SearchFileEntry>& files) {
 }
 
 void PublishResult(SearchJob& job, std::unique_ptr<SearchFileResult> result) {
-    const long long total = job.matches.fetch_add(static_cast<long long>(result->hits.size())) +
-        static_cast<long long>(result->hits.size());
+    const long long found = static_cast<long long>(result->hits.size() + result->unlistedHits);
+    const long long total = job.matches.fetch_add(found) + found;
     ++job.filesHit;
     if (total >= static_cast<long long>(job.matcher.options().maxMatches)) job.truncated = true;
     std::lock_guard lock(job.mutex);
@@ -12157,6 +12335,12 @@ void SearchText(SearchJob& job, std::unique_ptr<SearchFileResult> result, const 
     try {
         job.matcher.Find(normalized, matches);
         if (matches.empty()) return;
+        // A single file can match millions of times (minified code, logs):
+        // list the first ones and count the rest.
+        if (matches.size() > kMaxListedHitsPerFile) {
+            result->unlistedHits = matches.size() - kMaxListedHitsPerFile;
+            matches.resize(kMaxListedHitsPerFile);
+        }
         DescribeHits(normalized, matches, result->hits);
         if (job.matcher.options().forReplace) {
             result->before = normalized;
@@ -12511,6 +12695,7 @@ bool AddFileNode(int fileIndex) {
     const int visible = VisibleHitCount(file);
     if (visible == 0) return false;
     std::wstring text = file.display + L"  (" + std::to_wstring(visible) + L")";
+    if (file.unlistedHits > 0) text += L"  另有 " + std::to_wstring(file.unlistedHits) + L" 处未列出";
     g_search.items.push_back({fileIndex, -1, 0});
     TVINSERTSTRUCTW insert{};
     insert.hParent = TVI_ROOT;
@@ -12991,6 +13176,19 @@ void ReplaceSelectedResultHere() {
     SendMessageW(document->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
     std::wstring selected(static_cast<size_t>(selection.cpMax - selection.cpMin) + 1, L'\0');
     selected.resize(static_cast<size_t>(SendMessageW(document->editor, EM_GETSELTEXT, 0, reinterpret_cast<LPARAM>(selected.data()))));
+    std::replace(selected.begin(), selected.end(), L'\r', L'\n');
+    // The file may have changed since the search (or a regex needs the text
+    // around the match): only replace when the selection is still exactly a match.
+    std::vector<std::pair<size_t, size_t>> check;
+    try {
+        g_search.lastMatcher->Find(selected, check);
+    } catch (const std::exception&) {
+        check.clear();
+    }
+    if (selected.empty() || check.size() != 1 || check.front().first != 0 || check.front().second != selected.size()) {
+        ShowNotice(L"此处内容和搜索时不同（或正则需要上下文才能匹配），未替换；请重新搜索后再试");
+        return;
+    }
     std::wstring replacement = g_search.lastMatcher->ReplaceOne(selected);
     std::replace(replacement.begin(), replacement.end(), L'\n', L'\r');
     SendMessageW(document->editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
@@ -15076,6 +15274,8 @@ struct CompareSide {
     int encoding = 0;
     std::wstring eol = L"\r\n";
     bool dirty = false;
+    uint64_t sourceHash = 0;       // tab text when loaded, to notice later edits there
+    uint64_t sourceTimestamp = 0;  // file time when loaded, to notice changes on disk
 };
 
 // Rows of the aligned view: changed pairs first within each block of edits.
@@ -15141,11 +15341,14 @@ bool LoadCompareSideFromFile(CompareSide& side, const std::wstring& path, std::w
     side.title = fs::path(path).filename().wstring();
     side.editor = nullptr;
     side.dirty = false;
+    side.sourceTimestamp = FileTimestamp(path);
     return true;
 }
 
 void LoadCompareSideFromTab(CompareSide& side, const TabDocument& document) {
-    side.lines = SplitLines(GetEditorRawText(document.editor));
+    const std::wstring text = GetEditorRawText(document.editor);
+    side.sourceHash = HashText(text);
+    side.lines = SplitLines(text);
     side.path = document.untitled ? std::wstring() : document.path;
     side.title = document.title + (document.modified ? L"（未保存的修改）" : L"");
     side.editor = document.editor;
@@ -15184,6 +15387,8 @@ public:
     // Makes `path` here match `from`: replace, insert or delete.
     virtual bool Take(const std::wstring& path, const StructDoc& from, std::wstring& error) = 0;
     virtual std::vector<std::wstring> Lines() const = 0;
+    // True when writing this side back loses something (JSON comments).
+    virtual bool LosesComments() const { return false; }
 };
 
 // ---- JSON (comments allowed, numbers and strings kept as written) ----
@@ -15326,10 +15531,12 @@ private:
             const wchar_t c = text_[position_];
             if (iswspace(c) || c == 0xFEFF) { ++position_; continue; }
             if (c == L'/' && position_ + 1 < text_.size() && text_[position_ + 1] == L'/') {
+                hasComments_ = true;
                 while (position_ < text_.size() && text_[position_] != L'\n') ++position_;
                 continue;
             }
             if (c == L'/' && position_ + 1 < text_.size() && text_[position_ + 1] == L'*') {
+                hasComments_ = true;
                 const size_t end = text_.find(L"*/", position_ + 2);
                 position_ = end == std::wstring::npos ? text_.size() : end + 2;
                 continue;
@@ -15431,6 +15638,10 @@ private:
     std::wstring indent_;
     bool compact_ = false;
     bool trailingNewline_ = false;
+    bool hasComments_ = false;
+
+public:
+    bool LosesComments() const override { return hasComments_; }
 };
 
 // ---- CSV / TSV: rows matched by their first column ----
@@ -15604,9 +15815,14 @@ public:
         struct Open { int indent; std::wstring path; bool dash; };
         std::vector<Open> stack;
         std::unordered_map<std::wstring, int> sequenceCounters;
+        int blockScalarIndent = -1;  // inside "key: |" / "key: >" text: lines deeper than this are text
         for (size_t i = 0; i < lines_.size(); ++i) {
             const std::wstring& line = lines_[i];
             const size_t first = line.find_first_not_of(L' ');
+            if (blockScalarIndent >= 0) {
+                if (first == std::wstring::npos || static_cast<int>(first) > blockScalarIndent) continue;
+                blockScalarIndent = -1;
+            }
             if (first == std::wstring::npos || line[first] == L'#' || line[first] == L'\t') continue;
             if (first == 0 && (line.compare(0, 3, L"---") == 0 || line.compare(0, 3, L"...") == 0)) {
                 if (!nodes_.empty()) { error = L"暂不支持包含多个文档（---）的 YAML"; return false; }
@@ -15644,12 +15860,14 @@ public:
                 column = rest;
                 sequenceCounters.erase(item.path);
                 AddKey(i, column, indent, colon, item.path, true, stack, sequenceCounters);
+                if (StartsBlockScalar(nodes_.back())) blockScalarIndent = static_cast<int>(first);
                 continue;
             }
             const size_t colon = KeyColon(line, first);
             if (colon == std::wstring::npos) continue;  // continuation of a multi-line value
             while (!stack.empty() && stack.back().indent >= indent) stack.pop_back();
             AddKey(i, column, indent, colon, stack.empty() ? L"" : stack.back().path, false, stack, sequenceCounters);
+            if (StartsBlockScalar(nodes_.back())) blockScalarIndent = static_cast<int>(first);
         }
         // Block ends.
         for (Node& node : nodes_) {
@@ -15662,7 +15880,9 @@ public:
                 else break;
             }
             node.end = end;
-            node.container = end > node.line + 1 || node.inlineKey || (node.valueColumn == std::wstring::npos && end > node.line + 1);
+            // A value that starts on the key's line ("key: text", "key: |")
+            // is one value even when it continues over more lines.
+            node.container = node.inlineKey || (node.valueColumn == std::wstring::npos && end > node.line + 1);
         }
         return true;
     }
@@ -15683,7 +15903,7 @@ public:
         const Node* target = Find(path);
         const std::wstring unsupported = L"“" + path + L"”写在“- ”同一行，无法自动合并，请在文本视图中手动修改";
         if (source && target) {
-            if (!source->container && !target->container) {
+            if (!source->container && !target->container && source->end == source->line + 1 && target->end == target->line + 1) {
                 std::wstring& line = lines_[target->line];
                 const std::wstring value = source->valueColumn == std::wstring::npos ? L"" : from.lines_[source->line].substr(source->valueColumn);
                 line = line.substr(0, target->prefixEnd) + (value.empty() ? L"" : L" " + value);
@@ -15777,8 +15997,19 @@ private:
         stack.push_back({indent, node.path, false});
     }
 
+    bool StartsBlockScalar(const Node& node) const {
+        if (node.valueColumn == std::wstring::npos) return false;
+        const wchar_t c = lines_[node.line][node.valueColumn];
+        return c == L'|' || c == L'>';
+    }
+
     std::wstring Value(const Node& node) const {
         if (node.valueColumn == std::wstring::npos) return L"";
+        if (!node.container && node.end > node.line + 1) {  // multi-line value: all of it
+            std::wstring value = TrimCopy(lines_[node.line].substr(node.valueColumn));
+            for (size_t j = node.line + 1; j < node.end; ++j) value += L" ⏎ " + TrimCopy(lines_[j]);
+            return value;
+        }
         std::wstring value = lines_[node.line].substr(node.valueColumn);
         const size_t comment = value.find(L" #");
         if (comment != std::wstring::npos && value[0] != L'"' && value[0] != L'\'') value.erase(comment);
@@ -16186,9 +16417,15 @@ bool SaveCompareSide(CompareWindow& compare, int s) {
             MessageBoxW(compare.window, L"来源标签已关闭，无法写回。", kWindowTitle, MB_ICONWARNING);
             return false;
         }
+        if (HashText(GetEditorRawText(side.editor)) != side.sourceHash) {
+            const std::wstring question = L"标签“" + g_app.documents[static_cast<size_t>(index)].title +
+                L"”在打开比较后又被编辑过，写回会覆盖这些修改（之后仍可在该标签中 Ctrl+Z 撤销）。\n\n确定写回吗？";
+            if (MessageBoxW(compare.window, question.c_str(), kWindowTitle, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return false;
+        }
         text = JoinLines(side.lines, L"\r");
         SendMessageW(side.editor, EM_SETSEL, 0, -1);
         SendMessageW(side.editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(text.c_str()));
+        side.sourceHash = HashText(GetEditorRawText(side.editor));
         side.dirty = false;
         RenderCompare(compare, true);
         ShowNotice(L"已写回标签“" + g_app.documents[static_cast<size_t>(index)].title + L"”（未保存到磁盘，可撤销）");
@@ -16199,11 +16436,18 @@ bool SaveCompareSide(CompareWindow& compare, int s) {
         MessageBoxW(compare.window, L"内容包含 ANSI 编码无法表示的字符，未保存。", kWindowTitle, MB_ICONWARNING);
         return false;
     }
+    const uint64_t onDisk = FileTimestamp(side.path);
+    if (side.sourceTimestamp != 0 && onDisk != 0 && onDisk != side.sourceTimestamp) {
+        const std::wstring question = L"“" + fs::path(side.path).filename().wstring() +
+            L"”在打开比较后已被其他程序修改，保存会覆盖那些修改。\n\n确定保存吗？（可以先点“刷新”重新比较）";
+        if (MessageBoxW(compare.window, question.c_str(), kWindowTitle, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return false;
+    }
     std::string bytes;
     if (!EncodeTextBytes(text, side.encoding, bytes) || !WriteAtomicFile(side.path, bytes)) {
         MessageBoxW(compare.window, (L"保存失败：" + side.path).c_str(), kWindowTitle, MB_ICONERROR);
         return false;
     }
+    side.sourceTimestamp = FileTimestamp(side.path);
     side.dirty = false;
     for (size_t d = 0; d < g_app.documents.size(); ++d) {
         const TabDocument& document = g_app.documents[d];
@@ -16359,6 +16603,11 @@ void TakeStructItems(CompareWindow& compare, bool toRight) {
         return;
     }
     const int target = toRight ? 1 : 0;
+    if (compare.docs[target]->LosesComments() && !compare.sides[target].dirty) {
+        const std::wstring question = std::wstring(L"目标一侧（") + (toRight ? L"右侧" : L"左侧") +
+            L"）的 JSON 含有注释。采用后这一侧会按原缩进重新排版，注释会被删除。\n\n确定继续吗？";
+        if (MessageBoxW(compare.window, question.c_str(), kWindowTitle, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    }
     StructDoc& into = *compare.docs[target];
     const StructDoc& from = *compare.docs[toRight ? 0 : 1];
     std::wstring failures;
@@ -16557,6 +16806,24 @@ LRESULT CALLBACK CompareWindowProc(HWND window, UINT message, WPARAM wParam, LPA
 
 std::vector<HWND> g_toolWindows;  // compare / log windows: get IsDialogMessage and F7/F8 keys
 
+// Before the app exits: compare windows with merged but unsaved sides ask
+// to save (they have no owner, so they would otherwise just disappear).
+bool ConfirmCloseCompareWindows() {
+    for (HWND window : std::vector<HWND>(g_toolWindows)) {
+        if (!IsWindow(window)) continue;
+        wchar_t klass[64]{};
+        GetClassNameW(window, klass, 64);
+        if (wcscmp(klass, L"MCnotepadCompare") != 0) continue;
+        auto* compare = reinterpret_cast<CompareWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (!compare || (!compare->sides[0].dirty && !compare->sides[1].dirty)) continue;
+        ShowWindow(window, SW_SHOWNORMAL);
+        SetForegroundWindow(window);
+        if (!ConfirmDiscardCompare(*compare)) return false;
+        compare->sides[0].dirty = compare->sides[1].dirty = false;
+    }
+    return true;
+}
+
 void OpenCompareWindow(CompareSide left, CompareSide right, bool structure = false) {
     static bool registered = false;
     if (!registered) {
@@ -16688,7 +16955,15 @@ struct FolderCompare {
 enum FolderControl : int { kFolderOnlyDiff = 4101, kFolderOpen, kFolderToRight, kFolderToLeft, kFolderRefresh, kFolderList };
 constexpr UINT kMessageFolderDone = WM_APP + 30;
 
-void ListFolderFiles(const std::wstring& root, std::unordered_map<std::wstring, std::pair<uint64_t, uint64_t>>& files) {
+struct FolderFileInfo {
+    std::wstring relative;  // as named on disk
+    uint64_t size = 0;
+    uint64_t time = 0;
+};
+
+// Keyed by the lower-cased relative path: Windows folders ignore case, so
+// "README.md" and "Readme.md" are the same file.
+void ListFolderFiles(const std::wstring& root, std::unordered_map<std::wstring, FolderFileInfo>& files) {
     std::vector<std::wstring> stack{root};
     while (!stack.empty()) {
         const std::wstring directory = stack.back();
@@ -16706,7 +16981,8 @@ void ListFolderFiles(const std::wstring& root, std::unordered_map<std::wstring, 
             } else {
                 const uint64_t size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
                 const uint64_t time = (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
-                files[full.substr(root.size() + 1)] = {size, time};
+                const std::wstring relative = full.substr(root.size() + 1);
+                files[LowerInvariant(relative)] = {relative, size, time};
             }
         } while (FindNextFileW(find, &data));
         FindClose(find);
@@ -16781,23 +17057,23 @@ void StartFolderCompare(FolderCompare& folder) {
     const std::wstring left = folder.roots[0], right = folder.roots[1];
     HWND window = folder.window;
     HANDLE thread = StartSearchThread([left, right, window] {
-        std::unordered_map<std::wstring, std::pair<uint64_t, uint64_t>> a, b;
+        std::unordered_map<std::wstring, FolderFileInfo> a, b;
         ListFolderFiles(left, a);
         ListFolderFiles(right, b);
         auto* entries = new std::vector<FolderEntry>();
-        for (const auto& [relative, info] : a) {
-            FolderEntry entry{relative, EntryState::LeftOnly, info.first, 0, info.second, 0};
-            const auto other = b.find(relative);
+        for (const auto& [key, info] : a) {
+            FolderEntry entry{info.relative, EntryState::LeftOnly, info.size, 0, info.time, 0};
+            const auto other = b.find(key);
             if (other != b.end()) {
-                entry.rightSize = other->second.first;
-                entry.rightTime = other->second.second;
-                entry.state = entry.leftSize == entry.rightSize && SameFileContent(left + L"\\" + relative, right + L"\\" + relative)
+                entry.rightSize = other->second.size;
+                entry.rightTime = other->second.time;
+                entry.state = entry.leftSize == entry.rightSize && SameFileContent(left + L"\\" + info.relative, right + L"\\" + other->second.relative)
                     ? EntryState::Same : EntryState::Different;
             }
             entries->push_back(entry);
         }
-        for (const auto& [relative, info] : b) {
-            if (!a.count(relative)) entries->push_back({relative, EntryState::RightOnly, 0, info.first, 0, info.second});
+        for (const auto& [key, info] : b) {
+            if (!a.count(key)) entries->push_back({info.relative, EntryState::RightOnly, 0, info.size, 0, info.time});
         }
         std::sort(entries->begin(), entries->end(), [](const FolderEntry& x, const FolderEntry& y) { return _wcsicmp(x.relative.c_str(), y.relative.c_str()) < 0; });
         if (!PostMessageW(window, kMessageFolderDone, 0, reinterpret_cast<LPARAM>(entries))) delete entries;
@@ -16817,6 +17093,17 @@ std::vector<int> CheckedOrSelectedEntries(FolderCompare& folder) {
     return result;
 }
 
+// Deletes a file to the Recycle Bin, so an overwrite can be undone.
+bool MoveToRecycleBin(const fs::path& path) {
+    std::wstring from = path.wstring();
+    from.push_back(L'\0');  // the list is double-NUL terminated
+    SHFILEOPSTRUCTW operation{};
+    operation.wFunc = FO_DELETE;
+    operation.pFrom = from.c_str();
+    operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+    return SHFileOperationW(&operation) == 0 && !operation.fAnyOperationsAborted;
+}
+
 void CopyFolderEntries(FolderCompare& folder, bool toRight) {
     std::vector<int> picked;
     for (const int index : CheckedOrSelectedEntries(folder)) {
@@ -16829,7 +17116,7 @@ void CopyFolderEntries(FolderCompare& folder, bool toRight) {
         return;
     }
     const std::wstring prompt = L"将把 " + std::to_wstring(picked.size()) + L" 个文件从" + (toRight ? L"左侧复制到右侧" : L"右侧复制到左侧") +
-        L"，目标中的同名文件会被覆盖。确定继续吗？";
+        L"。目标中的同名文件会先移到回收站，再被覆盖。确定继续吗？";
     if (MessageBoxW(folder.window, prompt.c_str(), kWindowTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
     int copied = 0;
     std::wstring failures;
@@ -16839,6 +17126,10 @@ void CopyFolderEntries(FolderCompare& folder, bool toRight) {
         const fs::path to = fs::path(folder.roots[toRight ? 1 : 0]) / relative;
         std::error_code error;
         fs::create_directories(to.parent_path(), error);
+        if (fs::exists(to, error) && !MoveToRecycleBin(to)) {
+            failures += L"\n• " + relative + L"（无法把原文件移到回收站，未覆盖）";
+            continue;
+        }
         if (CopyFileW(from.c_str(), to.c_str(), FALSE)) ++copied;
         else failures += L"\n• " + relative;
     }
@@ -18089,9 +18380,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (notification == EN_CHANGE && source != nullptr && !g_app.loading) {
             for (size_t index = 0; index < g_app.documents.size(); ++index) {
                 if (g_app.documents[index].editor == source) {
-                    const uint64_t hash = HashText(GetEditorRawText(source));
+                    const std::wstring currentText = GetEditorRawText(source);
+                    const uint64_t hash = HashText(currentText);
                     if (hash == g_app.documents[index].textHash) break;  // formatting only
                     g_app.documents[index].textHash = hash;
+                    {
+                        CHARRANGE caret{};
+                        SendMessageW(source, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&caret));
+                        const int caretLine = 1 + static_cast<int>(std::count(currentText.begin(),
+                            currentText.begin() + std::min<size_t>(static_cast<size_t>(std::max<LONG>(0, caret.cpMin)), currentText.size()), L'\r'));
+                        ShiftBookmarksForEdit(g_app.documents[index], CountRealLines(currentText), caretLine);
+                    }
                     const bool wasModified = g_app.documents[index].modified;
                     g_app.documents[index].modified = true;
                     MarkRecoveryDirty(static_cast<int>(index));
@@ -18665,6 +18964,81 @@ int RunSelfTests() {
             std::string again;
             EncodeTextBytes(DecodeTextBytes(bytes, &encoding), encoding, again);
             failures += expect((again == sample) == (sample == clean));
+        }
+    }
+    // Bookmarks move with inserted/removed lines.
+    {
+        TabDocument document;
+        document.logicalLineCount = 10;
+        document.bookmarks = {2, 5, 9};
+        ShiftBookmarksForEdit(document, 12, 4);   // 2 lines inserted ending at line 4 (edit at line 2)
+        failures += expect((document.bookmarks == std::vector<int>{2, 7, 11}));
+        ShiftBookmarksForEdit(document, 9, 3);    // lines 4..6 removed, caret on line 3
+        failures += expect((document.bookmarks == std::vector<int>{2, 4, 8}));
+    }
+    // Regex suffix: the trailing match, not the first one.
+    {
+        PrefixSuffixMatch match;
+        std::wstring error;
+        failures += expect(PrefixSuffixRegexSearch(L"a1b2", LR"(\d+)", true, false, match, error) && match.found && match.start == 3 && match.length == 1);
+        PrefixSuffixMatch none;
+        failures += expect(PrefixSuffixRegexSearch(L"a1b", LR"(\d+)", true, false, none, error) && !none.found);
+    }
+    // Wrap by width: breaks at spaces, keeps surrogate pairs whole.
+    {
+        std::vector<std::wstring> out;
+        int breaks = 0;
+        WrapLineByWidth(L"aaa bbb ccc", 5, out, breaks);
+        failures += expect((out == std::vector<std::wstring>{L"aaa", L"bbb", L"ccc"}) && breaks == 2);
+        out.clear();
+        WrapLineByWidth(L"ab\U0001F600cd", 3, out, breaks);  // emoji = 2 UTF-16 units at positions 2-3
+        failures += expect(out.size() >= 2 && out[0] == L"ab" && out[1].substr(0, 2) == L"\U0001F600");
+    }
+    // Hit line ends come from the line table.
+    {
+        std::vector<SearchHit> hits;
+        DescribeHits(L"one\ntwo x\nthree", {{8, 1}}, hits);
+        failures += expect(hits.size() == 1 && hits[0].line == 2 && hits[0].column == 5 && hits[0].lineText == L"two x");
+    }
+    // YAML block text is one value: a change inside it is reported.
+    {
+        YamlDoc left, right;
+        std::wstring error;
+        left.Parse({L"job:", L"  script: |", L"    echo a: 1", L"    done", L"  name: x"}, error);
+        right.Parse({L"job:", L"  script: |", L"    echo b: 1", L"    done", L"  name: x"}, error);
+        const auto rows = CompareStructItems(left.Items(), right.Items());
+        failures += expect(rows.size() == 1 && rows[0].path == L"job.script" && rows[0].kind == RowKind::Changed);
+        failures += expect(left.Take(L"job.script", right, error));
+        failures += expect(CompareStructItems(left.Items(), right.Items()).empty());
+    }
+    // Folder compare matches names case-insensitively.
+    {
+        wchar_t tempRoot[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, tempRoot);
+        const fs::path folder = fs::path(tempRoot) / (L"mcnotepad-folders-" + std::to_wstring(GetCurrentProcessId()));
+        std::error_code error;
+        fs::create_directories(folder, error);
+        WriteBinaryFile(folder / L"README.md", "x");
+        std::unordered_map<std::wstring, FolderFileInfo> files;
+        ListFolderFiles(folder.wstring(), files);
+        failures += expect(files.count(L"readme.md") == 1 && files[L"readme.md"].relative == L"README.md");
+        fs::remove_all(folder, error);
+    }
+    // Selection direction survives capture/restore.
+    {
+        LoadLibraryW(L"Msftedit.dll");
+        HWND edit = CreateWindowExW(0, L"RICHEDIT50W", L"line one\rline two\rline three", WS_POPUP | ES_MULTILINE, 0, 0, 200, 100, nullptr, nullptr, nullptr, nullptr);
+        if (edit) {
+            SendMessageW(edit, EM_SETSEL, 15, 3);  // made upwards: caret at 3
+            const SelectionState saved = CaptureSelection(edit);
+            failures += expect(saved.caretAtStart && saved.range.cpMin == 3 && saved.range.cpMax == 15);
+            CHARRANGE flat{3, 15};
+            SendMessageW(edit, EM_SETSEL, 0, 0);
+            RestoreSelection(edit, saved);
+            const SelectionState after = CaptureSelection(edit);
+            failures += expect(after.caretAtStart && after.range.cpMin == 3 && after.range.cpMax == 15);
+            (void)flat;
+            DestroyWindow(edit);
         }
     }
     // Atomic save keeps attributes and hard links and leaves no temp files.
