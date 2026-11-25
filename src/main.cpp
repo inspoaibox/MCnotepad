@@ -132,6 +132,7 @@ constexpr int kIdViewToggleBookmark = 1236;
 constexpr int kIdViewNextBookmark = 1237;
 constexpr int kIdViewPreviousBookmark = 1238;
 constexpr int kIdViewClearBookmarks = 1239;
+constexpr int kIdTabTogglePinned = 1240;
 constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
@@ -272,6 +273,7 @@ struct TabDocument {
     fs::path snapshotPath;
     bool untitled = true;
     bool modified = false;
+    bool pinned = false;
     bool recoveryDirty = true;
     int64_t caret = 0;
     int64_t anchor = 0;
@@ -296,6 +298,7 @@ struct ClosedTab {
     std::wstring text;
     bool untitled = true;
     bool modified = false;
+    bool pinned = false;
     int64_t caret = 0;
     int64_t anchor = 0;
     int firstVisibleLine = 0;
@@ -3176,7 +3179,7 @@ bool SaveSessionFile() {
             if (bookmark != 0) output << ',';
             output << document.bookmarks[bookmark];
         }
-        output << '\n';
+        output << '\t' << (document.pinned ? 1 : 0) << '\n';
     }
 
     return WriteAtomicFile(g_app.sessionPath, output.str());
@@ -3718,6 +3721,7 @@ void RememberClosedTab(TabDocument& document) {
     closed.text = GetWindowTextValue(document.editor);
     closed.untitled = document.untitled;
     closed.modified = document.modified;
+    closed.pinned = document.pinned;
     closed.caret = document.caret;
     closed.anchor = document.anchor;
     closed.firstVisibleLine = document.firstVisibleLine;
@@ -3757,6 +3761,7 @@ void ReopenClosedDocument() {
         closed.modified, closed.caret, closed.anchor, closed.firstVisibleLine, nullptr, format);
     if (index < 0) return;
     g_app.documents[static_cast<size_t>(index)].bookmarks = std::move(closed.bookmarks);
+    g_app.documents[static_cast<size_t>(index)].pinned = closed.pinned;
     NormalizeBookmarks(g_app.documents[static_cast<size_t>(index)]);
     SelectTab(index);
     PersistAll(false);
@@ -4034,6 +4039,7 @@ struct SessionEntry {
     int horizontalScroll = 0;
     bool modified = false;
     bool untitled = false;
+    bool pinned = false;
     std::vector<int> bookmarks;
     DocumentFormat format;
 };
@@ -4153,6 +4159,11 @@ void LoadPersistedSession() {
                 std::sort(entry.bookmarks.begin(), entry.bookmarks.end());
                 entry.bookmarks.erase(std::unique(entry.bookmarks.begin(), entry.bookmarks.end()), entry.bookmarks.end());
             }
+            if (parts.size() >= 17) {
+                int pinned = 0;
+                ParseInt(parts[16], pinned);
+                entry.pinned = pinned != 0;
+            }
             entry.path = Utf8ToWide(HexDecode(parts[2]));
             entry.title = Utf8ToWide(HexDecode(parts[3]));
             entry.snapshot = fs::path(Utf8ToWide(HexDecode(parts[4])));
@@ -4226,6 +4237,7 @@ void LoadPersistedSession() {
         if (index >= 0) {
             TabDocument& created = g_app.documents[static_cast<size_t>(index)];
             created.horizontalScroll = entry.horizontalScroll;
+            created.pinned = entry.pinned;
             created.bookmarks = std::move(entry.bookmarks);
             NormalizeBookmarks(created);
             // A tab that had to get a fresh snapshot (missing or shared by an
@@ -6586,6 +6598,7 @@ void ShowTabContextMenu(int index, POINT screen) {
     const int last = static_cast<int>(g_app.documents.size()) - 1;
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, 6, hasFile ? L"重命名文件...\tF2" : L"重命名标签...\tF2");
+    AppendMenuW(menu, MF_STRING, 9, document.pinned ? L"取消固定标签" : L"固定标签");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 1, L"关闭\tCtrl+W");
     AppendMenuW(menu, MF_STRING | (index == 0 ? MF_GRAYED : 0), 8, L"关闭左侧标签");
@@ -6640,6 +6653,20 @@ void ShowTabContextMenu(int index, POINT screen) {
     case 7:
         CompareTabs(g_app.activeIndex, index);
         break;
+    case 9: {
+        g_app.documents[static_cast<size_t>(index)].pinned = !g_app.documents[static_cast<size_t>(index)].pinned;
+        const bool nowPinned = g_app.documents[static_cast<size_t>(index)].pinned;
+        if (nowPinned) {
+            int firstUnpinned = 0;
+            while (firstUnpinned < static_cast<int>(g_app.documents.size()) &&
+                g_app.documents[static_cast<size_t>(firstUnpinned)].pinned) ++firstUnpinned;
+            if (index > firstUnpinned) MoveTab(index, firstUnpinned);
+        }
+        g_app.stateDirty = true;
+        InvalidateTabs();
+        ShowNotice(nowPinned ? L"标签已固定" : L"标签已取消固定");
+        break;
+    }
     default:
         break;
     }
@@ -6699,7 +6726,21 @@ LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lP
                         palette.panelBorder);
                 }
             }
-            RECT text{tab.left + Scale(14), tab.top, tab.right - Scale(30), tab.bottom - Scale(1)};
+            if (document.pinned) {
+                const int pinX = tab.left + Scale(9);
+                const int pinY = (tab.top + tab.bottom) / 2;
+                HPEN pinPen = CreatePen(PS_SOLID, std::max(1, Scale(1)), palette.accent);
+                HGDIOBJ oldPen = SelectObject(dc, pinPen);
+                MoveToEx(dc, pinX - Scale(3), pinY - Scale(5), nullptr);
+                LineTo(dc, pinX + Scale(3), pinY - Scale(5));
+                MoveToEx(dc, pinX, pinY - Scale(5), nullptr);
+                LineTo(dc, pinX, pinY + Scale(3));
+                MoveToEx(dc, pinX - Scale(4), pinY + Scale(4), nullptr);
+                LineTo(dc, pinX + Scale(4), pinY + Scale(4));
+                SelectObject(dc, oldPen);
+                DeleteObject(pinPen);
+            }
+            RECT text{tab.left + Scale(document.pinned ? 24 : 14), tab.top, tab.right - Scale(30), tab.bottom - Scale(1)};
             DrawLabel(dc, document.title, text, active ? palette.tabActiveText : palette.tabText);
 
             // Close box on hover/active; otherwise an amber dot marks unsaved work.
