@@ -223,6 +223,7 @@ constexpr int kIdLineSpacing115 = kIdLineSpacingFirst + 1;
 constexpr int kIdLineSpacing150 = kIdLineSpacingFirst + 2;
 constexpr int kIdLineSpacing200 = kIdLineSpacingFirst + 3;
 constexpr int kIdLineSpacingCustom = kIdLineSpacingFirst + 4;
+constexpr int kIdTopSpacingCustom = kIdLineSpacingFirst + 5;
 
 enum DataGeneratorId : int {
     kIdDataFirst = 1801,
@@ -434,6 +435,7 @@ struct AppState {
     ThemeKind theme = ThemeKind::Dark;
     int fontSize = 13;
     int lineSpacingPercent = 100;
+    int topSpacingPixels = 0;
     std::wstring fontFamily = L"Consolas";
     bool showLineNumbers = true;
     bool wordWrap = false;
@@ -652,6 +654,7 @@ std::wstring ShortcutLabelForCommand(int command) {
     case kIdLineSpacing150: return L"视图：行距 1.5 倍";
     case kIdLineSpacing200: return L"视图：行距 2.0 倍";
     case kIdLineSpacingCustom: return L"视图：自定义行距";
+    case kIdTopSpacingCustom: return L"视图：自定义顶部间距";
     default: break;
     }
     if (command >= kIdEncodingFirst && command < kIdEncodingFirst + kEncodingCount) {
@@ -718,6 +721,7 @@ void InitializeShortcutBindings() {
     add(kIdToolbarLineNumbers, L"Ctrl+Alt+L"); add(kIdToolbarWrap, L"Ctrl+Alt+W"); add(kIdToolbarEncoding);
     add(kIdLineSpacingSingle, L"Ctrl+Alt+1"); add(kIdLineSpacing115, L"Ctrl+Alt+2");
     add(kIdLineSpacing150, L"Ctrl+Alt+3"); add(kIdLineSpacing200, L"Ctrl+Alt+4"); add(kIdLineSpacingCustom);
+    add(kIdTopSpacingCustom);
     add(kIdToolbarFormat, L"Shift+Alt+F"); add(kIdToggleToolbox, L"Ctrl+Shift+D"); add(kIdToolbarRun, L"F5");
     add(kIdCompareWithFile); add(kIdCompareFiles); add(kIdCompareStructure); add(kIdCompareFolders); add(kIdOpenLogViewer);
     add(kIdToolbarSettings, L"Ctrl+,"); add(kIdSettingsShortcuts, L"Ctrl+K");
@@ -781,6 +785,7 @@ void ApplyWordWrapAll();
 void ApplyEditorLineSpacing(HWND editor);
 void ApplyEditorLineSpacingAll();
 void OpenCustomLineSpacingDialog();
+void OpenCustomTopSpacingDialog();
 bool IsDataGeneratorCommand(int command);
 void AppendDataGeneratorMenus(HMENU menu);
 void OpenDataGeneratorDialog(int command);
@@ -3258,7 +3263,10 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 if (start < 0) break;
                 POINTL position{};
                 SendMessageW(editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&position), start);
-                const int y = position.y + origin.y;
+                // RichEdit reports the character box before its internal
+                // top inset; the gutter has no such inset. Keep the number
+                // baseline aligned with the first glyph of the text line.
+                const int y = position.y + origin.y + Scale(5);
                 if (y > client.bottom) break;
                 const long paragraph = fastParagraphOf(static_cast<LONG>(start));
                 if (paragraph != previousParagraph) {
@@ -4309,6 +4317,7 @@ bool SaveSessionFile() {
     output << "ACTIVE\t" << g_app.activeIndex << "\n";
     output << "THEME\t" << static_cast<int>(g_app.theme) << "\n";
     output << "LINE_SPACING\t" << g_app.lineSpacingPercent << "\n";
+    output << "TOP_SPACING\t" << g_app.topSpacingPixels << "\n";
     output << "OPTIONS\t" << (g_app.showLineNumbers ? 1 : 0) << '\t'
            << (g_app.wordWrap ? 1 : 0) << '\t'
            << (g_app.sidebarVisible ? 1 : 0) << '\t'
@@ -4841,7 +4850,7 @@ void ApplyEditorLineSpacing(HWND editor) {
 
     PARAFORMAT2 format{};
     format.cbSize = sizeof(format);
-    format.dwMask = PFM_LINESPACING;
+    format.dwMask = PFM_LINESPACING | PFM_SPACEBEFORE;
     // Use one fixed paragraph line box for the whole document.  RichEdit's
     // multiple-line mode derives the box from the selected glyph run, so a
     // CJK fallback font can make Chinese lines visibly taller than Latin
@@ -4862,6 +4871,8 @@ void ApplyEditorLineSpacing(HWND editor) {
     const int lineTwips = std::clamp(MulDiv(linePixels, 1440, static_cast<int>(g_app.dpi)), 120, 720);
     format.bLineSpacingRule = tomLineSpaceExactly;
     format.dyLineSpacing = lineTwips;
+    format.dySpaceBefore = static_cast<SHORT>(std::clamp(
+        MulDiv(g_app.topSpacingPixels, 1440, static_cast<int>(g_app.dpi)), 0, 1440));
 
     SendMessageW(editor, EM_SETSEL, 0, -1);
     SendMessageW(editor, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format));
@@ -4912,6 +4923,29 @@ void OpenCustomLineSpacingDialog() {
         return;
     }
     SetLineSpacingPercent(static_cast<int>(std::lround(multiplier * 100.0)));
+}
+
+void OpenCustomTopSpacingDialog() {
+    std::wstring value = std::to_wstring(g_app.topSpacingPixels);
+    std::vector<std::wstring> values{value};
+    if (!PromptForText(L"自定义顶部间距", {L"每段顶部间距（像素，0 - 40）："}, values, nullptr, nullptr)) {
+        return;
+    }
+    int pixels = -1;
+    size_t consumed = 0;
+    try {
+        pixels = std::stoi(values.front(), &consumed);
+    } catch (...) {
+        pixels = -1;
+    }
+    while (consumed < values.front().size() && iswspace(values.front()[consumed])) ++consumed;
+    if (consumed != values.front().size() || pixels < 0 || pixels > 40) {
+        MessageBoxW(g_app.window, L"请输入 0 到 40 之间的像素值。", kWindowTitle, MB_ICONWARNING);
+        return;
+    }
+    g_app.topSpacingPixels = pixels;
+    ApplyEditorLineSpacingAll();
+    SetMenuState();
 }
 
 int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
@@ -5361,6 +5395,8 @@ void SetMenuState() {
         }
         if (selected != 0) CheckMenuItem(g_app.lineSpacingMenu, selected, MF_BYCOMMAND | MF_CHECKED);
     }
+    CheckMenuItem(menu, kIdTopSpacingCustom, MF_BYCOMMAND |
+        (g_app.topSpacingPixels > 0 ? MF_CHECKED : MF_UNCHECKED));
     CheckDocumentMenuItems(menu);
     CheckMenuItem(menu, kIdTogglePreview, MF_BYCOMMAND | (g_app.previewTextTools ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuRadioItem(menu, kIdOutputReplace, kIdOutputInsertBelow, kIdOutputReplace + g_app.toolOutputMode, MF_BYCOMMAND);
@@ -5463,6 +5499,7 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacingCustom, L"自定义...");
     g_app.lineSpacingMenu = lineSpacing;
     AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(lineSpacing), L"行距");
+    AppendMenuW(view, MF_STRING, kIdTopSpacingCustom, L"顶部间距自定义...");
     AppendEncodingItems(encoding);
     for (int index = 0; index < kLanguageCount; ++index) {
         AppendMenuW(language, MF_STRING, kIdLanguageFirst + index, kLanguageNames[index]);
@@ -5532,6 +5569,7 @@ void LoadPersistedSession() {
     int activeIndex = 0;
     int persistedTheme = static_cast<int>(g_app.theme);
     int persistedLineSpacing = g_app.lineSpacingPercent;
+    int persistedTopSpacing = g_app.topSpacingPixels;
     int persistedShowLineNumbers = g_app.showLineNumbers ? 1 : 0;
     int persistedWordWrap = g_app.wordWrap ? 1 : 0;
     int persistedSidebarVisible = g_app.sidebarVisible ? 1 : 0;
@@ -5568,6 +5606,8 @@ void LoadPersistedSession() {
             ParseInt(parts[1], persistedTheme);
         } else if (parts[0] == "LINE_SPACING" && parts.size() >= 2) {
             ParseInt(parts[1], persistedLineSpacing);
+        } else if (parts[0] == "TOP_SPACING" && parts.size() >= 2) {
+            ParseInt(parts[1], persistedTopSpacing);
         } else if (parts[0] == "OPTIONS" && parts.size() >= 9) {
             ParseInt(parts[1], persistedShowLineNumbers);
             ParseInt(parts[2], persistedWordWrap);
@@ -5678,6 +5718,7 @@ void LoadPersistedSession() {
 
     g_app.theme = static_cast<ThemeKind>(std::clamp(persistedTheme, 0, 3));
     g_app.lineSpacingPercent = std::clamp(persistedLineSpacing, 50, 300);
+    g_app.topSpacingPixels = std::clamp(persistedTopSpacing, 0, 40);
     g_app.showLineNumbers = persistedShowLineNumbers != 0;
     g_app.wordWrap = persistedWordWrap != 0;
     g_app.showWhitespace = persistedShowWhitespace != 0;
@@ -18698,6 +18739,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         if (command == kIdLineSpacingCustom) {
             OpenCustomLineSpacingDialog();
+            return 0;
+        }
+        if (command == kIdTopSpacingCustom) {
+            OpenCustomTopSpacingDialog();
             return 0;
         }
         if (command >= kIdEncodingFirst && command < kIdEncodingFirst + kEncodingCount) {
