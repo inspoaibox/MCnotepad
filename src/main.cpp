@@ -5932,15 +5932,14 @@ void CreateUiFonts() {
 void ApplyEditorTypography(HWND editor) {
     if (!editor) return;
 
-    // Keep automatic glyph fallback for CJK, but disable RichEdit's dual-font
-    // size adjustment.  The latter can silently choose a taller fallback font
-    // for Chinese text and make otherwise identical paragraphs use different
-    // baselines.  The explicit character height also applies the user's
-    // editor size uniformly to existing and newly inserted text.
+    // Keep RichEdit's dual-font fallback so CJK glyphs are rendered by a font
+    // that contains them.  Only the automatic size adjustment is disabled;
+    // the explicit character height and fixed paragraph line box keep the
+    // fallback from changing the visual size or baseline grid.
     const LRESULT languageOptions = SendMessageW(editor, EM_GETLANGOPTIONS, 0, 0);
     SendMessageW(editor, EM_SETLANGOPTIONS, 0,
-        (languageOptions | IMF_AUTOFONT) &
-        ~static_cast<LRESULT>(IMF_DUALFONT | IMF_AUTOFONTSIZEADJUST));
+        (languageOptions | IMF_AUTOFONT | IMF_DUALFONT) &
+        ~static_cast<LRESULT>(IMF_AUTOFONTSIZEADJUST));
 
     CHARFORMAT2W format{};
     format.cbSize = sizeof(format);
