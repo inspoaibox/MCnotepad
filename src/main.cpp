@@ -540,6 +540,7 @@ std::wstring ShortcutLabelForCommand(int command) {
     case kIdFileReopenClosed: return L"文件：重新打开关闭的标签";
     case kIdFileRename: return L"文件：重命名标签";
     case kIdFileExit: return L"文件：退出";
+    case kIdHelpAbout: return L"帮助：关于 MCnotepad";
     case kIdTabNext: return L"标签：下一个标签";
     case kIdTabPrevious: return L"标签：上一个标签";
     case kIdTabTogglePinned: return L"标签：固定/取消固定当前标签";
@@ -568,6 +569,12 @@ std::wstring ShortcutLabelForCommand(int command) {
     case kIdSearchFileNames: return L"搜索：文件名";
     case kIdSearchRegex: return L"搜索：正则表达式";
     case kIdToggleSearchPanel: return L"搜索：显示搜索面板";
+    case kIdExportSearchResults: return L"搜索：导出搜索结果";
+    case kIdClearSearchResults: return L"搜索：清除搜索结果";
+    case kIdSearchErrorLog: return L"搜索：查看错误日志";
+    case kIdUndoReplaceInFiles: return L"搜索：撤销文件替换";
+    case kIdCopySearchResults: return L"搜索：复制搜索结果";
+    case kIdBookmarkSearchResult: return L"搜索：标记搜索结果";
     case kIdViewToggleBookmark: return L"视图：切换书签";
     case kIdViewNextBookmark: return L"视图：下一个书签";
     case kIdViewPreviousBookmark: return L"视图：上一个书签";
@@ -655,6 +662,9 @@ void InitializeShortcutBindings() {
     add(kIdFindPrevious, L"Shift+F3"); add(kIdToolbarGoto, L"Ctrl+G"); add(kIdSearchInFolder, L"Ctrl+Shift+F");
     add(kIdReplaceInFolder, L"Ctrl+Shift+H"); add(kIdSearchCurrentFile); add(kIdSearchOpenFiles);
     add(kIdSearchFileNames); add(kIdSearchRegex); add(kIdToggleSearchPanel, L"Ctrl+Shift+J");
+    add(kIdExportSearchResults, L"Ctrl+Alt+E"); add(kIdClearSearchResults); add(kIdSearchErrorLog);
+    add(kIdUndoReplaceInFiles, L"Ctrl+Alt+Z"); add(kIdCopySearchResults); add(kIdBookmarkSearchResult);
+    add(kIdHelpAbout);
     add(kIdViewToggleBookmark, L"Ctrl+F2"); add(kIdViewNextBookmark, L"F4"); add(kIdViewPreviousBookmark, L"Shift+F4");
     add(kIdViewClearBookmarks); add(kIdViewWhitespace, L"Ctrl+Alt+Space"); add(kIdViewIndentGuides, L"Ctrl+Alt+I");
     add(kIdViewFoldCurrent, L"F7"); add(kIdViewUnfoldAll, L"Shift+F7");
