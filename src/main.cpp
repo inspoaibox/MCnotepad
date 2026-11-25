@@ -3222,6 +3222,38 @@ void ChangeEditorFontSize(int delta) {
     ShowNotice(L"编辑器字号 " + std::to_wstring(g_app.fontSize) + L" px");
 }
 
+bool TryAutoCloseCharacter(HWND editor, wchar_t character) {
+    wchar_t closing = 0;
+    switch (character) {
+    case L'(': closing = L')'; break;
+    case L'[': closing = L']'; break;
+    case L'{': closing = L'}'; break;
+    case L'"': closing = L'"'; break;
+    case L'\'': closing = L'\''; break;
+    default: return false;
+    }
+    CHARRANGE selection{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const std::wstring text = GetEditorRawText(editor);
+    if (selection.cpMin == selection.cpMax && selection.cpMin < static_cast<LONG>(text.size()) &&
+        text[static_cast<size_t>(selection.cpMin)] == closing && character != L'(' && character != L'[' && character != L'{') {
+        SendMessageW(editor, EM_SETSEL, selection.cpMin + 1, selection.cpMin + 1);
+        return true;
+    }
+    std::wstring selected;
+    if (selection.cpMax > selection.cpMin) {
+        selected = text.substr(static_cast<size_t>(selection.cpMin),
+            static_cast<size_t>(selection.cpMax - selection.cpMin));
+    }
+    const std::wstring replacement = std::wstring(1, character) + selected + std::wstring(1, closing);
+    const LONG start = selection.cpMin;
+    SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
+    const LONG innerStart = start + 1;
+    const LONG innerEnd = innerStart + static_cast<LONG>(selected.size());
+    SendMessageW(editor, EM_SETSEL, innerStart, innerEnd);
+    return true;
+}
+
 LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lParam) {
     const auto oldIt = g_editorProcs.find(editor);
     const WNDPROC oldProc = oldIt != g_editorProcs.end() ? oldIt->second : nullptr;
@@ -3298,6 +3330,11 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         if (delta != 0) {
             ChangeEditorFontSize(delta > 0 ? 1 : -1);
         }
+        return 0;
+    }
+
+    if (message == WM_CHAR && (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+        (GetKeyState(VK_MENU) & 0x8000) == 0 && TryAutoCloseCharacter(editor, static_cast<wchar_t>(wParam))) {
         return 0;
     }
 
