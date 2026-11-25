@@ -4324,12 +4324,12 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
         reinterpret_cast<WPARAM>(g_app.editorFont != nullptr
             ? g_app.editorFont : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
-    // With an Asian keyboard layout active (e.g. a Chinese IME), RichEdit's
-    // auto-font / dual-font modes switch typed text to a proportional UI font.
-    // Keep the editor font; CJK characters still render through font fallback.
+    // Keep the selected Latin font, but allow RichEdit to choose a proper
+    // fallback face for CJK text instead of drawing replacement boxes.
     const LRESULT languageOptions = SendMessageW(document.editor, EM_GETLANGOPTIONS, 0, 0);
     SendMessageW(document.editor, EM_SETLANGOPTIONS, 0,
-        languageOptions & ~static_cast<LRESULT>(IMF_AUTOFONT | IMF_DUALFONT | IMF_AUTOFONTSIZEADJUST));
+        (languageOptions | IMF_AUTOFONT | IMF_DUALFONT) &
+        ~static_cast<LRESULT>(IMF_AUTOFONTSIZEADJUST));
     SetWindowTextW(document.editor, text.c_str());
     // RichEdit resets the character format when WM_SETTEXT/SetWindowText is
     // applied.  Set the theme after loading the document so dark-theme text
@@ -5617,6 +5617,13 @@ void ApplyEditorFont() {
     for (const TabDocument& document : g_app.documents) {
         EditorEventMute mute(document.editor);
         SendMessageW(document.editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+        // Keep the selected Latin font while allowing RichEdit to select a
+        // CJK fallback font for Chinese/Japanese/Korean characters. Without
+        // dual-font mode, Consolas renders these characters as tofu boxes.
+        const LRESULT languageOptions = SendMessageW(document.editor, EM_GETLANGOPTIONS, 0, 0);
+        SendMessageW(document.editor, EM_SETLANGOPTIONS, 0,
+            (languageOptions | IMF_AUTOFONT | IMF_DUALFONT) &
+            ~static_cast<LRESULT>(IMF_AUTOFONTSIZEADJUST));
         SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
         InvalidateRect(document.editor, nullptr, TRUE);
     }
@@ -17955,12 +17962,16 @@ int RunSelfTests() {
     failures += expect(!ParseShortcutText(L"Ctrl+Unknown", modifiers, key));
     const auto lines = SplitLines(L"a\r\nb\nc");
     failures += expect(lines.size() == 3 && JoinLines(lines, L"\r") == L"a\rb\rc");
+    const std::wstring cjkLabel = L"姓名：用户名：";
+    failures += expect(Utf8ToWide(WideToUtf8(cjkLabel)) == cjkLabel);
     for (int locale = 0; locale < 5; ++locale) {
         DataGeneratorOptions profile;
         profile.count = 1;
         profile.locale = locale;
         const std::wstring generated = GenerateDataText(kDataFullProfile, profile);
-        failures += expect(!generated.empty() && generated.find(L"姓名：") != std::wstring::npos);
+        failures += expect(!generated.empty() &&
+            generated.find(L"姓名：") != std::wstring::npos &&
+            generated.find(L'\uFFFD') == std::wstring::npos);
     }
     return failures == 0 ? 0 : 1;
 }
