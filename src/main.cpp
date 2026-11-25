@@ -503,6 +503,7 @@ struct ShortcutBinding {
 std::vector<ShortcutBinding> g_shortcuts;
 HACCEL g_accelerators = nullptr;
 HWND g_shortcutDialog = nullptr;
+HWND g_shortcutDialogOwner = nullptr;
 std::vector<HWND> g_shortcutEditControls;
 
 std::string HexEncode(std::string_view value);
@@ -523,6 +524,7 @@ void InitializeShortcutBindings() {
         {kIdSearchInFolder, L"文件夹搜索", L"Ctrl+Shift+F"},
         {kIdToggleToolbox, L"开发者工具箱", L"Ctrl+Shift+D"},
         {kIdToolbarSettings, L"偏好设置", L"Ctrl+,"},
+        {kIdSettingsShortcuts, L"快捷键设置", L"Ctrl+K"},
     };
 }
 
@@ -4814,7 +4816,7 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(settings, MF_POPUP, reinterpret_cast<UINT_PTR>(theme), L"主题");
     AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(settings, MF_STRING, kIdToolbarSettings, L"偏好设置...\tCtrl+,");
-    AppendMenuW(settings, MF_STRING, kIdSettingsShortcuts, L"快捷键设置...");
+    AppendMenuW(settings, MF_STRING, kIdSettingsShortcuts, L"快捷键设置...\tCtrl+K");
     AppendMenuW(help, MF_STRING, kIdHelpAbout, L"关于 MCnotepad");
 
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"文件(F)");
@@ -5444,8 +5446,14 @@ LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LP
     case WM_DESTROY:
         g_shortcutEditControls.clear();
         g_shortcutDialog = nullptr;
-        EnableWindow(g_app.window, TRUE);
-        SetForegroundWindow(g_app.window);
+        {
+            HWND owner = g_shortcutDialogOwner ? g_shortcutDialogOwner : g_app.window;
+            g_shortcutDialogOwner = nullptr;
+            if (owner && IsWindow(owner)) {
+                EnableWindow(owner, TRUE);
+                SetForegroundWindow(owner);
+            }
+        }
         return 0;
     case WM_ERASEBKGND: {
         HDC dc = reinterpret_cast<HDC>(wParam);
@@ -5483,13 +5491,17 @@ void OpenShortcutDialog() {
     klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassW(&klass);
     const int height = 16 + static_cast<int>(g_shortcuts.size()) * 30 + 24 + 64;
+    g_shortcutDialogOwner = g_app.settingsWindow ? g_app.settingsWindow : g_app.window;
     g_shortcutDialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
         klass.lpszClassName, L"MCnotepad 快捷键设置",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         CW_USEDEFAULT, CW_USEDEFAULT, Scale(570), Scale(height),
-        g_app.window, nullptr, g_app.instance, nullptr);
-    if (!g_shortcutDialog) return;
-    EnableWindow(g_app.window, FALSE);
+        g_shortcutDialogOwner, nullptr, g_app.instance, nullptr);
+    if (!g_shortcutDialog) {
+        g_shortcutDialogOwner = nullptr;
+        return;
+    }
+    EnableWindow(g_shortcutDialogOwner, FALSE);
     ApplyWindowFrameTheme(g_shortcutDialog);
     ShowWindow(g_shortcutDialog, SW_SHOW);
     UpdateWindow(g_shortcutDialog);
@@ -5791,8 +5803,8 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             kIdSettingsWrap, 215, 278, 170, 26);
         SendMessageW(g_app.settingsLineNumbersCheck, BM_SETCHECK, g_app.showLineNumbers ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(g_app.settingsWrapCheck, BM_SETCHECK, g_app.wordWrap ? BST_CHECKED : BST_UNCHECKED, 0);
-        CreateSettingsControl(window, L"BUTTON", L"快捷键设置...", BS_PUSHBUTTON | WS_TABSTOP,
-            kIdSettingsShortcuts, 26, 310, 150, 30);
+        CreateSettingsControl(window, L"BUTTON", L"快捷键设置（Ctrl+K）", BS_PUSHBUTTON | WS_TABSTOP,
+            kIdSettingsShortcuts, 26, 310, 190, 30);
         CreateSettingsControl(window, L"BUTTON", L"应用", BS_DEFPUSHBUTTON | WS_TABSTOP,
             kIdSettingsApply, 360, 340, 82, 30);
         CreateSettingsControl(window, L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP,
@@ -9519,7 +9531,10 @@ std::wstring GenerateDataValue(int command, const DataGeneratorOptions& options,
         const std::wstring telephone = Utf8ToWide(faker::phone::phoneNumberByFormat());
         const std::wstring gender = Utf8ToWide(faker::person::sex(locale));
         const int age = static_cast<int>(randomInt(18, 80));
-        const std::string birthDateValue = faker::date::birthdateByAge(static_cast<unsigned>(age), static_cast<unsigned>(age), faker::date::DateFormat::ISO);
+        // faker-cxx requires a non-empty time range. Passing the same age as
+        // both bounds can produce a zero-second range and throw internally.
+        const std::string birthDateValue = faker::date::birthdateByAge(
+            static_cast<unsigned>(age), static_cast<unsigned>(age + 1), faker::date::DateFormat::ISO);
         const std::wstring birthDate = Utf8ToWide(birthDateValue.substr(0, 10));
         const std::wstring country = Utf8ToWide(faker::location::country());
         const std::wstring city = Utf8ToWide(faker::location::city(locale));
@@ -9613,7 +9628,13 @@ std::wstring GenerateDataText(int command, const DataGeneratorOptions& options) 
         std::wstring value;
         int attempts = 0;
         do {
-            value = GenerateDataValue(command, options, rng, options.descending ? count - i - 1 : i);
+            try {
+                value = GenerateDataValue(command, options, rng, options.descending ? count - i - 1 : i);
+            } catch (const std::exception&) {
+                value = L"[数据生成失败]";
+            } catch (...) {
+                value = L"[数据生成失败]";
+            }
         } while (options.unique && !seen.insert(value).second && ++attempts < 100);
         values.push_back(std::move(value));
     }
@@ -17934,6 +17955,13 @@ int RunSelfTests() {
     failures += expect(!ParseShortcutText(L"Ctrl+Unknown", modifiers, key));
     const auto lines = SplitLines(L"a\r\nb\nc");
     failures += expect(lines.size() == 3 && JoinLines(lines, L"\r") == L"a\rb\rc");
+    for (int locale = 0; locale < 5; ++locale) {
+        DataGeneratorOptions profile;
+        profile.count = 1;
+        profile.locale = locale;
+        const std::wstring generated = GenerateDataText(kDataFullProfile, profile);
+        failures += expect(!generated.empty() && generated.find(L"姓名：") != std::wstring::npos);
+    }
     return failures == 0 ? 0 : 1;
 }
 
