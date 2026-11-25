@@ -711,6 +711,7 @@ int Scale(int value) {
 // control. Keep a small per-editor subclass so the shortcuts always reach the
 // active editor, regardless of which child window currently owns focus.
 std::unordered_map<HWND, WNDPROC> g_editorProcs;
+std::unordered_set<HWND> g_imeComposingEditors;
 
 std::wstring GetWindowTextValue(HWND window);
 void ApplyEditorTheme(HWND editor);
@@ -2696,9 +2697,17 @@ bool IsEditorSelectionDragActive(HWND editor) {
     return editor != nullptr && (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
 }
 
+bool IsEditorImeComposing(HWND editor) {
+    return editor != nullptr && g_imeComposingEditors.find(editor) != g_imeComposingEditors.end();
+}
+
 void ApplyCurrentLineHighlight(TabDocument& document, bool force) {
     HWND editor = document.editor;
     if (!editor || !IsWindow(editor) || !IsWindowVisible(editor)) return;
+    // RichEdit owns the temporary composition range while an IME is active.
+    // TOM formatting plus EM_EXSETSEL during that range makes the candidate
+    // window flash and move, especially for Chinese pinyin input.
+    if (IsEditorImeComposing(editor)) return;
 
     CHARRANGE selection{};
     SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
@@ -2805,6 +2814,7 @@ COLORREF BracketMatchHighlightColor() {
 void ApplyBracketMatchHighlight(TabDocument& document, bool force) {
     HWND editor = document.editor;
     if (!editor || !IsWindow(editor) || !IsWindowVisible(editor)) return;
+    if (IsEditorImeComposing(editor)) return;
     CHARRANGE selection{};
     SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
     const LONG length = static_cast<LONG>(GetWindowTextLengthW(editor));
@@ -4138,6 +4148,10 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
     const auto oldIt = g_editorProcs.find(editor);
     const WNDPROC oldProc = oldIt != g_editorProcs.end() ? oldIt->second : nullptr;
 
+    if (message == WM_IME_STARTCOMPOSITION) {
+        g_imeComposingEditors.insert(editor);
+    }
+
     // This is a plain-text editor: every paste (menu, Ctrl+V, Shift+Insert)
     // takes only the clipboard's Unicode text, never rich formatting or images.
     if (message == WM_CONTEXTMENU) {
@@ -4264,6 +4278,7 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         : DefWindowProcW(editor, message, wParam, lParam);
     if (message == WM_NCDESTROY) {
         g_editorProcs.erase(editor);
+        g_imeComposingEditors.erase(editor);
     } else if (message == WM_MOUSEWHEEL || message == WM_KEYDOWN || message == WM_VSCROLL) {
         // EN_VSCROLL is not sent for wheel or keyboard scrolling.
         RefreshGutter();
@@ -4273,6 +4288,18 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         if (message == WM_SIZE) SyntaxOnViewChanged(editor);
     }
     if (message == WM_LBUTTONUP) {
+        for (TabDocument& document : g_app.documents) {
+            if (document.editor == editor) {
+                ApplyCurrentLineHighlight(document);
+                ApplyBracketMatchHighlight(document);
+                break;
+            }
+        }
+    }
+    if (message == WM_IME_ENDCOMPOSITION) {
+        g_imeComposingEditors.erase(editor);
+        // Let the IME commit its result and restore the caret first, then
+        // repaint the visual helpers once after composition has ended.
         for (TabDocument& document : g_app.documents) {
             if (document.editor == editor) {
                 ApplyCurrentLineHighlight(document);
@@ -17834,8 +17861,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     UpdateHorizontalScrollbar(source);
                     RefreshGutter();
                     TabDocument& changed = g_app.documents[index];
-                    ApplyCurrentLineHighlight(changed, true);
-                    ApplyBracketMatchHighlight(changed, true);
+                    if (!IsEditorImeComposing(source)) {
+                        ApplyCurrentLineHighlight(changed, true);
+                        ApplyBracketMatchHighlight(changed, true);
+                    }
                     NormalizeBookmarks(changed);
                     changed.syntaxStale = true;  // tokens no longer match; scrolling re-tokenizes
                     if (EffectiveLanguage(changed) != kLanguagePlain || changed.syntaxHadColors ||
@@ -18111,7 +18140,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 // selection resets RichEdit's active end and makes a
                 // bottom-to-top selection jump.  Defer these visual updates
                 // until WM_LBUTTONUP, after the selection is complete.
-                if (!IsEditorSelectionDragActive(header->hwndFrom)) {
+                if (!IsEditorSelectionDragActive(header->hwndFrom) &&
+                    !IsEditorImeComposing(header->hwndFrom)) {
                     ApplyCurrentLineHighlight(*document);
                     ApplyBracketMatchHighlight(*document);
                 }
