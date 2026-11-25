@@ -191,6 +191,11 @@ constexpr int kIdSettingsCancel = 1709;
 constexpr int kIdSettingsWindowCloseBehavior = 1710;
 constexpr int kIdSettingsMinimizeToTray = 1711;
 constexpr int kIdSettingsShowTray = 1712;
+constexpr int kIdSettingsShortcuts = 1713;
+constexpr int kIdShortcutEditFirst = 2120;
+constexpr int kIdShortcutApply = 2140;
+constexpr int kIdShortcutReset = 2141;
+constexpr int kIdShortcutCancel = 2142;
 constexpr int kIdTrayShow = 1720;
 constexpr int kIdTrayExit = 1721;
 constexpr int kIdEncodingFirst = 1601;    // 1601..1605
@@ -455,7 +460,50 @@ struct AppState {
 
 AppState g_app;
 
+struct ShortcutBinding {
+    int command = 0;
+    const wchar_t* label = nullptr;
+    std::wstring text;
+};
+
+std::vector<ShortcutBinding> g_shortcuts;
+HACCEL g_accelerators = nullptr;
+HWND g_shortcutDialog = nullptr;
+std::vector<HWND> g_shortcutEditControls;
+
+std::string HexEncode(std::string_view value);
+std::string WideToUtf8(std::wstring_view value);
+std::wstring Utf8ToWide(std::string_view value);
+
+void InitializeShortcutBindings() {
+    if (!g_shortcuts.empty()) return;
+    g_shortcuts = {
+        {kIdFileNew, L"新建", L"Ctrl+N"},
+        {kIdFileOpen, L"打开", L"Ctrl+O"},
+        {kIdFileSave, L"保存", L"Ctrl+S"},
+        {kIdFileSaveAs, L"另存为", L"Ctrl+Shift+S"},
+        {kIdFileClose, L"关闭标签", L"Ctrl+W"},
+        {kIdToolbarFind, L"查找", L"Ctrl+F"},
+        {kIdToolbarReplace, L"替换", L"Ctrl+H"},
+        {kIdToolbarGoto, L"跳转到行", L"Ctrl+G"},
+        {kIdSearchInFolder, L"文件夹搜索", L"Ctrl+Shift+F"},
+        {kIdToggleToolbox, L"开发者工具箱", L"Ctrl+Shift+D"},
+        {kIdToolbarSettings, L"偏好设置", L"Ctrl+,"},
+    };
+}
+
+void SaveShortcutBindings(std::ostream& output) {
+    output << "SHORTCUTS";
+    for (const ShortcutBinding& binding : g_shortcuts) {
+        output << '\t' << binding.command << '\t' << HexEncode(WideToUtf8(binding.text));
+    }
+    output << "\n";
+}
+
 struct PromptChoice;
+std::string HexEncode(std::string_view value);
+std::string WideToUtf8(std::wstring_view value);
+std::wstring Utf8ToWide(std::string_view value);
 bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels,
     std::vector<std::wstring>& values,
     std::vector<std::pair<std::wstring, bool>>* checks,
@@ -524,6 +572,8 @@ void HideMainWindowToTray();
 void RestoreMainWindowFromTray();
 bool HandleMainWindowClose(bool forceExit = false);
 void OpenPrefixSuffixDialog();
+void OpenShortcutDialog();
+void RebuildAccelerators();
 std::vector<std::wstring> SplitLines(std::wstring_view text);
 std::wstring JoinLines(const std::vector<std::wstring>& lines, std::wstring_view separator = L"\r");
 bool ToolRange(HWND editor, bool wholeLines, CHARRANGE& range, std::wstring& text, bool& wholeDocument);
@@ -3347,6 +3397,7 @@ bool SaveSessionFile() {
            << static_cast<int>(g_app.windowCloseBehavior) << '\t'
            << (g_app.minimizeToTray ? 1 : 0) << '\t'
            << (g_app.showTrayIcon ? 1 : 0) << "\n";
+    SaveShortcutBindings(output);
 
     // rcNormalPosition is the restored size even while maximized/minimized.
     WINDOWPLACEMENT placement{};
@@ -4386,6 +4437,7 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(settings, MF_POPUP, reinterpret_cast<UINT_PTR>(theme), L"主题");
     AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(settings, MF_STRING, kIdToolbarSettings, L"偏好设置...\tCtrl+,");
+    AppendMenuW(settings, MF_STRING, kIdSettingsShortcuts, L"快捷键设置...");
     AppendMenuW(help, MF_STRING, kIdHelpAbout, L"关于 MCnotepad");
 
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"文件(F)");
@@ -4418,6 +4470,7 @@ struct SessionEntry {
 };
 
 void LoadPersistedSession() {
+    InitializeShortcutBindings();
     std::ifstream input(g_app.sessionPath, std::ios::binary);
     if (!input) {
         ApplyEditorFont();
@@ -4493,6 +4546,20 @@ void LoadPersistedSession() {
             if (parts.size() >= 6) ParseInt(parts[5], persistedWindowCloseBehavior);
             if (parts.size() >= 7) ParseInt(parts[6], persistedMinimizeToTray);
             if (parts.size() >= 8) ParseInt(parts[7], persistedShowTrayIcon);
+        } else if (parts[0] == "SHORTCUTS" && parts.size() >= 3) {
+            // Pairs are stored as command + hex encoded UTF-8 text. Unknown
+            // commands are ignored so newer session files remain compatible.
+            for (size_t part = 1; part + 1 < parts.size(); part += 2) {
+                int command = 0;
+                if (!ParseInt(parts[part], command)) continue;
+                const std::wstring text = Utf8ToWide(HexDecode(parts[part + 1]));
+                for (ShortcutBinding& binding : g_shortcuts) {
+                    if (binding.command == command) {
+                        binding.text = text;
+                        break;
+                    }
+                }
+            }
         } else if (parts[0] == "WINDOW" && parts.size() >= 6) {
             int left = 0, top = 0, width = 0, height = 0, maximized = 0;
             if (ParseInt(parts[1], left) && ParseInt(parts[2], top) &&
@@ -4866,14 +4933,201 @@ void HandleFindReplaceMessage(LPARAM lParam) {
     }
 }
 
+bool ParseShortcutText(std::wstring value, BYTE& modifiers, WORD& key) {
+    modifiers = FVIRTKEY;
+    key = 0;
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t plus = value.find(L'+', start);
+        parts.push_back(value.substr(start, plus == std::wstring::npos ? std::wstring::npos : plus - start));
+        if (plus == std::wstring::npos) break;
+        start = plus + 1;
+    }
+    if (parts.empty()) return false;
+    for (std::wstring& part : parts) {
+        while (!part.empty() && iswspace(part.front())) part.erase(part.begin());
+        while (!part.empty() && iswspace(part.back())) part.pop_back();
+        for (wchar_t& character : part) character = static_cast<wchar_t>(towupper(character));
+    }
+    for (size_t index = 0; index + 1 < parts.size(); ++index) {
+        if (parts[index] == L"CTRL" || parts[index] == L"CONTROL") modifiers |= FCONTROL;
+        else if (parts[index] == L"SHIFT") modifiers |= FSHIFT;
+        else if (parts[index] == L"ALT") modifiers |= FALT;
+        else return false;
+    }
+    const std::wstring& token = parts.back();
+    if (token.size() == 1 && ((token[0] >= L'A' && token[0] <= L'Z') || (token[0] >= L'0' && token[0] <= L'9'))) {
+        key = static_cast<WORD>(token[0]);
+    } else if (token.size() >= 2 && token[0] == L'F') {
+        const int functionKey = _wtoi(token.c_str() + 1);
+        if (functionKey < 1 || functionKey > 24) return false;
+        key = static_cast<WORD>(VK_F1 + functionKey - 1);
+    } else if (token == L"COMMA") key = VK_OEM_COMMA;
+    else if (token == L"PERIOD" || token == L"DOT") key = VK_OEM_PERIOD;
+    else if (token == L"PLUS") key = VK_OEM_PLUS;
+    else if (token == L"MINUS") key = VK_OEM_MINUS;
+    else if (token == L"TAB") key = VK_TAB;
+    else if (token == L"ENTER" || token == L"RETURN") key = VK_RETURN;
+    else if (token == L"ESC" || token == L"ESCAPE") key = VK_ESCAPE;
+    else if (token == L"SPACE") key = VK_SPACE;
+    else return false;
+    return (modifiers & (FCONTROL | FSHIFT | FALT)) != 0;
+}
+
+LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        g_shortcutEditControls.clear();
+        int y = 16;
+        for (size_t index = 0; index < g_shortcuts.size(); ++index) {
+            const ShortcutBinding& binding = g_shortcuts[index];
+            HWND label = CreateWindowExW(0, L"STATIC", binding.label,
+                WS_CHILD | WS_VISIBLE, Scale(24), Scale(y + 3), Scale(190), Scale(24),
+                window, nullptr, g_app.instance, nullptr);
+            HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", binding.text.c_str(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                Scale(220), Scale(y), Scale(250), Scale(26), window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShortcutEditFirst + index)),
+                g_app.instance, nullptr);
+            SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            if (g_app.darkTheme) SetWindowTheme(edit, L"DarkMode_Explorer", nullptr);
+            g_shortcutEditControls.push_back(edit);
+            y += 30;
+        }
+        HWND hint = CreateWindowExW(0, L"STATIC",
+            L"格式：Ctrl+Shift+S、F5、Alt+1。快捷键不能与其他功能重复。",
+            WS_CHILD | WS_VISIBLE, Scale(24), Scale(y + 4), Scale(500), Scale(24),
+            window, nullptr, g_app.instance, nullptr);
+        SendMessageW(hint, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        HWND apply = CreateWindowExW(0, L"BUTTON", L"应用",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            Scale(270), Scale(y + 34), Scale(82), Scale(30), window,
+            reinterpret_cast<HMENU>(kIdShortcutApply), g_app.instance, nullptr);
+        HWND reset = CreateWindowExW(0, L"BUTTON", L"恢复默认",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(360), Scale(y + 34), Scale(92), Scale(30), window,
+            reinterpret_cast<HMENU>(kIdShortcutReset), g_app.instance, nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            Scale(460), Scale(y + 34), Scale(82), Scale(30), window,
+            reinterpret_cast<HMENU>(kIdShortcutCancel), g_app.instance, nullptr);
+        ThemePushButtons({apply, reset, cancel});
+        return 0;
+    }
+    case WM_COMMAND: {
+        const int command = LOWORD(wParam);
+        if (command == kIdShortcutReset) {
+            g_shortcuts.clear();
+            InitializeShortcutBindings();
+            for (size_t index = 0; index < g_shortcutEditControls.size() && index < g_shortcuts.size(); ++index)
+                SetWindowTextW(g_shortcutEditControls[index], g_shortcuts[index].text.c_str());
+            return 0;
+        }
+        if (command == kIdShortcutCancel || command == IDCANCEL) {
+            DestroyWindow(window);
+            return 0;
+        }
+        if (command == kIdShortcutApply || command == IDOK) {
+            std::vector<std::wstring> values;
+            values.reserve(g_shortcuts.size());
+            std::vector<std::pair<BYTE, WORD>> parsed;
+            for (size_t index = 0; index < g_shortcutEditControls.size(); ++index) {
+                std::wstring value = GetWindowTextValue(g_shortcutEditControls[index]);
+                while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
+                while (!value.empty() && iswspace(value.back())) value.pop_back();
+                BYTE modifiers = 0;
+                WORD key = 0;
+                if (!ParseShortcutText(value, modifiers, key)) {
+                    MessageBoxW(window, (L"快捷键格式无效：" + value).c_str(), kWindowTitle, MB_ICONWARNING);
+                    SetFocus(g_shortcutEditControls[index]);
+                    return 0;
+                }
+                if (std::find(parsed.begin(), parsed.end(), std::make_pair(modifiers, key)) != parsed.end()) {
+                    MessageBoxW(window, L"快捷键不能重复，请修改后再应用。", kWindowTitle, MB_ICONWARNING);
+                    SetFocus(g_shortcutEditControls[index]);
+                    return 0;
+                }
+                parsed.emplace_back(modifiers, key);
+                values.push_back(std::move(value));
+            }
+            for (size_t index = 0; index < values.size(); ++index) g_shortcuts[index].text = values[index];
+            RebuildAccelerators();
+            g_app.stateDirty = true;
+            PersistAll(false);
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        DestroyWindow(window);
+        return 0;
+    case WM_DESTROY:
+        g_shortcutEditControls.clear();
+        g_shortcutDialog = nullptr;
+        EnableWindow(g_app.window, TRUE);
+        SetForegroundWindow(g_app.window);
+        return 0;
+    case WM_ERASEBKGND: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(dc, &client, g_app.windowBrush);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        const ThemePalette& palette = CurrentPalette();
+        SetTextColor(dc, palette.controlText);
+        SetBkColor(dc, palette.windowBackground);
+        return reinterpret_cast<LRESULT>(g_app.windowBrush);
+    }
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void OpenShortcutDialog() {
+    if (g_shortcutDialog) {
+        SetForegroundWindow(g_shortcutDialog);
+        return;
+    }
+    InitializeShortcutBindings();
+    WNDCLASSW klass{};
+    klass.hInstance = g_app.instance;
+    klass.lpfnWndProc = ShortcutDialogProc;
+    klass.lpszClassName = L"MCnotepadShortcuts";
+    klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    RegisterClassW(&klass);
+    const int height = 16 + static_cast<int>(g_shortcuts.size()) * 30 + 24 + 64;
+    g_shortcutDialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+        klass.lpszClassName, L"MCnotepad 快捷键设置",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, Scale(570), Scale(height),
+        g_app.window, nullptr, g_app.instance, nullptr);
+    if (!g_shortcutDialog) return;
+    EnableWindow(g_app.window, FALSE);
+    ApplyWindowFrameTheme(g_shortcutDialog);
+    ShowWindow(g_shortcutDialog, SW_SHOW);
+    UpdateWindow(g_shortcutDialog);
+}
+
 HACCEL CreateAccelerators() {
-    ACCEL accelerators[] = {
-        { FCONTROL | FVIRTKEY, 'N', kIdFileNew },
-        { FCONTROL | FVIRTKEY, 'O', kIdFileOpen },
-        { FCONTROL | FVIRTKEY, 'S', kIdFileSave },
-        { FCONTROL | FSHIFT | FVIRTKEY, 'S', kIdFileSaveAs },
+    InitializeShortcutBindings();
+    std::vector<ACCEL> entries;
+    for (const ShortcutBinding& binding : g_shortcuts) {
+        BYTE modifiers = 0;
+        WORD key = 0;
+        if (ParseShortcutText(binding.text, modifiers, key)) entries.push_back({modifiers, key, static_cast<WORD>(binding.command)});
+    }
+    const ACCEL fixed[] = {
         { FCONTROL | FALT | FVIRTKEY, 'S', kIdFileSaveAll },
-        { FCONTROL | FVIRTKEY, 'W', kIdFileClose },
         { FCONTROL | FSHIFT | FVIRTKEY, 'W', kIdFileCloseAll },
         { FCONTROL | FSHIFT | FVIRTKEY, 'T', kIdFileReopenClosed },
         { FCONTROL | FVIRTKEY, 'Z', kIdEditUndo },
@@ -4882,20 +5136,20 @@ HACCEL CreateAccelerators() {
         { FCONTROL | FVIRTKEY, 'C', kIdEditCopy },
         { FCONTROL | FVIRTKEY, 'V', kIdEditPaste },
         { FCONTROL | FVIRTKEY, 'A', kIdEditSelectAll },
-        { FCONTROL | FVIRTKEY, 'F', kIdToolbarFind },
-        { FCONTROL | FVIRTKEY, 'H', kIdToolbarReplace },
-        { FCONTROL | FVIRTKEY, 'G', kIdToolbarGoto },
         { FALT | FSHIFT | FVIRTKEY, 'F', kIdToolbarFormat },
-        { FCONTROL | FSHIFT | FVIRTKEY, 'F', kIdSearchInFolder },
         { FCONTROL | FSHIFT | FVIRTKEY, 'H', kIdReplaceInFolder },
-        { FCONTROL | FSHIFT | FVIRTKEY, 'D', kIdToggleToolbox },
         { FVIRTKEY, VK_F5, kIdToolbarRun },
         { FVIRTKEY, VK_F2, kIdFileRename },
-        { FCONTROL | FVIRTKEY, VK_OEM_COMMA, kIdToolbarSettings },
         { FVIRTKEY, VK_F3, kIdFindNext },
         { FSHIFT | FVIRTKEY, VK_F3, kIdFindPrevious }
     };
-    return CreateAcceleratorTableW(accelerators, static_cast<int>(std::size(accelerators)));
+    entries.insert(entries.end(), std::begin(fixed), std::end(fixed));
+    return CreateAcceleratorTableW(entries.data(), static_cast<int>(entries.size()));
+}
+
+void RebuildAccelerators() {
+    if (g_accelerators) DestroyAcceleratorTable(g_accelerators);
+    g_accelerators = CreateAccelerators();
 }
 
 void HandleEditCommand(int command) {
@@ -5159,6 +5413,8 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             kIdSettingsWrap, 215, 278, 170, 26);
         SendMessageW(g_app.settingsLineNumbersCheck, BM_SETCHECK, g_app.showLineNumbers ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(g_app.settingsWrapCheck, BM_SETCHECK, g_app.wordWrap ? BST_CHECKED : BST_UNCHECKED, 0);
+        CreateSettingsControl(window, L"BUTTON", L"快捷键设置...", BS_PUSHBUTTON | WS_TABSTOP,
+            kIdSettingsShortcuts, 26, 310, 150, 30);
         CreateSettingsControl(window, L"BUTTON", L"应用", BS_DEFPUSHBUTTON | WS_TABSTOP,
             kIdSettingsApply, 360, 340, 82, 30);
         CreateSettingsControl(window, L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP,
@@ -5166,6 +5422,10 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         return 0;
     }
     case WM_COMMAND:
+        if (LOWORD(wParam) == kIdSettingsShortcuts) {
+            OpenShortcutDialog();
+            return 0;
+        }
         if (LOWORD(wParam) == kIdSettingsApply || LOWORD(wParam) == IDOK) {
             const int fontIndex = static_cast<int>(SendMessageW(g_app.settingsFontCombo, CB_GETCURSEL, 0, 0));
             const wchar_t* fonts[] = {L"Consolas", L"Cascadia Mono", L"Microsoft YaHei Mono", L"Courier New"};
@@ -16989,6 +17249,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToolbarSettings:
             OpenSettingsDialog();
             break;
+        case kIdSettingsShortcuts:
+            OpenShortcutDialog();
+            break;
         case kIdPrefixSuffix:
             OpenPrefixSuffixDialog();
             break;
@@ -17263,6 +17526,7 @@ int RunSelfTests() {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCommand) {
     (void)commandLine;
     g_app.instance = instance;
+    InitializeShortcutBindings();
 
     if (commandLine != nullptr && wcsstr(commandLine, L"--self-test") != nullptr) {
         return RunSelfTests();
@@ -17348,7 +17612,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
     OpenCommandLineFiles();
     PostMessageW(window, kMessageCheckExternalChanges, 0, 0);
 
-    HACCEL accelerators = CreateAccelerators();
+    RebuildAccelerators();
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         // Modeless dialogs first: gives them Tab/Enter/Esc handling and keeps the
@@ -17356,7 +17620,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
         // Search panel: app shortcuts first (edit commands are routed to its
         // text boxes), then Tab/Enter/Esc dialog navigation.
         if ((g_app.searchPanel && IsChild(g_app.searchPanel, message.hwnd)) || (g_app.toolboxPanel && IsChild(g_app.toolboxPanel, message.hwnd))) {
-            if (TranslateAcceleratorW(window, accelerators, &message)) continue;
+            if (TranslateAcceleratorW(window, g_accelerators, &message)) continue;
             HWND panel = g_app.toolboxPanel && IsChild(g_app.toolboxPanel, message.hwnd) ? g_app.toolboxPanel : g_app.searchPanel;
             // Enter belongs to the multi-line boxes.
             wchar_t klass[16]{};
@@ -17387,12 +17651,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
             }
         }
         if (handled) continue;
-        if (!TranslateAcceleratorW(window, accelerators, &message)) {
+        if (!TranslateAcceleratorW(window, g_accelerators, &message)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
-    DestroyAcceleratorTable(accelerators);
+    if (g_accelerators) {
+        DestroyAcceleratorTable(g_accelerators);
+        g_accelerators = nullptr;
+    }
 
     return static_cast<int>(message.wParam);
 }
