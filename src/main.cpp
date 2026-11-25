@@ -133,6 +133,8 @@ constexpr int kIdViewNextBookmark = 1237;
 constexpr int kIdViewPreviousBookmark = 1238;
 constexpr int kIdViewClearBookmarks = 1239;
 constexpr int kIdTabTogglePinned = 1240;
+constexpr int kIdViewWhitespace = 1241;
+constexpr int kIdViewIndentGuides = 1242;
 constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
@@ -386,6 +388,8 @@ struct AppState {
     std::wstring fontFamily = L"Consolas";
     bool showLineNumbers = true;
     bool wordWrap = false;
+    bool showWhitespace = false;
+    bool showIndentGuides = false;
     bool sidebarVisible = false;
     UINT findReplaceMessage = 0;
     HWND findDialog = nullptr;
@@ -474,6 +478,7 @@ std::wstring GetWindowTextValue(HWND window);
 void ApplyEditorTheme(HWND editor);
 void ApplyCurrentLineHighlight(TabDocument& document, bool force = false);
 void ApplyBracketMatchHighlight(TabDocument& document, bool force = false);
+COLORREF Blend(COLORREF base, COLORREF overlay, int percentOverlay);
 void HighlightDocument(const TabDocument& document);
 void HighlightDocument(TabDocument& document);
 void SyntaxColorVisible(TabDocument& document);
@@ -3331,7 +3336,9 @@ bool SaveSessionFile() {
            << HexEncode(WideToUtf8(g_app.fontFamily)) << '\t'
            << g_app.languageIndex << '\t'
            << g_app.encodingIndex << '\t'
-           << g_app.lineEndingIndex << "\n";
+           << g_app.lineEndingIndex << '\t'
+           << (g_app.showWhitespace ? 1 : 0) << '\t'
+           << (g_app.showIndentGuides ? 1 : 0) << "\n";
     output << "TOOLBOX\t" << (g_app.toolboxVisible ? 1 : 0) << '\t' << g_app.toolboxWidth << '\t' << g_app.toolboxMask << '\t' << g_app.toolboxTool << "\n";
     output << "PREFERENCES\t" << (g_app.launchAtStartup ? 1 : 0) << '\t'
            << static_cast<int>(g_app.closeBehavior) << '\t'
@@ -3447,6 +3454,128 @@ bool TryAutoCloseCharacter(HWND editor, wchar_t character) {
     return true;
 }
 
+std::wstring SmartIndentForEnter(HWND editor) {
+    if (!editor) return {};
+    CHARRANGE selection{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    if (selection.cpMin != selection.cpMax) return {};
+    const std::wstring text = GetEditorRawText(editor);
+    const LONG caret = std::clamp(selection.cpMin, 0L, static_cast<LONG>(text.size()));
+    const LRESULT lineNumber = SendMessageW(editor, EM_EXLINEFROMCHAR, 0, caret);
+    const LONG lineStart = lineNumber >= 0
+        ? static_cast<LONG>(SendMessageW(editor, EM_LINEINDEX, lineNumber, 0)) : 0;
+    if (lineStart < 0 || lineStart > caret) return {};
+
+    size_t prefixEnd = static_cast<size_t>(caret - lineStart);
+    prefixEnd = std::min(prefixEnd, text.size() - static_cast<size_t>(lineStart));
+    std::wstring linePrefix = text.substr(static_cast<size_t>(lineStart), prefixEnd);
+    size_t firstCode = 0;
+    while (firstCode < linePrefix.size() && (linePrefix[firstCode] == L' ' || linePrefix[firstCode] == L'\t')) ++firstCode;
+    std::wstring indent = linePrefix.substr(0, firstCode);
+
+    size_t lastCode = linePrefix.size();
+    while (lastCode > firstCode && iswspace(linePrefix[lastCode - 1])) --lastCode;
+    const wchar_t previous = lastCode > firstCode ? linePrefix[lastCode - 1] : 0;
+    const wchar_t next = caret < static_cast<LONG>(text.size()) ? text[static_cast<size_t>(caret)] : 0;
+    const bool opensBlock = previous == L'{' || previous == L'[' || previous == L'(';
+    const bool closesBlock = next == L'}' || next == L']' || next == L')';
+    if (closesBlock && lastCode == firstCode && indent.size() >= 4) indent.resize(indent.size() - 4);
+    if (opensBlock) indent += L"    ";
+    return L"\r" + indent;
+}
+
+bool HandleSmartIndentEnter(HWND editor) {
+    if (!editor) return false;
+    CHARRANGE selection{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    if (selection.cpMin != selection.cpMax) return false;
+    const std::wstring insertion = SmartIndentForEnter(editor);
+    if (insertion.empty()) return false;
+    SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(insertion.c_str()));
+    return true;
+}
+
+void DrawEditorGuides(HWND editor) {
+    if (!editor || (!g_app.showWhitespace && !g_app.showIndentGuides)) return;
+    RECT client{};
+    GetClientRect(editor, &client);
+    HDC dc = GetDC(editor);
+    if (!dc) return;
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(editor, WM_GETFONT, 0, 0));
+    HGDIOBJ previousFont = font ? SelectObject(dc, font) : nullptr;
+    TEXTMETRICW metrics{};
+    GetTextMetricsW(dc, &metrics);
+    const int lineHeight = std::max(1, static_cast<int>(metrics.tmHeight));
+    const int charWidth = std::max(1, static_cast<int>(metrics.tmAveCharWidth));
+    const COLORREF guideColor = Blend(EditorBackground(), CurrentPalette().accent, g_app.darkTheme ? 28 : 20);
+    HPEN guidePen = CreatePen(PS_DOT, 1, guideColor);
+    HPEN oldPen = static_cast<HPEN>(SelectObject(dc, guidePen));
+    SetBkMode(dc, TRANSPARENT);
+    const int firstLine = std::max(0, static_cast<int>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0)));
+    const int lineCount = static_cast<int>(SendMessageW(editor, EM_GETLINECOUNT, 0, 0));
+    const int visibleLines = client.bottom / lineHeight + 3;
+    for (int line = firstLine; line < lineCount && line < firstLine + visibleLines; ++line) {
+        const LONG start = static_cast<LONG>(SendMessageW(editor, EM_LINEINDEX, line, 0));
+        if (start < 0) continue;
+        POINT origin{};
+        SendMessageW(editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&origin), start);
+        if (origin.y + lineHeight < 0 || origin.y > client.bottom) continue;
+        wchar_t buffer[4096]{};
+        *reinterpret_cast<WORD*>(buffer) = static_cast<WORD>(std::size(buffer) - 1);
+        const LRESULT copied = SendMessageW(editor, EM_GETLINE, line, reinterpret_cast<LPARAM>(buffer));
+        const int length = std::max(0, static_cast<int>(copied));
+        int column = 0;
+        int leading = 0;
+        for (int index = 0; index < length; ++index) {
+            const wchar_t character = buffer[index];
+            if (character == L'\t') {
+                column = (column / 4 + 1) * 4;
+                ++leading;
+            } else if (character == L' ') {
+                ++column;
+                ++leading;
+            } else {
+                break;
+            }
+        }
+        if (g_app.showIndentGuides && leading > 0) {
+            for (int guide = 4; guide <= column; guide += 4) {
+                const int x = origin.x + guide * charWidth;
+                MoveToEx(dc, x, origin.y, nullptr);
+                LineTo(dc, x, origin.y + lineHeight);
+            }
+        }
+        if (g_app.showWhitespace) {
+            int visualColumn = 0;
+            for (int index = 0; index < length; ++index) {
+                const wchar_t character = buffer[index];
+                POINT position{};
+                SendMessageW(editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&position), start + index);
+                if (character == L' ') {
+                    const int x = position.x + charWidth / 2;
+                    const int y = origin.y + lineHeight / 2;
+                    Ellipse(dc, x - 1, y - 1, x + 2, y + 2);
+                    ++visualColumn;
+                } else if (character == L'\t') {
+                    const int nextColumn = (visualColumn / 4 + 1) * 4;
+                    const int x = position.x + 2;
+                    const int y = origin.y + lineHeight / 2;
+                    MoveToEx(dc, x, y, nullptr);
+                    LineTo(dc, origin.x + nextColumn * charWidth - 3, y);
+                    ++visualColumn;
+                    visualColumn = nextColumn;
+                } else {
+                    ++visualColumn;
+                }
+            }
+        }
+    }
+    SelectObject(dc, oldPen);
+    DeleteObject(guidePen);
+    if (previousFont) SelectObject(dc, previousFont);
+    ReleaseDC(editor, dc);
+}
+
 LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lParam) {
     const auto oldIt = g_editorProcs.find(editor);
     const WNDPROC oldProc = oldIt != g_editorProcs.end() ? oldIt->second : nullptr;
@@ -3531,6 +3660,12 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         return 0;
     }
 
+    if (message == WM_CHAR && wParam == L'\r' &&
+        (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+        (GetKeyState(VK_MENU) & 0x8000) == 0 && HandleSmartIndentEnter(editor)) {
+        return 0;
+    }
+
     const LRESULT result = oldProc != nullptr
         ? CallWindowProcW(oldProc, editor, message, wParam, lParam)
         : DefWindowProcW(editor, message, wParam, lParam);
@@ -3544,6 +3679,7 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         UpdateHorizontalScrollbar(editor);
         if (message == WM_SIZE) SyntaxOnViewChanged(editor);
     }
+    if (message == WM_PAINT) DrawEditorGuides(editor);
     return result;
 }
 
@@ -4118,6 +4254,10 @@ void SetMenuState() {
         (g_app.showLineNumbers ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, kIdToolbarWrap, MF_BYCOMMAND |
         (g_app.wordWrap ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, kIdViewWhitespace, MF_BYCOMMAND |
+        (g_app.showWhitespace ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, kIdViewIndentGuides, MF_BYCOMMAND |
+        (g_app.showIndentGuides ? MF_CHECKED : MF_UNCHECKED));
     if (g_app.lineSpacingMenu) {
         for (int id = kIdLineSpacingSingle; id <= kIdLineSpacingCustom; ++id) {
             CheckMenuItem(g_app.lineSpacingMenu, id, MF_BYCOMMAND | MF_UNCHECKED);
@@ -4213,6 +4353,9 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(view, MF_STRING, kIdViewNextBookmark, L"下一个书签\tF4");
     AppendMenuW(view, MF_STRING, kIdViewPreviousBookmark, L"上一个书签\tShift+F4");
     AppendMenuW(view, MF_STRING, kIdViewClearBookmarks, L"清除当前文档书签");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, MF_STRING, kIdViewWhitespace, L"显示空格和制表符");
+    AppendMenuW(view, MF_STRING, kIdViewIndentGuides, L"显示缩进参考线");
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacingSingle, L"1.0 倍");
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacing115, L"1.15 倍");
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacing150, L"1.5 倍");
@@ -4295,6 +4438,8 @@ void LoadPersistedSession() {
     int persistedLanguage = g_app.languageIndex;
     int persistedEncoding = g_app.encodingIndex;
     int persistedLineEnding = g_app.lineEndingIndex;
+    int persistedShowWhitespace = g_app.showWhitespace ? 1 : 0;
+    int persistedShowIndentGuides = g_app.showIndentGuides ? 1 : 0;
     int persistedStartup = g_app.launchAtStartup ? 1 : 0;
     int persistedCloseBehavior = static_cast<int>(g_app.closeBehavior);
     int persistedWindowCloseBehavior = static_cast<int>(g_app.windowCloseBehavior);
@@ -4325,6 +4470,8 @@ void LoadPersistedSession() {
             ParseInt(parts[6], persistedLanguage);
             ParseInt(parts[7], persistedEncoding);
             ParseInt(parts[8], persistedLineEnding);
+            if (parts.size() >= 10) ParseInt(parts[9], persistedShowWhitespace);
+            if (parts.size() >= 11) ParseInt(parts[10], persistedShowIndentGuides);
         } else if (parts[0] == "TOOLBOX" && parts.size() >= 5) {
             int visible = 0, width = 380, mask = 0x3FF, tool = 0;
             ParseInt(parts[1], visible);
@@ -4405,6 +4552,8 @@ void LoadPersistedSession() {
     g_app.lineSpacingPercent = std::clamp(persistedLineSpacing, 50, 300);
     g_app.showLineNumbers = persistedShowLineNumbers != 0;
     g_app.wordWrap = persistedWordWrap != 0;
+    g_app.showWhitespace = persistedShowWhitespace != 0;
+    g_app.showIndentGuides = persistedShowIndentGuides != 0;
     g_app.sidebarVisible = false;
     g_app.fontSize = std::clamp(persistedFontSize, 10, 32);
     if (!persistedFontFamily.empty()) g_app.fontFamily = persistedFontFamily;
@@ -16824,6 +16973,16 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdViewClearBookmarks:
             ClearBookmarks();
             break;
+        case kIdViewWhitespace:
+            g_app.showWhitespace = !g_app.showWhitespace;
+            g_app.stateDirty = true;
+            for (const TabDocument& document : g_app.documents) InvalidateRect(document.editor, nullptr, FALSE);
+            break;
+        case kIdViewIndentGuides:
+            g_app.showIndentGuides = !g_app.showIndentGuides;
+            g_app.stateDirty = true;
+            for (const TabDocument& document : g_app.documents) InvalidateRect(document.editor, nullptr, FALSE);
+            break;
         case kIdToolbarTheme:
             ShowThemeMenu(ToolbarItemScreenRect(kIdToolbarTheme));
             break;
@@ -17088,11 +17247,26 @@ void ForwardToRunningInstance() {
         SMTO_ABORTIFHUNG, 5000, &result);
 }
 
+int RunSelfTests() {
+    const auto expect = [](bool condition) { return condition ? 0 : 1; };
+    int failures = 0;
+    failures += expect(FindMatchingBracket(L"{alpha [beta]}", 0) == 13);
+    failures += expect(FindMatchingBracket(L"{alpha [beta]}", 12) == 7);
+    failures += expect(HashText(L"abc") == HashText(L"abc"));
+    failures += expect(HashText(L"abc") != HashText(L"abd"));
+    failures += expect(DataUnescape(L"a\\nb\\t") == L"a\r\nb\t");
+    return failures == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCommand) {
     (void)commandLine;
     g_app.instance = instance;
+
+    if (commandLine != nullptr && wcsstr(commandLine, L"--self-test") != nullptr) {
+        return RunSelfTests();
+    }
 
     // Kept open for the lifetime of the process; the OS releases it on exit.
     HANDLE singleInstance = CreateMutexW(nullptr, FALSE, kSingleInstanceMutex);

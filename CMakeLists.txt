@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 project(MCnotepad VERSION 0.1.0 LANGUAGES C CXX RC)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -75,3 +77,7 @@ add_custom_command(TARGET MCnotepad POST_BUILD
             ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-pinyin/res/dict/mandarin
             $<TARGET_FILE_DIR:MCnotepad>/dict/mandarin
 )
+
+if(BUILD_TESTING)
+    add_test(NAME MCnotepad.self_test COMMAND MCnotepad --self-test)
+endif()
