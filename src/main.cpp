@@ -291,6 +291,8 @@ struct TabDocument {
     uint64_t textHash = 0;       // to tell real edits from formatting-only EN_CHANGE
     std::vector<int> bookmarks;  // 1-based logical line numbers
     int highlightedLine = -1;
+    LONG bracketMatchStart = -1;
+    LONG bracketMatchEnd = -1;
 };
 
 struct ClosedTab {
@@ -471,6 +473,7 @@ std::unordered_map<HWND, WNDPROC> g_editorProcs;
 std::wstring GetWindowTextValue(HWND window);
 void ApplyEditorTheme(HWND editor);
 void ApplyCurrentLineHighlight(TabDocument& document, bool force = false);
+void ApplyBracketMatchHighlight(TabDocument& document, bool force = false);
 void HighlightDocument(const TabDocument& document);
 void HighlightDocument(TabDocument& document);
 void SyntaxColorVisible(TabDocument& document);
@@ -740,8 +743,11 @@ void ApplyThemeToEditors(bool rehighlight = true) {
     for (TabDocument& document : g_app.documents) {
         ApplyEditorTheme(document.editor);
         document.highlightedLine = -1;
+        document.bracketMatchStart = -1;
+        document.bracketMatchEnd = -1;
         if (rehighlight) HighlightDocument(document);
         ApplyCurrentLineHighlight(document);
+        ApplyBracketMatchHighlight(document, true);
     }
     if (g_app.gutter) InvalidateRect(g_app.gutter, nullptr, TRUE);
     ApplyMenuColorMode();
@@ -2221,6 +2227,121 @@ void ApplyCurrentLineHighlight(TabDocument& document, bool force) {
     InvalidateRect(editor, nullptr, FALSE);
 }
 
+bool IsOpeningBracket(wchar_t character) {
+    return character == L'(' || character == L'[' || character == L'{';
+}
+
+bool IsClosingBracket(wchar_t character) {
+    return character == L')' || character == L']' || character == L'}';
+}
+
+wchar_t MatchingBracket(wchar_t character) {
+    switch (character) {
+    case L'(': return L')';
+    case L'[': return L']';
+    case L'{': return L'}';
+    case L')': return L'('; 
+    case L']': return L'[';
+    case L'}': return L'{';
+    default: return 0;
+    }
+}
+
+LONG FindMatchingBracket(std::wstring_view text, LONG position) {
+    if (position < 0 || position >= static_cast<LONG>(text.size())) return -1;
+    const wchar_t anchor = text[static_cast<size_t>(position)];
+    if (!IsOpeningBracket(anchor) && !IsClosingBracket(anchor)) return -1;
+    const wchar_t match = MatchingBracket(anchor);
+    const int direction = IsOpeningBracket(anchor) ? 1 : -1;
+    int depth = 1;
+    bool inString = false;
+    wchar_t quote = 0;
+    for (LONG index = position + direction;
+         index >= 0 && index < static_cast<LONG>(text.size()); index += direction) {
+        const wchar_t character = text[static_cast<size_t>(index)];
+        const bool escaped = index > 0 && text[static_cast<size_t>(index - 1)] == L'\\' &&
+            (index < 2 || text[static_cast<size_t>(index - 2)] != L'\\');
+        if (character == L'"' || character == L'\'') {
+            if (!escaped && (!inString || character == quote)) {
+                inString = !inString;
+                quote = inString ? character : 0;
+            }
+            continue;
+        }
+        if (inString) continue;
+        if (character == anchor) {
+            ++depth;
+        } else if (character == match) {
+            if (--depth == 0) return index;
+        }
+    }
+    return -1;
+}
+
+COLORREF BracketMatchHighlightColor() {
+    const ThemePalette& palette = CurrentPalette();
+    const int amount = g_app.darkTheme ? 34 : 24;
+    const auto blend = [amount](BYTE a, BYTE b) -> BYTE {
+        return static_cast<BYTE>(std::clamp(static_cast<int>(a) +
+            (static_cast<int>(b) - static_cast<int>(a)) * amount / 100, 0, 255));
+    };
+    return RGB(blend(GetRValue(palette.editorBackground), GetRValue(palette.accent)),
+        blend(GetGValue(palette.editorBackground), GetGValue(palette.accent)),
+        blend(GetBValue(palette.editorBackground), GetBValue(palette.accent)));
+}
+
+void ApplyBracketMatchHighlight(TabDocument& document, bool force) {
+    HWND editor = document.editor;
+    if (!editor || !IsWindow(editor) || !IsWindowVisible(editor)) return;
+    CHARRANGE selection{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const LONG length = static_cast<LONG>(GetWindowTextLengthW(editor));
+    const LONG caret = std::clamp(selection.cpMin, 0L, length);
+    const std::wstring text = GetEditorRawText(editor);
+    LONG anchor = -1;
+    if (caret < static_cast<LONG>(text.size()) &&
+        (IsOpeningBracket(text[static_cast<size_t>(caret)]) || IsClosingBracket(text[static_cast<size_t>(caret)]))) {
+        anchor = caret;
+    } else if (caret > 0 &&
+        (IsOpeningBracket(text[static_cast<size_t>(caret - 1)]) || IsClosingBracket(text[static_cast<size_t>(caret - 1)]))) {
+        anchor = caret - 1;
+    }
+    const LONG match = anchor >= 0 ? FindMatchingBracket(text, anchor) : -1;
+    if (!force && anchor == document.bracketMatchStart && match == document.bracketMatchEnd) return;
+
+    EditorEventMute mute(editor);
+    TextDocumentRef tom(editor);
+    if (!tom) return;
+    long freezeCount = 0;
+    tom.document()->Undo(tomSuspend, nullptr);
+    tom.document()->Freeze(&freezeCount);
+    if (document.bracketMatchStart >= 0 && document.bracketMatchEnd > document.bracketMatchStart) {
+        tom.SetBackColor(document.bracketMatchStart, document.bracketMatchStart + 1, EditorBackground());
+        tom.SetBackColor(document.bracketMatchEnd, document.bracketMatchEnd + 1, EditorBackground());
+    }
+    document.bracketMatchStart = anchor;
+    document.bracketMatchEnd = match;
+    tom.document()->Unfreeze(&freezeCount);
+    tom.document()->Undo(tomResume, nullptr);
+    // Restoring the line background after removing the old pair keeps the two
+    // highlights composable when a bracket sits on the active line.
+    ApplyCurrentLineHighlight(document, true);
+    if (anchor >= 0 && match >= 0) {
+        TextDocumentRef bracketTom(editor);
+        if (bracketTom) {
+            long bracketFreeze = 0;
+            bracketTom.document()->Undo(tomSuspend, nullptr);
+            bracketTom.document()->Freeze(&bracketFreeze);
+            bracketTom.SetBackColor(anchor, anchor + 1, BracketMatchHighlightColor());
+            bracketTom.SetBackColor(match, match + 1, BracketMatchHighlightColor());
+            bracketTom.document()->Unfreeze(&bracketFreeze);
+            bracketTom.document()->Undo(tomResume, nullptr);
+        }
+    }
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    InvalidateRect(editor, nullptr, FALSE);
+}
+
 // Re-colouring after typing pauses.
 constexpr UINT kTimerHighlight = 4102;
 constexpr UINT kHighlightDelayMs = 250;
@@ -3165,6 +3286,7 @@ void SelectTab(int index) {
     RestoreEditorState(document);
     SyntaxColorVisible(document);
     ApplyCurrentLineHighlight(document);
+    ApplyBracketMatchHighlight(document, true);
     EnsureTabVisible(index);
     InvalidateToolbar();
     if (g_app.showLineNumbers && GutterWidthFor(document.editor) != g_app.gutterWidth) LayoutChildren(g_app.window);
@@ -5109,6 +5231,8 @@ void ReloadDocumentFromDisk(int index) {
     document.lineEnding = lineEnding;
     document.modified = false;
     document.highlightedLine = -1;
+    document.bracketMatchStart = -1;
+    document.bracketMatchEnd = -1;
     document.textHash = HashText(GetEditorRawText(document.editor));
     document.fileTimestamp = FileTimestamp(document.path);
     MarkRecoveryDirty(index);
@@ -5119,6 +5243,7 @@ void ReloadDocumentFromDisk(int index) {
     selection.cpMax = std::min(selection.cpMax, length);
     SendMessageW(document.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
     ApplyCurrentLineHighlight(document);
+    ApplyBracketMatchHighlight(document, true);
     UpdateTabTitle(index);
     UpdateStatusBar();
     RefreshGutter();
@@ -16579,6 +16704,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     RefreshGutter();
                     TabDocument& changed = g_app.documents[index];
                     ApplyCurrentLineHighlight(changed, true);
+                    ApplyBracketMatchHighlight(changed, true);
                     NormalizeBookmarks(changed);
                     changed.syntaxStale = true;  // tokens no longer match; scrolling re-tokenizes
                     if (EffectiveLanguage(changed) != kLanguagePlain || changed.syntaxHadColors ||
@@ -16801,7 +16927,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             UpdateStatusBar();
             ToolboxOnSelectionChanged();
             RefreshGutter();  // current-line number follows the caret
-            if (TabDocument* document = ActiveDocument()) ApplyCurrentLineHighlight(*document);
+            if (TabDocument* document = ActiveDocument()) {
+                ApplyCurrentLineHighlight(*document);
+                ApplyBracketMatchHighlight(*document);
+            }
             return 0;
         }
         return 0;
