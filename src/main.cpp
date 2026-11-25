@@ -329,9 +329,13 @@ struct TabDocument {
     std::vector<std::pair<LONG, LONG>> syntaxColored;  // character ranges already painted
     bool syntaxStale = true;     // tokens no longer match the text
     bool syntaxHadColors = false;
+    bool syntaxResetAll = false; // painted ranges are no longer tracked: clear colours outside the view once
     uint64_t textHash = 0;       // to tell real edits from formatting-only EN_CHANGE
     std::vector<int> bookmarks;  // 1-based logical line numbers
-    int highlightedLine = -1;
+    int highlightedLine = -1;     // -1: no current-line highlight is applied
+    LONG highlightedStart = 0;    // its character range, and the text length when it was applied
+    LONG highlightedEnd = 0;
+    LONG highlightedLength = 0;
     LONG bracketMatchStart = -1;
     LONG bracketMatchEnd = -1;
     std::vector<FoldRegion> folds;
@@ -764,7 +768,7 @@ void ApplyBracketMatchHighlight(TabDocument& document, bool force = false);
 COLORREF Blend(COLORREF base, COLORREF overlay, int percentOverlay);
 void HighlightDocument(const TabDocument& document);
 void HighlightDocument(TabDocument& document);
-void SyntaxColorVisible(TabDocument& document);
+void SyntaxColorVisible(TabDocument& document, bool retokenize = true);
 void SyntaxOnViewChanged(HWND editor);
 int LanguageFromName(const std::wstring& name);
 int LanguageFromPath(const std::wstring& path);
@@ -1200,6 +1204,19 @@ public:
         return static_cast<LONG>(start);
     }
 
+    // The display line (one row on screen) around a position. Needs only the
+    // layout near that position, unlike EM_LINEINDEX / EM_EXLINEFROMCHAR,
+    // which lay the document out from the top down to the line asked for.
+    std::pair<LONG, LONG> DisplayLineRange(LONG position) {
+        long start = position, end = position;
+        if (range_ && SUCCEEDED(range_->SetRange(position, position))) {
+            range_->Expand(tomLine, nullptr);
+            range_->GetStart(&start);
+            range_->GetEnd(&end);
+        }
+        return {static_cast<LONG>(start), static_cast<LONG>(end)};
+    }
+
     LONG ParagraphStart(LONG position) {
         long start = 0;
         if (range_ && SUCCEEDED(range_->SetRange(position, position)) &&
@@ -1270,6 +1287,35 @@ private:
     ITextRange* range_ = nullptr;
 };
 
+std::wstring GetEditorRawText(HWND editor);
+
+// The text of the document that was edited last, kept from the EN_CHANGE
+// handler so folding, highlighting and bracket matching don't each copy
+// megabytes out of the control again for the same keystroke.
+struct EditorTextCache {
+    HWND editor = nullptr;
+    uint64_t hash = 0;
+    std::wstring text;
+} g_textCache;
+
+void StoreEditorText(HWND editor, uint64_t hash, std::wstring&& text) {
+    g_textCache.editor = editor;
+    g_textCache.hash = hash;
+    g_textCache.text = std::move(text);
+}
+
+// Current text of a document: the cached copy when it is provably current
+// (same control, same hash as the document, same length), else a fresh one.
+const std::wstring& DocumentText(const TabDocument& document, std::wstring& storage) {
+    if (g_textCache.editor == document.editor && g_textCache.hash == document.textHash && document.textHash != 0) {
+        GETTEXTLENGTHEX query{GTL_NUMCHARS | GTL_PRECISE, 1200};
+        const LRESULT length = SendMessageW(document.editor, EM_GETTEXTLENGTHEX, reinterpret_cast<WPARAM>(&query), 0);
+        if (length >= 0 && static_cast<size_t>(length) == g_textCache.text.size()) return g_textCache.text;
+    }
+    storage = GetEditorRawText(document.editor);
+    return storage;
+}
+
 // Folds are {...} blocks spanning more than one real line. Re-detected only
 // when the text changed (textHash is kept current by the EN_CHANGE handler);
 // a block stays collapsed after an edit as long as its text is still hidden.
@@ -1278,7 +1324,8 @@ void DetectFoldRegions(TabDocument& document) {
     if (document.largeFileMode) return;
     if (document.foldTextHash != 0 && document.foldTextHash == document.textHash) return;
     const bool hadCollapsed = std::any_of(document.folds.begin(), document.folds.end(), [](const FoldRegion& region) { return region.collapsed; });
-    const std::wstring text = GetEditorRawText(document.editor);
+    std::wstring storage;
+    const std::wstring& text = DocumentText(document, storage);
     document.folds.clear();
     document.foldTextHash = document.textHash != 0 ? document.textHash : HashText(text);
     struct Open { LONG position; int line; };
@@ -2636,9 +2683,13 @@ bool SyntaxEnabled(const TabDocument& document) {
 
 void RetokenizeDocument(TabDocument& document) {
     document.syntaxStale = false;
+    // Ranges painted before the edit sit at shifted positions now and can't
+    // be tracked: the next paint clears colours outside the view once.
+    if (!document.syntaxColored.empty()) document.syntaxResetAll = true;
     document.syntaxColored.clear();
     document.syntaxTokens.clear();
-    const std::wstring text = GetEditorRawText(document.editor);
+    std::wstring storage;
+    const std::wstring& text = DocumentText(document, storage);
     if (document.untitled && document.language == kLanguageAuto && document.path.empty()) {
         document.sniffedLanguage = SniffLanguage(text);  // a new tab follows what is typed
     }
@@ -2686,12 +2737,17 @@ void PaintSyntaxRange(TabDocument& document, TextDocumentRef& tom, StyleFonts& f
 constexpr LONG kMaxPaintedChars = 60000;
 
 // Colours whatever part of the visible text (plus a margin) is not coloured yet.
-void SyntaxColorVisible(TabDocument& document) {
+// `retokenize` is false for scrolling and key presses: lexing the whole text
+// on every keystroke is what the typing-pause timer is there to avoid.
+void SyntaxColorVisible(TabDocument& document, bool retokenize) {
     HWND editor = document.editor;
     if (!editor || !IsWindowVisible(editor)) return;
-    if (document.syntaxStale) RetokenizeDocument(document);
-    if (document.syntaxTokens.empty() && !document.syntaxHadColors) return;
-    const LONG length = GetWindowTextLengthW(editor);
+    if (document.syntaxStale) {
+        if (!retokenize) return;  // tokens don't match the text; the timer re-lexes shortly
+        RetokenizeDocument(document);
+    }
+    if (document.syntaxTokens.empty() && !document.syntaxHadColors && !document.syntaxResetAll) return;
+    const LONG length = EditorTextLength(editor);  // exact and O(1); WM_GETTEXTLENGTH walks the text
     RECT client{};
     GetClientRect(editor, &client);
     POINTL topLeft{0, 0}, bottomRight{client.right, client.bottom};
@@ -2709,7 +2765,7 @@ void SyntaxColorVisible(TabDocument& document) {
         cursor = std::max(cursor, end);
     }
     if (cursor < to) gaps.emplace_back(cursor, to);
-    if (gaps.empty()) return;
+    if (gaps.empty() && !document.syntaxResetAll) return;
 
     EditorEventMute mute(editor);
     TextDocumentRef tom(editor);
@@ -2718,6 +2774,13 @@ void SyntaxColorVisible(TabDocument& document) {
     tom.document()->Undo(tomSuspend, nullptr);
     tom.document()->Freeze(&freezeCount);
     StyleFonts fonts(tom);
+    if (document.syntaxResetAll) {
+        // One pass back to plain for everything outside the view, so the run
+        // count stays bounded and no stale colours remain after a language switch.
+        document.syntaxResetAll = false;
+        if (from > 0) tom.ApplyFont(0, from, fonts.For(Tok::Plain));
+        if (to < length + 1) tom.ApplyFont(to, length + 1, fonts.For(Tok::Plain));
+    }
     LONG painted = 0;
     for (const auto& [start, end] : document.syntaxColored) painted += end - start;
     if (painted + (to - from) > kMaxPaintedChars) {
@@ -2747,6 +2810,7 @@ void SyntaxColorVisible(TabDocument& document) {
 // other tabs recolour when they are shown.
 void HighlightDocument(TabDocument& document) {
     document.syntaxStale = true;
+    if (!document.syntaxColored.empty() || document.syntaxHadColors) document.syntaxResetAll = true;
     document.syntaxColored.clear();
     if (document.syntaxHadColors && !SyntaxEnabled(document)) {
         // Switched to plain text: drop old colours once.
@@ -2770,7 +2834,7 @@ void HighlightDocument(const TabDocument& document) {
 void SyntaxOnViewChanged(HWND editor) {
     for (TabDocument& document : g_app.documents) {
         if (document.editor == editor) {
-            SyntaxColorVisible(document);
+            SyntaxColorVisible(document, false);
             return;
         }
     }
@@ -2833,49 +2897,32 @@ void RestoreSelection(HWND editor, const SelectionState& state) {
 }
 
 void ApplyCurrentLineHighlight(TabDocument& document, bool force) {
+    (void)force;
     HWND editor = document.editor;
     if (!editor || !IsWindow(editor) || !IsWindowVisible(editor)) return;
-    // RichEdit owns the temporary composition range while an IME is active.
-    // TOM formatting plus EM_EXSETSEL during that range makes the candidate
-    // window flash and move, especially for Chinese pinyin input.
-    if (IsEditorImeComposing(editor)) return;
-
-    const SelectionState savedSelection = CaptureSelection(editor);
-    const CHARRANGE selection = savedSelection.range;
-    const LONG length = static_cast<LONG>(GetWindowTextLengthW(editor));
-    const LONG caret = std::clamp(selection.cpMin, 0L, length);
-    const int lineIndex = static_cast<int>(SendMessageW(editor, EM_EXLINEFROMCHAR, 0, caret));
-    if (lineIndex < 0) return;
-    const int line = lineIndex + 1;
-    if (!force && document.highlightedLine == line) return;
-
-    const auto lineRange = [editor, length](int zeroBasedLine) -> std::pair<LONG, LONG> {
-        if (zeroBasedLine < 0) return {0, 0};
-        LONG start = static_cast<LONG>(SendMessageW(editor, EM_LINEINDEX,
-            static_cast<WPARAM>(zeroBasedLine), 0));
-        if (start < 0) return {0, 0};
-        LONG end = static_cast<LONG>(SendMessageW(editor, EM_LINEINDEX,
-            static_cast<WPARAM>(zeroBasedLine + 1), 0));
-        if (end < 0) end = length;
-        return {std::min(start, length), std::max(std::min(end, length), start)};
-    };
-
-    EditorEventMute mute(editor);
+    // Do not paint the active line into RichEdit character backgrounds. The
+    // TOM `tomLine` range can expand across wrapped paragraphs and leave
+    // large blocks of text tinted, which looks like accidental selection and
+    // also interferes with IME composition. Keep the editor surface plain.
+    if (document.highlightedLine <= 0) return;
     TextDocumentRef tom(editor);
     if (!tom) return;
-    long freezeCount = 0;
-    tom.document()->Undo(tomSuspend, nullptr);
-    tom.document()->Freeze(&freezeCount);
-    if (document.highlightedLine > 0) {
-        const auto [oldStart, oldEnd] = lineRange(document.highlightedLine - 1);
-        if (oldEnd > oldStart) tom.SetBackColor(oldStart, oldEnd, EditorBackground());
+    const LONG length = EditorTextLength(editor);
+    const LONG start = std::clamp(document.highlightedStart, 0L, length);
+    const LONG end = std::clamp(document.highlightedEnd, start, length + 1);
+    if (end > start) {
+        EditorEventMute mute(editor);
+        long freezeCount = 0;
+        tom.document()->Undo(tomSuspend, nullptr);
+        tom.document()->Freeze(&freezeCount);
+        tom.SetBackColor(start, end, EditorBackground());
+        tom.document()->Unfreeze(&freezeCount);
+        tom.document()->Undo(tomResume, nullptr);
     }
-    const auto [newStart, newEnd] = lineRange(lineIndex);
-    if (newEnd > newStart) tom.SetBackColor(newStart, newEnd, CurrentLineHighlightColor());
-    tom.document()->Unfreeze(&freezeCount);
-    tom.document()->Undo(tomResume, nullptr);
-    document.highlightedLine = line;
-    RestoreSelection(editor, savedSelection);
+    document.highlightedLine = -1;
+    document.highlightedStart = 0;
+    document.highlightedEnd = 0;
+    document.highlightedLength = length;
     InvalidateRect(editor, nullptr, FALSE);
 }
 
@@ -2897,6 +2944,20 @@ wchar_t MatchingBracket(wchar_t character) {
     case L'}': return L'{';
     default: return 0;
     }
+}
+
+LONG EditorTextLength(HWND editor);
+
+// Characters [from, to) exactly as RichEdit stores them (line breaks are \r).
+std::wstring EditorTextRange(HWND editor, LONG from, LONG to) {
+    if (to <= from) return {};
+    std::wstring text(static_cast<size_t>(to - from) + 1, L'\0');
+    TEXTRANGEW range{};
+    range.chrg = CHARRANGE{from, to};
+    range.lpstrText = text.data();
+    const LRESULT copied = SendMessageW(editor, EM_GETTEXTRANGE, 0, reinterpret_cast<LPARAM>(&range));
+    text.resize(static_cast<size_t>(std::clamp<LRESULT>(copied, 0, to - from)));
+    return text;
 }
 
 LONG FindMatchingBracket(std::wstring_view text, LONG position) {
@@ -2948,18 +3009,30 @@ void ApplyBracketMatchHighlight(TabDocument& document, bool force) {
     if (IsEditorImeComposing(editor)) return;
     const SelectionState savedSelection = CaptureSelection(editor);
     const CHARRANGE selection = savedSelection.range;
-    const LONG length = static_cast<LONG>(GetWindowTextLengthW(editor));
+    const LONG length = EditorTextLength(editor);
     const LONG caret = std::clamp(selection.cpMin, 0L, length);
-    const std::wstring text = GetEditorRawText(editor);
+    // Only the two characters at the caret are read first; the text around
+    // them (a bounded window, not the whole document) only when one of them
+    // is a bracket. This runs on every caret move.
+    const std::wstring around = EditorTextRange(editor, std::max(0L, caret - 1), std::min(length, caret + 1));
+    const LONG aroundStart = std::max(0L, caret - 1);
+    const auto bracketAt = [&](LONG position) {
+        const LONG local = position - aroundStart;
+        if (local < 0 || local >= static_cast<LONG>(around.size())) return false;
+        const wchar_t c = around[static_cast<size_t>(local)];
+        return IsOpeningBracket(c) || IsClosingBracket(c);
+    };
     LONG anchor = -1;
-    if (caret < static_cast<LONG>(text.size()) &&
-        (IsOpeningBracket(text[static_cast<size_t>(caret)]) || IsClosingBracket(text[static_cast<size_t>(caret)]))) {
-        anchor = caret;
-    } else if (caret > 0 &&
-        (IsOpeningBracket(text[static_cast<size_t>(caret - 1)]) || IsClosingBracket(text[static_cast<size_t>(caret - 1)]))) {
-        anchor = caret - 1;
+    if (bracketAt(caret)) anchor = caret;
+    else if (caret > 0 && bracketAt(caret - 1)) anchor = caret - 1;
+    LONG match = -1;
+    if (anchor >= 0) {
+        constexpr LONG kBracketWindow = 200000;
+        const LONG windowStart = std::max(0L, anchor - kBracketWindow);
+        const std::wstring window = EditorTextRange(editor, windowStart, std::min(length, anchor + kBracketWindow));
+        const LONG local = FindMatchingBracket(window, anchor - windowStart);
+        if (local >= 0) match = windowStart + local;
     }
-    const LONG match = anchor >= 0 ? FindMatchingBracket(text, anchor) : -1;
     if (!force && anchor == document.bracketMatchStart && match == document.bracketMatchEnd) return;
 
     EditorEventMute mute(editor);
@@ -3149,11 +3222,36 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             };
             CHARRANGE selection{};
             SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-            const long caretParagraph = paragraphOf(selection.cpMax);
             const int lineCount = static_cast<int>(SendMessageW(editor, EM_GETLINECOUNT, 0, 0));
             const int firstVisual = static_cast<int>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
             const LONG firstChar = static_cast<LONG>(SendMessageW(editor, EM_LINEINDEX, firstVisual, 0));
-            long previousParagraph = firstChar > 0 ? paragraphOf(firstChar - 1) : 0;
+            // A paragraph number costs RichEdit a walk from the top of the
+            // document. Ask once for the first visible line and count line
+            // breaks in the visible text for the others.
+            RECT editorClient{};
+            GetClientRect(editor, &editorClient);
+            POINTL bottomRight{editorClient.right, editorClient.bottom};
+            const LONG lastChar = static_cast<LONG>(SendMessageW(editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&bottomRight)));
+            const LONG bufferStart = std::max(0L, firstChar - 1);
+            const std::wstring visibleText = lastChar - bufferStart < 400000 ? EditorTextRange(editor, bufferStart, lastChar + 2) : std::wstring();
+            const long firstParagraph = paragraphOf(std::max(0L, firstChar));
+            LONG countedTo = std::max(0L, firstChar);
+            long countedParagraph = firstParagraph;
+            const auto fastParagraphOf = [&](LONG position) -> long {
+                const LONG end = bufferStart + static_cast<LONG>(visibleText.size());
+                if (visibleText.empty() || position < countedTo || position > end) return paragraphOf(position);
+                for (; countedTo < position; ++countedTo) {
+                    if (visibleText[static_cast<size_t>(countedTo - bufferStart)] == L'\r') ++countedParagraph;
+                }
+                return countedParagraph;
+            };
+            const long caretParagraph = selection.cpMax >= firstChar && selection.cpMax <= lastChar
+                ? firstParagraph + static_cast<long>(std::count(visibleText.begin() + std::min<size_t>(visibleText.size(), static_cast<size_t>(std::max(0L, firstChar) - bufferStart)),
+                      visibleText.begin() + std::min<size_t>(visibleText.size(), static_cast<size_t>(selection.cpMax - bufferStart)), L'\r'))
+                : paragraphOf(selection.cpMax);
+            long previousParagraph = firstChar <= 0 ? 0
+                : visibleText.empty() ? paragraphOf(firstChar - 1)
+                : visibleText[0] == L'\r' ? firstParagraph - 1 : firstParagraph;
             const int right = client.right - Scale(8);
             for (int visual = firstVisual; visual < lineCount; ++visual) {
                 const LRESULT start = SendMessageW(editor, EM_LINEINDEX, visual, 0);
@@ -3162,7 +3260,7 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 SendMessageW(editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&position), start);
                 const int y = position.y + origin.y;
                 if (y > client.bottom) break;
-                const long paragraph = paragraphOf(static_cast<LONG>(start));
+                const long paragraph = fastParagraphOf(static_cast<LONG>(start));
                 if (paragraph != previousParagraph) {
                     const auto fold = std::find_if(activeDocument.folds.begin(), activeDocument.folds.end(),
                         [paragraph](const FoldRegion& region) { return region.line + 1 == paragraph; });
@@ -3682,6 +3780,24 @@ DWORD HardLinkCount(const fs::path& path) {
     return links;
 }
 
+// For the app's own data (recovery snapshots, session, histories): written
+// to a unique temp file and moved over the old one. There is no metadata
+// worth keeping on these, and the snapshot is rewritten every two seconds
+// while typing, where ReplaceFileW costs roughly ten times a plain move.
+bool WriteDataFile(const fs::path& path, std::string_view bytes) {
+    wchar_t suffix[32]{};
+    swprintf_s(suffix, L".mcn-%08lx%04lx.tmp", GetTickCount(), GetCurrentProcessId() & 0xFFFF);
+    const fs::path temporaryPath = path.wstring() + suffix;
+    std::error_code error;
+    if (!WriteBinaryFile(temporaryPath, bytes)) {
+        fs::remove(temporaryPath, error);
+        return false;
+    }
+    if (MoveFileExW(temporaryPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) return true;
+    fs::remove(temporaryPath, error);
+    return false;
+}
+
 // Writes a file so that a crash never leaves it half-written:
 // - the new content goes to a uniquely named hidden temp file next to it,
 //   then ReplaceFileW swaps it in, keeping the original's attributes, ACLs,
@@ -4003,12 +4119,13 @@ bool EncodeTextBytes(std::wstring_view text, int encoding, std::string& bytes) {
     return true;
 }
 
-bool WriteTextFile(const fs::path& path, std::wstring_view text, int encodingIndex = -1, int lineEndingIndex = -1) {
+bool WriteTextFile(const fs::path& path, std::wstring_view text, int encodingIndex = -1, int lineEndingIndex = -1,
+    bool dataFile = false) {
     if (encodingIndex < 0) encodingIndex = g_app.encodingIndex;
     if (lineEndingIndex < 0) lineEndingIndex = g_app.lineEndingIndex;
     std::string bytes;
     if (!EncodeTextBytes(NormalizeLineEndings(text, lineEndingIndex), encodingIndex, bytes)) return false;
-    return WriteAtomicFile(path, bytes);
+    return dataFile ? WriteDataFile(path, bytes) : WriteAtomicFile(path, bytes);
 }
 
 std::wstring FileTitle(const fs::path& path) {
@@ -4070,7 +4187,18 @@ void RestoreEditorState(const TabDocument& document) {
 
 void UpdateStatusBar() {
     if (g_app.statusBar) InvalidateRect(g_app.statusBar, nullptr, FALSE);
-    InvalidateToolbar();  // undo/redo availability follows edits
+    // Undo/redo availability follows edits. This runs on every caret move,
+    // so the toolbar is only repainted when that state really changed.
+    static HWND lastEditor = nullptr;
+    static int lastState = -1;
+    HWND editor = g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size())
+        ? g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor : nullptr;
+    const int state = editor ? (SendMessageW(editor, EM_CANUNDO, 0, 0) ? 1 : 0) | (SendMessageW(editor, EM_CANREDO, 0, 0) ? 2 : 0) : 0;
+    if (editor != lastEditor || state != lastState) {
+        lastEditor = editor;
+        lastState = state;
+        InvalidateToolbar();
+    }
 }
 
 void LayoutChildren(HWND window) {
@@ -4167,7 +4295,7 @@ bool SaveDocumentRecovery(TabDocument& document) {
     // Snapshots always use UTF-8 BOM + CRLF so recovery never depends on the
     // user's chosen save encoding (ANSI would silently drop characters).
     const std::wstring text = GetWindowTextValue(document.editor);
-    if (!WriteTextFile(document.snapshotPath, text, 1, 0)) {
+    if (!WriteTextFile(document.snapshotPath, text, 1, 0, true)) {
         return false;
     }
 
@@ -4235,7 +4363,7 @@ bool SaveSessionFile() {
         output << '\t' << (document.pinned ? 1 : 0) << '\n';
     }
 
-    return WriteAtomicFile(g_app.sessionPath, output.str());
+    return WriteDataFile(g_app.sessionPath, output.str());
 }
 
 bool PersistAll(bool forceSnapshots) {
@@ -4257,7 +4385,7 @@ bool PersistAll(bool forceSnapshots) {
 }
 
 bool CreateRunningMarker() {
-    return WriteAtomicFile(g_app.runningMarkerPath, "MCnotepad running\n");
+    return WriteDataFile(g_app.runningMarkerPath, "MCnotepad running\n");
 }
 
 void RemoveRunningMarker() {
@@ -8757,7 +8885,16 @@ void CaretInfo(const TabDocument& document, int& line, int& column, int& selecte
     selected = selection.cpMax - selection.cpMin;
     TextDocumentRef tom(document.editor);
     LONG lineStart = 0;
-    if (tom) {
+    const std::wstring& cached = g_textCache.text;
+    if (g_textCache.editor == document.editor && g_textCache.hash == document.textHash && document.textHash != 0 &&
+        static_cast<LONG>(cached.size()) == EditorTextLength(document.editor) && selection.cpMax <= static_cast<LONG>(cached.size())) {
+        // The text kept from the last edit answers this without RichEdit
+        // walking its paragraphs from the top (this runs on every repaint).
+        const auto caret = cached.begin() + selection.cpMax;
+        line = 1 + static_cast<int>(std::count(cached.begin(), caret, L'\r'));
+        const size_t previousBreak = selection.cpMax > 0 ? cached.rfind(L'\r', static_cast<size_t>(selection.cpMax) - 1) : std::wstring::npos;
+        lineStart = previousBreak == std::wstring::npos ? 0 : static_cast<LONG>(previousBreak) + 1;
+    } else if (tom) {
         line = static_cast<int>(tom.ParagraphIndex(selection.cpMax));
         lineStart = tom.ParagraphStart(selection.cpMax);
     } else {
@@ -9458,7 +9595,7 @@ void SavePrefixSuffixHistory() {
                << HexEncode(WideToUtf8(rule.suffix)) << '\t'
                << HexEncode(WideToUtf8(rule.replacement)) << '\n';
     }
-    WriteAtomicFile(PrefixSuffixHistoryPath(), output.str());
+    WriteDataFile(PrefixSuffixHistoryPath(), output.str());
 }
 
 void LoadPrefixSuffixHistory() {
@@ -10500,7 +10637,7 @@ bool SaveDataTemplate(const DataGeneratorOptions& options) {
            << HexEncode(WideToUtf8(options.prefix)) << '\t' << HexEncode(WideToUtf8(options.suffix)) << '\t'
            << HexEncode(WideToUtf8(options.separator)) << '\t' << HexEncode(WideToUtf8(options.charset)) << '\t'
            << HexEncode(WideToUtf8(options.repeatText)) << '\n';
-    return WriteAtomicFile(DataTemplatePath(), output.str());
+    return WriteDataFile(DataTemplatePath(), output.str());
 }
 
 bool LoadDataTemplate(DataGeneratorOptions& options) {
@@ -12716,7 +12853,7 @@ void SaveSearchState() {
            << g_search.optionWholeWord << '\t' << g_search.optionUseExcludes << '\t' << g_search.optionGitignore << '\t'
            << g_search.maxFileMb << '\t' << g_search.maxResults << '\t' << g_app.searchPanelHeight << '\t'
            << (g_app.searchPanelVisible ? 1 : 0) << '\n';
-    WriteAtomicFile(SearchStatePath(), output.str());
+    WriteDataFile(SearchStatePath(), output.str());
 }
 
 void FillCombo(HWND combo, const std::vector<std::wstring>& values) {
@@ -14128,7 +14265,7 @@ void ExecuteReplaceInFiles(const std::vector<bool>& checked, bool backup) {
     }
 
     if (backup && backupIndex > 0) {
-        WriteAtomicFile(backupDirectory / L"manifest.txt", manifest.str());
+        WriteDataFile(backupDirectory / L"manifest.txt", manifest.str());
         g_search.lastBackupDirectory = backupDirectory.wstring();
         PruneReplaceBackups();
     } else if (backup) {
@@ -18512,7 +18649,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (notification == EN_CHANGE && source != nullptr && !g_app.loading) {
             for (size_t index = 0; index < g_app.documents.size(); ++index) {
                 if (g_app.documents[index].editor == source) {
-                    const std::wstring currentText = GetEditorRawText(source);
+                    std::wstring currentText = GetEditorRawText(source);
                     const uint64_t hash = HashText(currentText);
                     if (hash == g_app.documents[index].textHash) break;  // formatting only
                     g_app.documents[index].textHash = hash;
@@ -18523,6 +18660,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                             currentText.begin() + std::min<size_t>(static_cast<size_t>(std::max<LONG>(0, caret.cpMin)), currentText.size()), L'\r'));
                         ShiftBookmarksForEdit(g_app.documents[index], CountRealLines(currentText), caretLine);
                     }
+                    StoreEditorText(source, hash, std::move(currentText));
                     const bool wasModified = g_app.documents[index].modified;
                     g_app.documents[index].modified = true;
                     MarkRecoveryDirty(static_cast<int>(index));
@@ -18533,11 +18671,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     RefreshGutter();
                     TabDocument& changed = g_app.documents[index];
                     if (!IsEditorImeComposing(source)) {
-                        ApplyCurrentLineHighlight(changed, true);
-                        ApplyBracketMatchHighlight(changed, true);
+                        ApplyBracketMatchHighlight(changed, true);  // re-applies the line highlight too
                     }
                     NormalizeBookmarks(changed);
-                    changed.syntaxStale = true;  // tokens no longer match; scrolling re-tokenizes
+                    changed.syntaxStale = true;  // tokens no longer match; the timer below re-tokenizes
                     if (EffectiveLanguage(changed) != kLanguagePlain || changed.syntaxHadColors ||
                         (changed.untitled && changed.language == kLanguageAuto)) {
                         SetTimer(window, kTimerHighlight, kHighlightDelayMs, nullptr);  // restarts on each keystroke
@@ -19207,7 +19344,50 @@ int RunSelfTests() {
 
 } // namespace
 
+
+// TEMPORARY hang sampler: writes RVAs of the main thread's stack to a file.
+unsigned __stdcall HangSampler(void* mainThreadHandle) {
+    HANDLE mainThread = static_cast<HANDLE>(mainThreadHandle);
+    const DWORD64 base = reinterpret_cast<DWORD64>(GetModuleHandleW(nullptr));
+    FILE* out = nullptr;
+    _wfopen_s(&out, L"D:\\tmp\\hangtrace.txt", L"w");
+    if (!out) return 0;
+    for (int sample = 0; sample < 6000; ++sample) {
+        Sleep(15);
+        SuspendThread(mainThread);
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(mainThread, &context)) {
+            fprintf(out, "S%d:", sample);
+            for (int frame = 0; frame < 48 && context.Rip; ++frame) {
+                DWORD64 imageBase = 0;
+                PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+                if (imageBase == base) fprintf(out, " %llx", context.Rip - base);
+                else fprintf(out, " .");
+                if (!function) {
+                    context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);
+                    context.Rsp += 8;
+                } else {
+                    void* handlerData = nullptr;
+                    DWORD64 establisher = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+                }
+            }
+            fprintf(out, "\n");
+            fflush(out);
+        }
+        ResumeThread(mainThread);
+    }
+    fclose(out);
+    return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCommand) {
+    if (GetEnvironmentVariableW(L"MCN_TRACE", nullptr, 0) > 0) {
+        HANDLE self = nullptr;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        _beginthreadex(nullptr, 0, HangSampler, self, 0, nullptr);
+    }
     (void)commandLine;
     g_app.instance = instance;
     InitializeShortcutBindings();
