@@ -290,6 +290,7 @@ struct TabDocument {
     bool syntaxHadColors = false;
     uint64_t textHash = 0;       // to tell real edits from formatting-only EN_CHANGE
     std::vector<int> bookmarks;  // 1-based logical line numbers
+    int highlightedLine = -1;
 };
 
 struct ClosedTab {
@@ -469,6 +470,7 @@ std::unordered_map<HWND, WNDPROC> g_editorProcs;
 
 std::wstring GetWindowTextValue(HWND window);
 void ApplyEditorTheme(HWND editor);
+void ApplyCurrentLineHighlight(TabDocument& document, bool force = false);
 void HighlightDocument(const TabDocument& document);
 void HighlightDocument(TabDocument& document);
 void SyntaxColorVisible(TabDocument& document);
@@ -735,9 +737,11 @@ void ApplyThemeToEditors(bool rehighlight = true) {
     g_app.windowBrush = CreateSolidBrush(palette.windowBackground);
     g_app.controlBrush = CreateSolidBrush(palette.controlBackground);
     g_app.statusBrush = CreateSolidBrush(palette.statusBackground);
-    for (const TabDocument& document : g_app.documents) {
+    for (TabDocument& document : g_app.documents) {
         ApplyEditorTheme(document.editor);
+        document.highlightedLine = -1;
         if (rehighlight) HighlightDocument(document);
+        ApplyCurrentLineHighlight(document);
     }
     if (g_app.gutter) InvalidateRect(g_app.gutter, nullptr, TRUE);
     ApplyMenuColorMode();
@@ -932,6 +936,15 @@ public:
         ITextFont* font = nullptr;
         if (SUCCEEDED(range_->GetFont(&font)) && font) {
             font->SetForeColor(static_cast<long>(color));
+            font->Release();
+        }
+    }
+
+    void SetBackColor(LONG start, LONG end, COLORREF color) {
+        if (!range_ || FAILED(range_->SetRange(start, end))) return;
+        ITextFont* font = nullptr;
+        if (SUCCEEDED(range_->GetFont(&font)) && font) {
+            font->SetBackColor(static_cast<long>(color));
             font->Release();
         }
     }
@@ -2151,6 +2164,63 @@ void SyntaxOnViewChanged(HWND editor) {
     }
 }
 
+COLORREF CurrentLineHighlightColor() {
+    const ThemePalette& palette = CurrentPalette();
+    // Keep the current line close to the editor surface so it is visible
+    // without competing with syntax colours or selected text.
+    const int amount = g_app.darkTheme ? 12 : 8;
+    const auto blend = [amount](BYTE a, BYTE b) -> BYTE {
+        return static_cast<BYTE>(std::clamp(static_cast<int>(a) +
+            (static_cast<int>(b) - static_cast<int>(a)) * amount / 100, 0, 255));
+    };
+    return RGB(blend(GetRValue(palette.editorBackground), GetRValue(palette.accent)),
+        blend(GetGValue(palette.editorBackground), GetGValue(palette.accent)),
+        blend(GetBValue(palette.editorBackground), GetBValue(palette.accent)));
+}
+
+void ApplyCurrentLineHighlight(TabDocument& document, bool force) {
+    HWND editor = document.editor;
+    if (!editor || !IsWindow(editor) || !IsWindowVisible(editor)) return;
+
+    CHARRANGE selection{};
+    SendMessageW(editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const LONG length = static_cast<LONG>(GetWindowTextLengthW(editor));
+    const LONG caret = std::clamp(selection.cpMin, 0L, length);
+    const int lineIndex = static_cast<int>(SendMessageW(editor, EM_EXLINEFROMCHAR, 0, caret));
+    if (lineIndex < 0) return;
+    const int line = lineIndex + 1;
+    if (!force && document.highlightedLine == line) return;
+
+    const auto lineRange = [editor, length](int zeroBasedLine) -> std::pair<LONG, LONG> {
+        if (zeroBasedLine < 0) return {0, 0};
+        LONG start = static_cast<LONG>(SendMessageW(editor, EM_LINEINDEX,
+            static_cast<WPARAM>(zeroBasedLine), 0));
+        if (start < 0) return {0, 0};
+        LONG end = static_cast<LONG>(SendMessageW(editor, EM_LINEINDEX,
+            static_cast<WPARAM>(zeroBasedLine + 1), 0));
+        if (end < 0) end = length;
+        return {std::min(start, length), std::max(std::min(end, length), start)};
+    };
+
+    EditorEventMute mute(editor);
+    TextDocumentRef tom(editor);
+    if (!tom) return;
+    long freezeCount = 0;
+    tom.document()->Undo(tomSuspend, nullptr);
+    tom.document()->Freeze(&freezeCount);
+    if (document.highlightedLine > 0) {
+        const auto [oldStart, oldEnd] = lineRange(document.highlightedLine - 1);
+        if (oldEnd > oldStart) tom.SetBackColor(oldStart, oldEnd, EditorBackground());
+    }
+    const auto [newStart, newEnd] = lineRange(lineIndex);
+    if (newEnd > newStart) tom.SetBackColor(newStart, newEnd, CurrentLineHighlightColor());
+    tom.document()->Unfreeze(&freezeCount);
+    tom.document()->Undo(tomResume, nullptr);
+    document.highlightedLine = line;
+    SendMessageW(editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    InvalidateRect(editor, nullptr, FALSE);
+}
+
 // Re-colouring after typing pauses.
 constexpr UINT kTimerHighlight = 4102;
 constexpr UINT kHighlightDelayMs = 250;
@@ -3094,6 +3164,7 @@ void SelectTab(int index) {
     SetFocus(document.editor);
     RestoreEditorState(document);
     SyntaxColorVisible(document);
+    ApplyCurrentLineHighlight(document);
     EnsureTabVisible(index);
     InvalidateToolbar();
     if (g_app.showLineNumbers && GutterWidthFor(document.editor) != g_app.gutterWidth) LayoutChildren(g_app.window);
@@ -5037,6 +5108,7 @@ void ReloadDocumentFromDisk(int index) {
     document.encoding = encoding;
     document.lineEnding = lineEnding;
     document.modified = false;
+    document.highlightedLine = -1;
     document.textHash = HashText(GetEditorRawText(document.editor));
     document.fileTimestamp = FileTimestamp(document.path);
     MarkRecoveryDirty(index);
@@ -5046,6 +5118,7 @@ void ReloadDocumentFromDisk(int index) {
     selection.cpMin = std::min(selection.cpMin, length);
     selection.cpMax = std::min(selection.cpMax, length);
     SendMessageW(document.editor, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    ApplyCurrentLineHighlight(document);
     UpdateTabTitle(index);
     UpdateStatusBar();
     RefreshGutter();
@@ -16505,6 +16578,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     UpdateHorizontalScrollbar(source);
                     RefreshGutter();
                     TabDocument& changed = g_app.documents[index];
+                    ApplyCurrentLineHighlight(changed, true);
                     NormalizeBookmarks(changed);
                     changed.syntaxStale = true;  // tokens no longer match; scrolling re-tokenizes
                     if (EffectiveLanguage(changed) != kLanguagePlain || changed.syntaxHadColors ||
@@ -16727,6 +16801,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             UpdateStatusBar();
             ToolboxOnSelectionChanged();
             RefreshGutter();  // current-line number follows the caret
+            if (TabDocument* document = ActiveDocument()) ApplyCurrentLineHighlight(*document);
             return 0;
         }
         return 0;
