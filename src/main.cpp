@@ -1064,6 +1064,7 @@ private:
 
 void DetectFoldRegions(TabDocument& document) {
     if (!document.editor) return;
+    if (document.largeFileMode) return;
     const std::wstring text = GetEditorRawText(document.editor);
     const uint64_t hash = HashText(text);
     if (document.foldTextHash == hash && !document.folds.empty()) return;
@@ -4334,6 +4335,13 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     ApplyEditorTheme(document.editor);
     ApplyEditorLineSpacing(document.editor);
     ApplyWordWrap(document.editor);
+    document.largeFileMode = text.size() >= (8ull << 20);
+    if (document.largeFileMode) {
+        // RichEdit's undo journal can otherwise duplicate a large buffer for
+        // every edit. The document remains fully editable and is saved by the
+        // normal path; only the memory-heavy journal is disabled.
+        SendMessageW(document.editor, EM_SETUNDOLIMIT, 0, 0);
+    }
     DetectFoldRegions(document);
     if (LanguageFromPath(document.path) == kLanguagePlain) document.sniffedLanguage = SniffLanguage(text);
     // Colours are painted when the tab is shown (only the visible part).
@@ -4342,13 +4350,6 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     // Enable change/scroll notifications only after the initial text is in,
     // so loading a file does not mark it as modified.
     document.textHash = HashText(GetEditorRawText(document.editor));
-    document.largeFileMode = text.size() >= (8ull << 20);
-    if (document.largeFileMode) {
-        // RichEdit's undo journal can otherwise duplicate a large buffer for
-        // every edit. The document remains fully editable and is saved by the
-        // normal path; only the memory-heavy journal is disabled.
-        SendMessageW(document.editor, EM_SETUNDOLIMIT, 0, 0);
-    }
     SendMessageW(document.editor, EM_SETEVENTMASK, 0, kEditorEventMask);
     ShowWindow(document.editor, SW_HIDE);
 
