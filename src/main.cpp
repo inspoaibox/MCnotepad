@@ -35,6 +35,7 @@
 #include <iterator>
 #include <random>
 #include <chrono>
+#include <source_location>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -496,6 +497,34 @@ struct AppState {
 };
 
 AppState g_app;
+
+// While a dialog is open, work that can change or reorder the tabs (reloading
+// a file changed elsewhere, opening files sent by another instance) waits:
+// the dialog may hold a reference to a tab or a range in its text.
+int g_modalDepth = 0;
+bool g_deferredExternalCheck = false;
+bool g_deferredOpenFiles = false;
+
+bool AppIsInModalState() {
+    return g_modalDepth > 0 || (g_app.window && !IsWindowEnabled(g_app.window));
+}
+
+void ResumeDeferredWork() {
+    if (AppIsInModalState() || !g_app.window) return;
+    if (g_deferredExternalCheck) { g_deferredExternalCheck = false; PostMessageW(g_app.window, kMessageCheckExternalChanges, 0, 0); }
+    if (g_deferredOpenFiles) { g_deferredOpenFiles = false; PostMessageW(g_app.window, kMessageOpenPendingFiles, 0, 0); }
+}
+
+// Marks a custom modal message loop.
+struct ModalScope {
+    ModalScope() { ++g_modalDepth; }
+    ~ModalScope() {
+        --g_modalDepth;
+        ResumeDeferredWork();
+    }
+    ModalScope(const ModalScope&) = delete;
+    ModalScope& operator=(const ModalScope&) = delete;
+};
 
 struct ShortcutBinding {
     int command = 0;
@@ -1357,54 +1386,74 @@ void CreateRectangleCarets() {
     InvalidateRect(document->editor, nullptr, FALSE);
 }
 
-bool ApplyMultiCaretReplacement(HWND editor, const std::wstring& replacement) {
+// Tells the main window that the text changed. Multi-caret edits run with
+// the editor's notifications muted (one per caret would re-highlight and
+// re-hash each time), so this one call marks the tab modified, dirties the
+// recovery snapshot and schedules re-highlighting.
+void NotifyEditorTextChanged(HWND editor) {
+    HWND parent = GetParent(editor);
+    if (!parent) return;
+    SendMessageW(parent, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(editor), EN_CHANGE), reinterpret_cast<LPARAM>(editor));
+}
+
+LONG EditorTextLength(HWND editor) {
+    GETTEXTLENGTHEX query{GTL_NUMCHARS | GTL_PRECISE, 1200};
+    return static_cast<LONG>(std::max<LRESULT>(0, SendMessageW(editor, EM_GETTEXTLENGTHEX, reinterpret_cast<WPARAM>(&query), 0)));
+}
+
+// Edits every caret's range, from the last one back so earlier positions stay
+// valid, then moves each caret by the net change of the ranges before it.
+// `removeAround` widens an empty range by one character (Backspace/Delete).
+bool EditAtMultiCarets(HWND editor, const std::wstring& replacement, int removeAround) {
     TabDocument* document = ActiveDocument();
     if (!document || document->multiCarets.size() < 2) return false;
-    std::vector<MultiCaret> ranges = document->multiCarets;
-    std::sort(ranges.begin(), ranges.end(), [](const MultiCaret& left, const MultiCaret& right) {
-        return std::min(left.anchor, left.caret) > std::min(right.anchor, right.caret);
-    });
-    EditorEventMute mute(editor);
-    for (const MultiCaret& range : ranges) {
-        const LONG start = std::min(range.anchor, range.caret);
-        const LONG end = std::max(range.anchor, range.caret);
-        SendMessageW(editor, EM_SETSEL, start, end);
-        SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
+    const LONG length = EditorTextLength(editor);
+    struct Edit { LONG start, end; };
+    std::vector<Edit> edits;
+    for (const MultiCaret& caret : document->multiCarets) {
+        LONG start = std::clamp(std::min(caret.anchor, caret.caret), 0L, length);
+        LONG end = std::clamp(std::max(caret.anchor, caret.caret), 0L, length);
+        if (start == end && removeAround < 0) start = std::max<LONG>(0, start - 1);
+        if (start == end && removeAround > 0) end = std::min(length, end + 1);
+        edits.push_back({start, end});
     }
-    for (MultiCaret& range : document->multiCarets) {
-        range.anchor = range.caret = std::min(range.anchor, range.caret) + static_cast<LONG>(replacement.size());
+    std::sort(edits.begin(), edits.end(), [](const Edit& a, const Edit& b) { return a.start < b.start; });
+    // Overlapping ranges (two carets next to each other) become one edit.
+    std::vector<Edit> merged;
+    for (const Edit& edit : edits) {
+        if (!merged.empty() && edit.start <= merged.back().end) merged.back().end = std::max(merged.back().end, edit.end);
+        else merged.push_back(edit);
     }
-    SendMessageW(editor, EM_SETSEL, document->multiCarets.front().caret, document->multiCarets.front().caret);
+    {
+        EditorEventMute mute(editor);
+        for (auto it = merged.rbegin(); it != merged.rend(); ++it) {
+            SendMessageW(editor, EM_SETSEL, it->start, it->end);
+            SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
+        }
+    }
+    const LONG inserted = static_cast<LONG>(replacement.size());
+    std::vector<MultiCaret> carets;
+    LONG shift = 0;
+    for (const Edit& edit : merged) {
+        const LONG position = edit.start + shift + inserted;
+        carets.push_back({position, position});
+        shift += inserted - (edit.end - edit.start);
+    }
+    document->multiCarets = std::move(carets);
+    if (document->multiCarets.size() < 2) document->multiCarets.clear();
+    const LONG caret = document->multiCarets.empty() ? merged.front().start + inserted : document->multiCarets.front().caret;
+    SendMessageW(editor, EM_SETSEL, caret, caret);
+    NotifyEditorTextChanged(editor);
     InvalidateRect(editor, nullptr, FALSE);
     return true;
 }
 
+bool ApplyMultiCaretReplacement(HWND editor, const std::wstring& replacement) {
+    return EditAtMultiCarets(editor, replacement, 0);
+}
+
 bool ApplyMultiCaretBackspace(HWND editor, bool forward) {
-    TabDocument* document = ActiveDocument();
-    if (!document || document->multiCarets.size() < 2) return false;
-    std::vector<MultiCaret> ranges = document->multiCarets;
-    std::sort(ranges.begin(), ranges.end(), [](const MultiCaret& left, const MultiCaret& right) {
-        return std::min(left.anchor, left.caret) > std::min(right.anchor, right.caret);
-    });
-    EditorEventMute mute(editor);
-    for (const MultiCaret& range : ranges) {
-        LONG start = std::min(range.anchor, range.caret);
-        LONG end = std::max(range.anchor, range.caret);
-        if (start == end) {
-            if (forward) end = start + 1;
-            else start = std::max<LONG>(0, start - 1);
-        }
-        SendMessageW(editor, EM_SETSEL, start, end);
-        SendMessageW(editor, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L""));
-    }
-    for (MultiCaret& range : document->multiCarets) {
-        LONG position = std::min(range.anchor, range.caret);
-        if (range.anchor == range.caret && !forward) position = std::max<LONG>(0, position - 1);
-        range.anchor = range.caret = position;
-    }
-    SendMessageW(editor, EM_SETSEL, document->multiCarets.front().caret, document->multiCarets.front().caret);
-    InvalidateRect(editor, nullptr, FALSE);
-    return true;
+    return EditAtMultiCarets(editor, L"", forward ? 1 : -1);
 }
 
 void DrawMultiCaretOverlay(HWND editor) {
@@ -3359,6 +3408,36 @@ bool EnsureDirectory(const fs::path& path) {
     return !error;
 }
 
+fs::path GetDataDirectory();
+
+// One running instance per data folder: copies started with another
+// LOCALAPPDATA (portable/test setups) don't hand their files to a window that
+// keeps a different session.
+constexpr wchar_t kDataKeyProperty[] = L"MCnotepad.DataKey";
+
+UINT_PTR DataDirectoryKey() {
+    std::wstring path = GetDataDirectory().wstring();
+    for (wchar_t& c : path) c = towlower(c);
+    uint32_t hash = 2166136261u;
+    for (const wchar_t c : path) { hash ^= c; hash *= 16777619u; }
+    return static_cast<UINT_PTR>(hash | 1u);
+}
+
+std::wstring SingleInstanceMutexName() {
+    wchar_t suffix[16]{};
+    swprintf_s(suffix, L".%08x", static_cast<unsigned>(DataDirectoryKey()));
+    return std::wstring(kSingleInstanceMutex) + suffix;
+}
+
+HWND FindInstanceWindow() {
+    const UINT_PTR key = DataDirectoryKey();
+    for (HWND window = FindWindowExW(nullptr, nullptr, kWindowClass, nullptr); window;
+         window = FindWindowExW(nullptr, window, kWindowClass, nullptr)) {
+        if (reinterpret_cast<UINT_PTR>(GetPropW(window, kDataKeyProperty)) == key) return window;
+    }
+    return nullptr;
+}
+
 fs::path GetDataDirectory() {
     wchar_t buffer[MAX_PATH]{};
     const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, MAX_PATH);
@@ -3466,28 +3545,117 @@ bool WriteBinaryFile(const fs::path& path, std::string_view bytes) {
     return success;
 }
 
-bool WriteAtomicFile(const fs::path& path, std::string_view bytes) {
-    const fs::path temporaryPath = path.wstring() + L".tmp";
-    if (!WriteBinaryFile(temporaryPath, bytes)) {
-        return false;
+// Overwrites an existing file's contents where it is (keeps hard links,
+// attributes, ACLs and streams). Not atomic: only used when a replace isn't possible.
+bool WriteFileInPlace(const fs::path& path, std::string_view bytes) {
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    bool success = true;
+    size_t written = 0;
+    while (success && written < bytes.size()) {
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(bytes.size() - written, 1u << 20));
+        DWORD completed = 0;
+        success = WriteFile(handle, bytes.data() + written, chunk, &completed, nullptr) && completed > 0;
+        written += completed;
     }
+    success = success && SetEndOfFile(handle) && FlushFileBuffers(handle);
+    CloseHandle(handle);
+    return success;
+}
 
-    if (MoveFileExW(temporaryPath.c_str(), path.c_str(),
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        return true;
-    }
+DWORD HardLinkCount(const fs::path& path) {
+    HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return 1;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const DWORD links = GetFileInformationByHandle(handle, &info) ? info.nNumberOfLinks : 1;
+    CloseHandle(handle);
+    return links;
+}
 
+// Writes a file so that a crash never leaves it half-written:
+// - the new content goes to a uniquely named hidden temp file next to it,
+//   then ReplaceFileW swaps it in, keeping the original's attributes, ACLs,
+//   creation time and alternate streams;
+// - a symbolic link is followed, so the link's target is updated;
+// - hard-linked files, and folders where new files can't be created, are
+//   written in place instead.
+bool WriteAtomicFile(const fs::path& requestedPath, std::string_view bytes) {
     std::error_code error;
-    fs::remove(temporaryPath, error);
-    return false;
+    fs::path path = requestedPath;
+    if (fs::is_symlink(path, error)) {
+        const fs::path target = fs::canonical(path, error);
+        if (!error) path = target;
+    }
+    const bool exists = fs::exists(path, error);
+    if (exists && HardLinkCount(path) > 1) return WriteFileInPlace(path, bytes);
+
+    wchar_t suffix[32]{};
+    swprintf_s(suffix, L".mcn-%08lx%04lx.tmp", GetTickCount(), GetCurrentProcessId() & 0xFFFF);
+    const fs::path temporaryPath = path.wstring() + suffix;
+    if (!WriteBinaryFile(temporaryPath, bytes)) {
+        fs::remove(temporaryPath, error);
+        return exists && WriteFileInPlace(path, bytes);
+    }
+    SetFileAttributesW(temporaryPath.c_str(), FILE_ATTRIBUTE_HIDDEN);
+    bool replaced = false;
+    if (exists) {
+        replaced = ReplaceFileW(path.c_str(), temporaryPath.c_str(), nullptr,
+            REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS, nullptr, nullptr) != FALSE;
+        if (!replaced) {
+            // e.g. no permission to replace: fall back to rewriting the original.
+            fs::remove(temporaryPath, error);
+            return WriteFileInPlace(path, bytes);
+        }
+    } else {
+        SetFileAttributesW(temporaryPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+        replaced = MoveFileExW(temporaryPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    }
+    if (!replaced) fs::remove(temporaryPath, error);
+    return replaced;
 }
 
 // Decodes file bytes and reports which encoding was found:
 // BOM (UTF-8 / UTF-16 LE / UTF-16 BE) first, then strict UTF-8, otherwise the
 // system ANSI code page.
+// UTF-16 text without a BOM (PowerShell and registry exports, some logs):
+// mostly-ASCII text has a zero in every other byte. Returns 2 (LE), 3 (BE) or 0.
+int GuessBomlessUtf16(const std::vector<char>& bytes) {
+    const size_t pairs = std::min<size_t>(bytes.size(), 65536) / 2;
+    if (pairs < 2) return 0;
+    size_t zeroEven = 0, zeroOdd = 0;
+    for (size_t i = 0; i < pairs; ++i) {
+        zeroEven += bytes[2 * i] == 0;
+        zeroOdd += bytes[2 * i + 1] == 0;
+    }
+    if (zeroOdd * 10 >= pairs * 3 && zeroEven * 20 <= pairs) return 2;
+    if (zeroEven * 10 >= pairs * 3 && zeroOdd * 20 <= pairs) return 3;
+    return 0;
+}
+
+std::wstring DecodeUtf16Bytes(const std::vector<char>& bytes, size_t offset, bool bigEndian) {
+    std::wstring result;
+    result.reserve((bytes.size() - offset) / 2);
+    for (size_t index = offset; index + 1 < bytes.size(); index += 2) {
+        const unsigned char first = static_cast<unsigned char>(bytes[index]);
+        const unsigned char second = static_cast<unsigned char>(bytes[index + 1]);
+        result.push_back(static_cast<wchar_t>(bigEndian ? (first << 8) | second : (second << 8) | first));
+    }
+    return result;
+}
+
 std::wstring DecodeTextBytes(const std::vector<char>& bytes, int* detectedEncoding = nullptr) {
     int ignored = 0;
     int& encoding = detectedEncoding ? *detectedEncoding : ignored;
+    const bool hasBom = bytes.size() >= 2 &&
+        ((static_cast<unsigned char>(bytes[0]) == 0xFF && static_cast<unsigned char>(bytes[1]) == 0xFE) ||
+         (static_cast<unsigned char>(bytes[0]) == 0xFE && static_cast<unsigned char>(bytes[1]) == 0xFF));
+    if (!hasBom) {
+        if (const int utf16 = GuessBomlessUtf16(bytes)) {
+            encoding = utf16;  // saved back with a BOM, which every reader accepts
+            return DecodeUtf16Bytes(bytes, 0, utf16 == 3);
+        }
+    }
     if (bytes.size() >= 2 &&
         static_cast<unsigned char>(bytes[0]) == 0xFF &&
         static_cast<unsigned char>(bytes[1]) == 0xFE) {
@@ -3552,6 +3720,14 @@ int DetectLineEnding(std::wstring_view text, int fallback) {
     }
     return fallback;
 }
+
+bool HasNulCharacter(const std::wstring& text) {
+    return text.find(L'\0') != std::wstring::npos;
+}
+
+constexpr wchar_t kNulFileMessage[] =
+    L"这个文件包含 NUL 字符（多半是二进制文件或编码无法识别）。\n\n"
+    L"在编辑器中打开会在第一个 NUL 处截断，保存后文件会损坏，所以没有打开。";
 
 bool ReadTextFile(const fs::path& path, std::wstring& text,
     int* encoding = nullptr, int* lineEnding = nullptr) {
@@ -4357,7 +4533,7 @@ void RemoveOrphanSnapshots() {
         if (!it->is_regular_file(typeError)) continue;
         const fs::path file = it->path();
         const std::wstring name = file.filename().wstring();
-        if (name.ends_with(L".snapshot.tmp")) {
+        if (name.ends_with(L".snapshot.tmp") || (name.find(L".snapshot.mcn-") != std::wstring::npos && name.ends_with(L".tmp"))) {
             orphans.push_back(file);  // interrupted atomic write
         } else if (name.ends_with(L".snapshot") && !IsSnapshotInUse(file)) {
             orphans.push_back(file);
@@ -4693,6 +4869,10 @@ bool OpenFileInNewTab(const fs::path& path) {
     DocumentFormat format;
     if (!ReadTextFile(path, text, &format.encoding, &format.lineEnding)) {
         MessageBoxW(g_app.window, L"文件打开失败，请检查路径和权限。", kWindowTitle, MB_ICONERROR);
+        return false;
+    }
+    if (HasNulCharacter(text)) {
+        MessageBoxW(g_app.window, (path.filename().wstring() + L"\n\n" + kNulFileMessage).c_str(), kWindowTitle, MB_ICONWARNING);
         return false;
     }
     format.fileTimestamp = FileTimestamp(path);
@@ -5114,6 +5294,10 @@ void LoadPersistedSession() {
     int persistedShowTrayIcon = g_app.showTrayIcon ? 1 : 0;
     std::wstring persistedFontFamily = g_app.fontFamily;
     std::vector<SessionEntry> entries;
+    // Only a session file that was read completely may decide which recovery
+    // snapshots are orphans; otherwise unsaved work would be deleted.
+    bool sawHeader = false;
+    size_t tabLines = 0;
 
     while (std::getline(buffer, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -5121,6 +5305,8 @@ void LoadPersistedSession() {
         if (parts.empty()) {
             continue;
         }
+        if (parts[0] == "MCSESSION") sawHeader = true;
+        if (parts[0] == "TAB") ++tabLines;
 
         if (parts[0] == "ACTIVE" && parts.size() >= 2) {
             ParseInt(parts[1], activeIndex);
@@ -5228,6 +5414,13 @@ void LoadPersistedSession() {
             entries.push_back(std::move(entry));
         }
     }
+    const bool sessionComplete = sawHeader && tabLines == entries.size();
+    if (!sessionComplete) {
+        // Keep the unreadable file for inspection; the next save replaces session.dat.
+        std::error_code copyError;
+        fs::copy_file(g_app.sessionPath, fs::path(g_app.sessionPath).replace_extension(L".broken"),
+            fs::copy_options::overwrite_existing, copyError);
+    }
 
     g_app.theme = static_cast<ThemeKind>(std::clamp(persistedTheme, 0, 3));
     g_app.lineSpacingPercent = std::clamp(persistedLineSpacing, 50, 300);
@@ -5292,6 +5485,7 @@ void LoadPersistedSession() {
             }
         }
 
+        if (HasNulCharacter(text)) continue;  // file is no longer text; leave it untouched on disk
         const int index = CreateDocument(entry.path, entry.title, std::move(text), entry.untitled,
             entry.modified, entry.caret, entry.anchor, entry.firstLine, &entry.snapshot, entry.format);
         if (index >= 0) {
@@ -5306,7 +5500,7 @@ void LoadPersistedSession() {
         }
     }
     g_app.loading = false;
-    RemoveOrphanSnapshots();
+    if (sessionComplete) RemoveOrphanSnapshots();
     LayoutChildren(g_app.window);
 
     if (g_app.documents.empty()) {
@@ -6359,6 +6553,10 @@ void ReloadDocumentFromDisk(int index) {
     int lineEnding = 0;
     if (!ReadTextFile(document.path, text, &encoding, &lineEnding)) {
         MessageBoxW(g_app.window, L"重新加载失败，请检查文件权限。", kWindowTitle, MB_ICONERROR);
+        return;
+    }
+    if (HasNulCharacter(text)) {
+        MessageBoxW(g_app.window, (L"没有重新加载：" + std::wstring(kNulFileMessage)).c_str(), kWindowTitle, MB_ICONWARNING);
         return;
     }
     CHARRANGE selection{};
@@ -8684,6 +8882,7 @@ bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels
         SetFocus(state.combos[0]);
     }
     MSG message{};
+    ModalScope modalScope;
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (!IsDialogMessageW(dialog, &message)) {
             TranslateMessage(&message);
@@ -9356,6 +9555,7 @@ void OpenPrefixSuffixDialog() {
     if (!dialog) return;
     ApplyWindowFrameTheme(dialog); EnableWindow(g_app.window, FALSE); ShowWindow(dialog, SW_SHOW); PrefixSuffixRefreshPreview(dialog, state);
     MSG message{};
+    ModalScope modalScope;
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (!IsDialogMessageW(dialog, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
     }
@@ -10218,6 +10418,7 @@ void OpenDataGeneratorDialog(int command) {
     ApplyWindowFrameTheme(dialog);
     EnableWindow(g_app.window, FALSE); ShowWindow(dialog, SW_SHOW); SetFocus(state.edits.empty() ? state.preview : state.edits[0]);
     MSG message{};
+    ModalScope modalScope;
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (!IsDialogMessageW(dialog, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
     }
@@ -10674,6 +10875,7 @@ int ConfirmChange(const wchar_t* title, const std::wstring& before, const std::w
     ShowWindow(dialog, SW_SHOW);
     SetFocus(apply);
     MSG message{};
+    ModalScope modalScope;
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (!IsDialogMessageW(dialog, &message)) {
             TranslateMessage(&message);
@@ -11993,6 +12195,7 @@ void SearchOneFile(SearchJob& job, const SearchFileEntry& entry) {
         job.AddError(entry.path, L"已跳过：文件大于 " + std::to_wstring(options.maxFileBytes >> 20) + L" MB");
         return;
     }
+    const uint64_t timestampBeforeRead = FileTimestamp(entry.path);
     std::vector<char> bytes;
     if (!ReadBinaryFile(entry.path, bytes)) {
         job.AddError(entry.path, L"无法读取（可能没有权限或正被占用）");
@@ -12010,8 +12213,20 @@ void SearchOneFile(SearchJob& job, const SearchFileEntry& entry) {
     result->path = entry.path;
     result->display = entry.display;
     result->size = bytes.size();
-    result->timestamp = FileTimestamp(entry.path);
+    result->timestamp = timestampBeforeRead;
     const std::wstring text = DecodeTextBytes(bytes, &result->encoding);
+    if (job.matcher.options().forReplace) {
+        // Replacing rewrites the whole file, so its bytes must survive a
+        // decode/encode round trip; a damaged UTF-8 byte or a character the
+        // ANSI code page can't map would otherwise change text nobody matched.
+        std::string reencoded;
+        if (!EncodeTextBytes(text, result->encoding, reencoded) || reencoded.size() != bytes.size() ||
+            memcmp(reencoded.data(), bytes.data(), bytes.size()) != 0) {
+            job.AddError(entry.path, L"已跳过替换：文件按 " + std::wstring(kEncodingNames[std::clamp(result->encoding, 0, kEncodingCount - 1)]) +
+                L" 读写无法保持原样（可能含损坏的字节或混合编码），替换会改动未匹配的内容");
+            return;
+        }
+    }
     const std::wstring normalized = NormalizeToLf(text, result->eol, result->mixedEol);
     SearchText(job, std::move(result), normalized);
 }
@@ -13696,6 +13911,7 @@ void ShowReplaceInFilesPreview() {
     ShowWindow(dialog, SW_SHOW);
     SetFocus(state.list);
     MSG message{};
+    ModalScope modalScope;
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (!IsDialogMessageW(dialog, &message)) {
             TranslateMessage(&message);
@@ -16847,7 +17063,8 @@ bool IndexLogBytes(const char* data, uint64_t size, LogIndex& index, const std::
 }
 
 std::pair<uint64_t, uint64_t> LogLineRange(const char* data, uint64_t size, const LogIndex& index, uint64_t line) {
-    uint64_t start = index.checkpoints[static_cast<size_t>(line / kLogCheckpointEvery)];
+    if (!data || line / kLogCheckpointEvery >= index.checkpoints.size()) return {0, 0};
+    uint64_t start = std::min(index.checkpoints[static_cast<size_t>(line / kLogCheckpointEvery)], size);
     for (uint64_t skip = line % kLogCheckpointEvery; skip > 0 && start < size; --skip) {
         const void* hit = memchr(data + start, '\n', static_cast<size_t>(size - start));
         start = hit ? static_cast<uint64_t>(static_cast<const char*>(hit) - data) + 1 : size;
@@ -17078,6 +17295,30 @@ void SetLogRowCount(LogViewer& log, bool keepPosition) {
 struct LogIndexResult { int generation; LogIndex index; bool ok; };
 struct LogFilterResult { int generation; std::vector<uint32_t> view; LogLineState endState; bool ok; };
 
+void StopLogWorker(LogViewer& log) {
+    log.cancel = true;
+    while (log.busy) Sleep(5);
+    log.cancel = false;
+}
+
+void StartLogIndex(LogViewer& log);
+
+void ReindexLog(LogViewer& log) {
+    StopLogWorker(log);
+    ++log.generation;  // results already posted by the old worker are ignored
+    log.indexed = false;
+    log.filtered = false;
+    log.view.clear();
+    log.index = LogIndex{};
+    ListView_SetItemCountEx(log.list, 0, 0);
+    if (!MapLogFile(log)) {
+        log.size = 0;
+        SetWindowTextW(log.status, L"无法读取文件（可能已被删除或正被独占）");
+        return;
+    }
+    StartLogIndex(log);
+}
+
 void StartLogIndex(LogViewer& log) {
     log.cancel = true;
     while (log.busy) Sleep(5);
@@ -17136,7 +17377,7 @@ void StartLogFilter(LogViewer& log) {
             if (end > start && data[end - 1] == '\r') --end;
             if (LogLineMatches(data + start, static_cast<size_t>(end - start), filter, result->endState)) result->view.push_back(static_cast<uint32_t>(line));
             start = next;
-            if ((line & 0x3FFFF) == 0 && line) {
+            if ((line & 0x3FFF) == 0 && line) {
                 if (*cancel) { result->ok = false; break; }
                 PostMessageW(window, kMessageLogProgress, generation, static_cast<LPARAM>(start * 1000 / std::max<uint64_t>(size, 1)));
             }
@@ -17201,14 +17442,15 @@ void PollLogTail(LogViewer& log) {
     const uint64_t newSize = static_cast<uint64_t>(size.QuadPart);
     if (newSize == log.size) return;
     if (newSize < log.size) {  // truncated or rotated: start over
-        MapLogFile(log);
-        log.index = LogIndex{};
-        StartLogIndex(log);
+        ReindexLog(log);
         return;
     }
     const uint64_t oldLines = log.index.Lines(log.size);
     const uint64_t firstChanged = oldLines > 0 && log.size > log.index.indexedEnd ? oldLines - 1 : oldLines;  // a partial line may have grown
-    if (!MapLogFile(log)) return;
+    if (!MapLogFile(log)) {
+        ReindexLog(log);  // keeps the view consistent and reports the problem
+        return;
+    }
     IndexLogBytes(log.data, log.size, log.index);
     if (log.filtered) {
         if (!log.view.empty() && log.view.back() >= firstChanged) log.view.pop_back();
@@ -17696,9 +17938,7 @@ bool LogViewerKey(HWND root, WPARAM key) {
     if (control && key == 'C' && GetFocus() == log->list) { CopyLogSelection(*log); return true; }
     if (control && key == 'F') { SetFocus(log->keyword); SendMessageW(log->keyword, EM_SETSEL, 0, -1); return true; }
     if (key == VK_F5) {
-        log->index = LogIndex{};
-        MapLogFile(*log);
-        StartLogIndex(*log);
+        ReindexLog(*log);
         return true;
     }
     if (key == VK_RETURN && GetFocus() != log->list) { ApplyLogFilterFromControls(*log); return true; }
@@ -17737,6 +17977,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     switch (message) {
     case WM_CREATE: {
         g_app.window = window;
+        SetPropW(window, kDataKeyProperty, reinterpret_cast<HANDLE>(DataDirectoryKey()));
         g_app.mainMenu = CreateApplicationMenu();
         g_app.dpi = GetDpiForWindow(window);
         CreateUiFonts();
@@ -18176,9 +18417,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (wParam) PostMessageW(window, kMessageCheckExternalChanges, 0, 0);
         return 0;
     case kMessageCheckExternalChanges:
+        if (AppIsInModalState()) { g_deferredExternalCheck = true; return 0; }
         CheckExternalChanges();
         return 0;
+    case WM_ENABLE:
+        if (wParam) ResumeDeferredWork();
+        return DefWindowProcW(window, message, wParam, lParam);
     case kMessageOpenPendingFiles: {
+        if (AppIsInModalState()) { g_deferredOpenFiles = true; return 0; }
         std::vector<std::wstring> files;
         files.swap(g_app.pendingOpenFiles);
         for (size_t f = 0; f < files.size(); ++f) {
@@ -18238,6 +18484,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         return 0;
     case WM_DESTROY:
+        RemovePropW(window, kDataKeyProperty);
         RemoveTrayIcon();
         DeleteObject(g_app.editorBrush);
         g_app.toolbarIconImages.clear();
@@ -18285,7 +18532,7 @@ void ForwardToRunningInstance() {
     // The first instance may still be starting up; give it a few seconds.
     HWND target = nullptr;
     for (int attempt = 0; attempt < 50 && target == nullptr; ++attempt) {
-        target = FindWindowW(kWindowClass, nullptr);
+        target = FindInstanceWindow();
         if (target == nullptr) Sleep(100);
     }
     if (target == nullptr) return;
@@ -18303,7 +18550,10 @@ void ForwardToRunningInstance() {
 }
 
 int RunSelfTests() {
-    const auto expect = [](bool condition) { return condition ? 0 : 1; };
+    const auto expect = [](bool condition, std::source_location where = std::source_location::current()) {
+        if (!condition) printf("self-test failed at line %u\n", static_cast<unsigned>(where.line()));
+        return condition ? 0 : 1;
+    };
     int failures = 0;
     failures += expect(FindMatchingBracket(L"{alpha [beta]}", 0) == 13);
     failures += expect(FindMatchingBracket(L"{alpha [beta]}", 12) == 7);
@@ -18392,6 +18642,56 @@ int RunSelfTests() {
                 value.find(L"[数据生成失败]") == std::wstring::npos && utf8Safe(value));
         }
     }
+    // UTF-16 without a BOM is recognised instead of being cut at the first NUL.
+    {
+        const std::string le("H\0i\0 \0\x2D\x4E", 8);  // "Hi " + U+4E2D, UTF-16 LE
+        std::vector<char> bytes(le.begin(), le.end());
+        int encoding = -1;
+        const std::wstring text = DecodeTextBytes(bytes, &encoding);
+        failures += expect(encoding == 2 && text == L"Hi \u4E2D");
+        std::vector<char> big{'\0', 'O', '\0', 'K'};
+        failures += expect(DecodeTextBytes(big, &encoding) == L"OK" && encoding == 3);
+        std::vector<char> ascii{'a', 'b', 'c', 'd'};
+        failures += expect(GuessBomlessUtf16(ascii) == 0);
+        failures += expect(HasNulCharacter(std::wstring(L"a\0b", 3)) && !HasNulCharacter(L"ab"));
+    }
+    // Replace in files only rewrites files whose bytes survive a round trip.
+    {
+        const std::string clean = "\xE4\xB8\xAD\xE6\x96\x87 ok";  // UTF-8 "中文 ok"
+        const std::string damaged = clean + "\xFF";
+        for (const std::string& sample : {clean, damaged}) {
+            std::vector<char> bytes(sample.begin(), sample.end());
+            int encoding = 0;
+            std::string again;
+            EncodeTextBytes(DecodeTextBytes(bytes, &encoding), encoding, again);
+            failures += expect((again == sample) == (sample == clean));
+        }
+    }
+    // Atomic save keeps attributes and hard links and leaves no temp files.
+    {
+        wchar_t tempRoot[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, tempRoot);
+        const fs::path folder = fs::path(tempRoot) / (L"mcnotepad-selftest-" + std::to_wstring(GetCurrentProcessId()));
+        std::error_code error;
+        fs::create_directories(folder, error);
+        const fs::path hidden = folder / L"hidden.txt";
+        failures += expect(WriteAtomicFile(hidden, "one"));
+        SetFileAttributesW(hidden.c_str(), FILE_ATTRIBUTE_HIDDEN);
+        failures += expect(WriteAtomicFile(hidden, "two"));
+        failures += expect((GetFileAttributesW(hidden.c_str()) & FILE_ATTRIBUTE_HIDDEN) != 0);
+        std::vector<char> read;
+        failures += expect(ReadBinaryFile(hidden, read) && std::string(read.begin(), read.end()) == "two");
+        const fs::path linked = folder / L"linked.txt";
+        if (CreateHardLinkW(linked.c_str(), hidden.c_str(), nullptr)) {
+            failures += expect(WriteAtomicFile(hidden, "three"));
+            failures += expect(ReadBinaryFile(linked, read) && std::string(read.begin(), read.end()) == "three");
+        }
+        size_t leftovers = 0;
+        for (const auto& entry : fs::directory_iterator(folder, error)) leftovers += entry.path().extension() == L".tmp";
+        failures += expect(leftovers == 0);
+        SetFileAttributesW(hidden.c_str(), FILE_ATTRIBUTE_NORMAL);
+        fs::remove_all(folder, error);
+    }
     return failures == 0 ? 0 : 1;
 }
 
@@ -18407,7 +18707,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
     }
 
     // Kept open for the lifetime of the process; the OS releases it on exit.
-    HANDLE singleInstance = CreateMutexW(nullptr, FALSE, kSingleInstanceMutex);
+    HANDLE singleInstance = CreateMutexW(nullptr, FALSE, SingleInstanceMutexName().c_str());
     if (singleInstance != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
         ForwardToRunningInstance();
         CloseHandle(singleInstance);
