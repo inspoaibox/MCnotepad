@@ -10921,7 +10921,8 @@ struct PreviewState {
     bool accepted = false;
     int choice = -1;
     int defaultMode = 1;
-    HWND view = nullptr;
+    HWND beforeView = nullptr;
+    HWND afterView = nullptr;
     HWND dontAsk = nullptr;
     bool stopPreviewing = false;
 };
@@ -10934,12 +10935,18 @@ LRESULT CALLBACK PreviewProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));
         return 0;
     case WM_SIZE: {
-        if (!state || !state->view) break;
+        if (!state || !state->beforeView || !state->afterView) break;
         const int width = LOWORD(lParam);
         const int height = HIWORD(lParam);
         const int bottom = height - Scale(48);
         MoveWindow(GetDlgItem(window, 100), Scale(16), Scale(12), width - Scale(32), Scale(22), TRUE);
-        MoveWindow(state->view, Scale(16), Scale(40), width - Scale(32), std::max(0, bottom - Scale(48)), TRUE);
+        const int paneTop = Scale(64);
+        const int paneHeight = std::max(0, bottom - paneTop);
+        const int paneWidth = std::max(0, (width - Scale(40)) / 2);
+        MoveWindow(GetDlgItem(window, 101), Scale(16), Scale(40), paneWidth, Scale(20), TRUE);
+        MoveWindow(GetDlgItem(window, 102), Scale(24) + paneWidth, Scale(40), paneWidth, Scale(20), TRUE);
+        MoveWindow(state->beforeView, Scale(16), paneTop, paneWidth, paneHeight, TRUE);
+        MoveWindow(state->afterView, Scale(24) + paneWidth, paneTop, paneWidth, paneHeight, TRUE);
         MoveWindow(state->dontAsk, Scale(16), bottom + Scale(12), Scale(220), Scale(24), TRUE);
         int x = width - Scale(16 + 82);
         MoveWindow(GetDlgItem(window, IDCANCEL), x, bottom + Scale(10), Scale(82), Scale(28), TRUE);
@@ -10997,6 +11004,24 @@ COLORREF Blend(COLORREF a, COLORREF b, int percentB) {
     return RGB((GetRValue(a) * (100 - percentB) + GetRValue(b) * percentB) / 100,
                (GetGValue(a) * (100 - percentB) + GetGValue(b) * percentB) / 100,
                (GetBValue(a) * (100 - percentB) + GetBValue(b) * percentB) / 100);
+}
+
+void FillPreviewText(HWND view, const std::wstring& text) {
+    if (!view) return;
+    const ThemePalette& palette = CurrentPalette();
+    SendMessageW(view, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(view, EM_SETBKGNDCOLOR, 0, palette.editorBackground);
+    SetWindowTextW(view, text.c_str());
+    CHARFORMAT2W format{};
+    format.cbSize = sizeof(format);
+    format.dwMask = CFM_COLOR | CFM_BACKCOLOR;
+    format.crTextColor = palette.editorText;
+    format.crBackColor = palette.editorBackground;
+    SendMessageW(view, EM_SETSEL, 0, -1);
+    SendMessageW(view, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format));
+    SendMessageW(view, EM_SETSEL, 0, 0);
+    SendMessageW(view, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(view, nullptr, TRUE);
 }
 
 // Renders a line diff into a read-only RichEdit: removed lines red, added
@@ -11085,7 +11110,7 @@ int ConfirmChange(const wchar_t* title, const std::wstring& before, const std::w
     PreviewState state;
     RECT owner{};
     GetWindowRect(g_app.window, &owner);
-    const int width = std::min(Scale(820), static_cast<int>(owner.right - owner.left) - Scale(40));
+    const int width = std::min(Scale(1040), static_cast<int>(owner.right - owner.left) - Scale(40));
     const int height = std::min(Scale(560), static_cast<int>(owner.bottom - owner.top) - Scale(40));
     HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"MCnotepadPreview",
         (std::wstring(L"预览更改 - ") + title).c_str(), WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
@@ -11096,7 +11121,14 @@ int ConfirmChange(const wchar_t* title, const std::wstring& before, const std::w
 
     HWND label = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
         dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(100)), g_app.instance, nullptr);
-    state.view = CreateWindowExW(0, L"RICHEDIT50W", nullptr,
+    HWND beforeLabel = CreateWindowExW(0, L"STATIC", L"原文", WS_CHILD | WS_VISIBLE,
+        0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(101)), g_app.instance, nullptr);
+    HWND afterLabel = CreateWindowExW(0, L"STATIC", L"处理结果（预览）", WS_CHILD | WS_VISIBLE,
+        0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(102)), g_app.instance, nullptr);
+    state.beforeView = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+        0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
+    state.afterView = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", nullptr,
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
         0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
     state.dontAsk = CreateWindowExW(0, L"BUTTON", L"以后不再预览", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
@@ -11112,17 +11144,27 @@ int ConfirmChange(const wchar_t* title, const std::wstring& before, const std::w
     state.defaultMode = defaultMode;
     HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), g_app.instance, nullptr);
-    for (HWND control : {label, state.dontAsk, buttons[0], buttons[1], buttons[2], cancel}) {
+    for (HWND control : {label, beforeLabel, afterLabel, state.dontAsk, buttons[0], buttons[1], buttons[2], cancel}) {
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
     }
-    SendMessageW(state.view, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+    SendMessageW(state.beforeView, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+    SendMessageW(state.afterView, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
     ThemeCheckbox(state.dontAsk);
     ThemePushButtons({buttons[0], buttons[1], buttons[2], cancel});
-    SetWindowTheme(state.view, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-    SendMessageW(state.view, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(4), 0));
-    SendMessageW(state.view, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+    SetWindowTheme(state.beforeView, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    SetWindowTheme(state.afterView, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    for (HWND view : {state.beforeView, state.afterView}) {
+        SendMessageW(view, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
+        SendMessageW(view, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+    }
     int removed = 0, added = 0;
-    FillDiffView(state.view, before, after, removed, added);
+    const std::vector<DiffLine> diff = DiffLines(SplitLines(before), SplitLines(after));
+    for (const DiffLine& line : diff) {
+        if (line.kind == DiffKind::Removed) ++removed;
+        if (line.kind == DiffKind::Added) ++added;
+    }
+    FillPreviewText(state.beforeView, before);
+    FillPreviewText(state.afterView, after);
     SetWindowTextW(label, (L"与原文相比：删除 " + std::to_wstring(removed) + L" 行，新增 " + std::to_wstring(added) +
         L" 行。请选择如何使用处理结果（替换原文后可按 Ctrl+Z 撤销）。").c_str());
 
