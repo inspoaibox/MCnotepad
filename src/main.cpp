@@ -13903,7 +13903,8 @@ struct ReplacePreviewState {
     bool done = false;
     bool accepted = false;
     HWND list = nullptr;
-    HWND view = nullptr;
+    HWND beforeView = nullptr;
+    HWND afterView = nullptr;
     HWND summary = nullptr;
     HWND backup = nullptr;
     std::vector<bool> checked;
@@ -13934,14 +13935,22 @@ LRESULT CALLBACK ReplacePreviewProc(HWND window, UINT message, WPARAM wParam, LP
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams));
         return 0;
     case WM_SIZE: {
-        if (!state || !state->list) break;
+        if (!state || !state->list || !state->beforeView || !state->afterView) break;
         const int width = LOWORD(lParam);
         const int height = HIWORD(lParam);
         const int bottom = height - Scale(48);
         const int listWidth = std::clamp(width * 38 / 100, Scale(240), Scale(420));
         MoveWindow(state->summary, Scale(16), Scale(12), width - Scale(32), Scale(22), TRUE);
         MoveWindow(state->list, Scale(16), Scale(40), listWidth, std::max(0, bottom - Scale(48)), TRUE);
-        MoveWindow(state->view, Scale(24) + listWidth, Scale(40), width - listWidth - Scale(40), std::max(0, bottom - Scale(48)), TRUE);
+        const int previewLeft = Scale(24) + listWidth;
+        const int previewWidth = std::max(0, width - listWidth - Scale(40));
+        const int paneWidth = std::max(0, (previewWidth - Scale(8)) / 2);
+        const int paneTop = Scale(64);
+        const int paneHeight = std::max(0, bottom - paneTop);
+        MoveWindow(GetDlgItem(window, 203), previewLeft, Scale(40), paneWidth, Scale(20), TRUE);
+        MoveWindow(GetDlgItem(window, 204), previewLeft + Scale(8) + paneWidth, Scale(40), paneWidth, Scale(20), TRUE);
+        MoveWindow(state->beforeView, previewLeft, paneTop, paneWidth, paneHeight, TRUE);
+        MoveWindow(state->afterView, previewLeft + Scale(8) + paneWidth, paneTop, paneWidth, paneHeight, TRUE);
         ListView_SetColumnWidth(state->list, 0, listWidth - Scale(80));
         MoveWindow(GetDlgItem(window, 201), Scale(16), bottom + Scale(10), Scale(70), Scale(28), TRUE);
         MoveWindow(GetDlgItem(window, 202), Scale(92), bottom + Scale(10), Scale(70), Scale(28), TRUE);
@@ -13959,8 +13968,8 @@ LRESULT CALLBACK ReplacePreviewProc(HWND window, UINT message, WPARAM wParam, LP
             }
             if ((change->uChanged & LVIF_STATE) && (change->uNewState & LVIS_SELECTED) && !(change->uOldState & LVIS_SELECTED)) {
                 const SearchFileResult& file = *g_search.results[static_cast<size_t>(change->iItem)];
-                int removed = 0, added = 0;
-                FillDiffView(state->view, file.before, file.after, removed, added);
+                FillPreviewText(state->beforeView, file.before);
+                FillPreviewText(state->afterView, file.after);
             }
         }
         break;
@@ -14167,7 +14176,14 @@ void ShowReplaceInFilesPreview() {
     state.list = CreateWindowExW(0, WC_LISTVIEWW, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
         0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
     ListView_SetExtendedListViewStyle(state.list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-    state.view = CreateWindowExW(0, L"RICHEDIT50W", nullptr,
+    HWND beforeLabel = CreateWindowExW(0, L"STATIC", L"原文", WS_CHILD | WS_VISIBLE,
+        0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(203)), g_app.instance, nullptr);
+    HWND afterLabel = CreateWindowExW(0, L"STATIC", L"处理结果（预览）", WS_CHILD | WS_VISIBLE,
+        0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(204)), g_app.instance, nullptr);
+    state.beforeView = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+        0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
+    state.afterView = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", nullptr,
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
         0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
     HWND all = CreateWindowExW(0, L"BUTTON", L"全选", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(201), g_app.instance, nullptr);
@@ -14175,7 +14191,7 @@ void ShowReplaceInFilesPreview() {
     state.backup = CreateWindowExW(0, L"BUTTON", L"替换前备份原文件（可撤销）", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX, 0, 0, 0, 0, dialog, nullptr, g_app.instance, nullptr);
     HWND apply = CreateWindowExW(0, L"BUTTON", L"替换勾选的文件", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(IDOK), g_app.instance, nullptr);
     HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, dialog, reinterpret_cast<HMENU>(IDCANCEL), g_app.instance, nullptr);
-    for (HWND control : {state.summary, state.list, all, none, state.backup, apply, cancel}) {
+    for (HWND control : {state.summary, state.list, beforeLabel, afterLabel, all, none, state.backup, apply, cancel}) {
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
     }
     SendMessageW(state.backup, BM_SETCHECK, BST_CHECKED, 0);
@@ -14186,10 +14202,13 @@ void ShowReplaceInFilesPreview() {
     ListView_SetTextBkColor(state.list, palette.editorBackground);
     ListView_SetTextColor(state.list, palette.editorText);
     if (HWND headerControl = ListView_GetHeader(state.list)) SetWindowTheme(headerControl, g_app.darkTheme ? L"DarkMode_ItemsView" : nullptr, nullptr);
-    SendMessageW(state.view, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
-    SetWindowTheme(state.view, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-    SendMessageW(state.view, EM_SETBKGNDCOLOR, 0, palette.editorBackground);
-    SendMessageW(state.view, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+    for (HWND view : {state.beforeView, state.afterView}) {
+        SendMessageW(view, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
+        SetWindowTheme(view, g_app.darkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        SendMessageW(view, EM_SETBKGNDCOLOR, 0, palette.editorBackground);
+        SendMessageW(view, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+        SendMessageW(view, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
+    }
 
     LVCOLUMNW column{};
     column.mask = LVCF_TEXT | LVCF_WIDTH;
