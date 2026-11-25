@@ -2240,7 +2240,7 @@ wchar_t MatchingBracket(wchar_t character) {
     case L'(': return L')';
     case L'[': return L']';
     case L'{': return L'}';
-    case L')': return L'('; 
+    case L')': return L'(';
     case L']': return L'[';
     case L'}': return L'{';
     default: return 0;
