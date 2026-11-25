@@ -714,6 +714,7 @@ std::unordered_map<HWND, WNDPROC> g_editorProcs;
 
 std::wstring GetWindowTextValue(HWND window);
 void ApplyEditorTheme(HWND editor);
+void ApplyEditorTypography(HWND editor);
 void ApplyCurrentLineHighlight(TabDocument& document, bool force = false);
 void ApplyBracketMatchHighlight(TabDocument& document, bool force = false);
 COLORREF Blend(COLORREF base, COLORREF overlay, int percentOverlay);
@@ -2688,6 +2689,13 @@ COLORREF CurrentLineHighlightColor() {
         blend(GetBValue(palette.editorBackground), GetBValue(palette.accent)));
 }
 
+bool IsEditorSelectionDragActive(HWND editor) {
+    // EN_SELCHANGE is delivered by the editor itself, so the button state is
+    // sufficient and also covers RichEdit builds that capture the parent
+    // window rather than the child control during a drag.
+    return editor != nullptr && (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
+}
+
 void ApplyCurrentLineHighlight(TabDocument& document, bool force) {
     HWND editor = document.editor;
     if (!editor || !IsWindow(editor) || !IsWindowVisible(editor)) return;
@@ -4151,6 +4159,26 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         AddNextLineCaret();
         return 0;
     }
+
+    // Handle Enter before RichEdit's default key processing.  RichEdit may
+    // insert a paragraph while processing WM_KEYDOWN and then receive WM_CHAR
+    // as well; doing smart-indent from WM_CHAR can therefore create a blank
+    // line.  A multi-caret edit still uses the normal WM_CHAR replacement path.
+    if (message == WM_KEYDOWN && wParam == VK_RETURN &&
+        (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+        (GetKeyState(VK_MENU) & 0x8000) == 0) {
+        bool hasMultiCaret = false;
+        for (const TabDocument& document : g_app.documents) {
+            if (document.editor == editor) {
+                hasMultiCaret = !document.multiCarets.empty();
+                break;
+            }
+        }
+        if (!hasMultiCaret && HandleSmartIndentEnter(editor)) {
+            RecordMacroText(L"\r");
+            return 0;
+        }
+    }
     if (message == WM_KEYDOWN && (wParam == VK_BACK || wParam == VK_DELETE) &&
         ApplyMultiCaretBackspace(editor, wParam == VK_DELETE)) {
         return 0;
@@ -4231,12 +4259,6 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         return 0;
     }
 
-    if (message == WM_CHAR && wParam == L'\r' &&
-        (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
-        (GetKeyState(VK_MENU) & 0x8000) == 0 && HandleSmartIndentEnter(editor)) {
-        return 0;
-    }
-
     const LRESULT result = oldProc != nullptr
         ? CallWindowProcW(oldProc, editor, message, wParam, lParam)
         : DefWindowProcW(editor, message, wParam, lParam);
@@ -4249,6 +4271,15 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
     } else if (message == WM_SIZE || message == WM_SHOWWINDOW) {
         UpdateHorizontalScrollbar(editor);
         if (message == WM_SIZE) SyntaxOnViewChanged(editor);
+    }
+    if (message == WM_LBUTTONUP) {
+        for (TabDocument& document : g_app.documents) {
+            if (document.editor == editor) {
+                ApplyCurrentLineHighlight(document);
+                ApplyBracketMatchHighlight(document);
+                break;
+            }
+        }
     }
     if (message == WM_PAINT) {
         DrawEditorGuides(editor);
@@ -4372,9 +4403,26 @@ void ApplyEditorLineSpacing(HWND editor) {
     PARAFORMAT2 format{};
     format.cbSize = sizeof(format);
     format.dwMask = PFM_LINESPACING;
-    format.bLineSpacingRule = tomLineSpaceMultiple;
-    format.dyLineSpacing = std::clamp(
-        MulDiv(g_app.lineSpacingPercent, 20, 100), 10, 60);
+    // Use one fixed paragraph line box for the whole document.  RichEdit's
+    // multiple-line mode derives the box from the selected glyph run, so a
+    // CJK fallback font can make Chinese lines visibly taller than Latin
+    // lines.  Exact spacing keeps both scripts on the same baseline grid.
+    HDC dc = GetDC(editor);
+    TEXTMETRICW metrics{};
+    if (dc) {
+        HFONT font = g_app.editorFont != nullptr
+            ? g_app.editorFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HGDIOBJ previous = SelectObject(dc, font);
+        GetTextMetricsW(dc, &metrics);
+        SelectObject(dc, previous);
+        ReleaseDC(editor, dc);
+    }
+    const int basePixels = std::max(1, static_cast<int>(metrics.tmHeight) + Scale(2));
+    const int requestedPixels = MulDiv(basePixels, g_app.lineSpacingPercent, 100);
+    const int linePixels = std::max(basePixels, requestedPixels);
+    const int lineTwips = std::clamp(MulDiv(linePixels, 1440, static_cast<int>(g_app.dpi)), 120, 720);
+    format.bLineSpacingRule = tomLineSpaceExactly;
+    format.dyLineSpacing = lineTwips;
 
     SendMessageW(editor, EM_SETSEL, 0, -1);
     SendMessageW(editor, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format));
@@ -4488,15 +4536,13 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
     // Keep the selected Latin font, but allow RichEdit to choose a proper
     // fallback face for CJK text instead of drawing replacement boxes.
-    const LRESULT languageOptions = SendMessageW(document.editor, EM_GETLANGOPTIONS, 0, 0);
-    SendMessageW(document.editor, EM_SETLANGOPTIONS, 0,
-        (languageOptions | IMF_AUTOFONT | IMF_DUALFONT) &
-        ~static_cast<LRESULT>(IMF_AUTOFONTSIZEADJUST));
+    ApplyEditorTypography(document.editor);
     SetWindowTextW(document.editor, text.c_str());
     // RichEdit resets the character format when WM_SETTEXT/SetWindowText is
     // applied.  Set the theme after loading the document so dark-theme text
     // does not fall back to the RichEdit default black foreground.
     ApplyEditorTheme(document.editor);
+    ApplyEditorTypography(document.editor);
     ApplyEditorLineSpacing(document.editor);
     ApplyWordWrap(document.editor);
     document.largeFileMode = text.size() >= (8ull << 20);
@@ -5856,6 +5902,27 @@ void CreateUiFonts() {
     if (oldBold) DeleteObject(oldBold);
 }
 
+void ApplyEditorTypography(HWND editor) {
+    if (!editor) return;
+
+    // Keep automatic glyph fallback for CJK, but disable RichEdit's dual-font
+    // size adjustment.  The latter can silently choose a taller fallback font
+    // for Chinese text and make otherwise identical paragraphs use different
+    // baselines.  The explicit character height also applies the user's
+    // editor size uniformly to existing and newly inserted text.
+    const LRESULT languageOptions = SendMessageW(editor, EM_GETLANGOPTIONS, 0, 0);
+    SendMessageW(editor, EM_SETLANGOPTIONS, 0,
+        (languageOptions | IMF_AUTOFONT) &
+        ~static_cast<LRESULT>(IMF_DUALFONT | IMF_AUTOFONTSIZEADJUST));
+
+    CHARFORMAT2W format{};
+    format.cbSize = sizeof(format);
+    format.dwMask = CFM_SIZE;
+    format.yHeight = static_cast<LONG>(std::max(1, g_app.fontSize) * 20);
+    SendMessageW(editor, EM_SETCHARFORMAT, SCF_DEFAULT, reinterpret_cast<LPARAM>(&format));
+    SendMessageW(editor, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&format));
+}
+
 void ApplyEditorFont() {
     DeleteObject(g_app.editorFont);
     const int dpi = static_cast<int>(g_app.dpi);
@@ -5866,13 +5933,7 @@ void ApplyEditorFont() {
     for (const TabDocument& document : g_app.documents) {
         EditorEventMute mute(document.editor);
         SendMessageW(document.editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
-        // Keep the selected Latin font while allowing RichEdit to select a
-        // CJK fallback font for Chinese/Japanese/Korean characters. Without
-        // dual-font mode, Consolas renders these characters as tofu boxes.
-        const LRESULT languageOptions = SendMessageW(document.editor, EM_GETLANGOPTIONS, 0, 0);
-        SendMessageW(document.editor, EM_SETLANGOPTIONS, 0,
-            (languageOptions | IMF_AUTOFONT | IMF_DUALFONT) &
-            ~static_cast<LRESULT>(IMF_AUTOFONTSIZEADJUST));
+        ApplyEditorTypography(document.editor);
         SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
         InvalidateRect(document.editor, nullptr, TRUE);
     }
@@ -18046,8 +18107,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             ToolboxOnSelectionChanged();
             RefreshGutter();  // current-line number follows the caret
             if (TabDocument* document = ActiveDocument()) {
-                ApplyCurrentLineHighlight(*document);
-                ApplyBracketMatchHighlight(*document);
+                // Formatting the document while the mouse is dragging a
+                // selection resets RichEdit's active end and makes a
+                // bottom-to-top selection jump.  Defer these visual updates
+                // until WM_LBUTTONUP, after the selection is complete.
+                if (!IsEditorSelectionDragActive(header->hwndFrom)) {
+                    ApplyCurrentLineHighlight(*document);
+                    ApplyBracketMatchHighlight(*document);
+                }
             }
             return 0;
         }
