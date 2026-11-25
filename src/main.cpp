@@ -135,6 +135,8 @@ constexpr int kIdViewClearBookmarks = 1239;
 constexpr int kIdTabTogglePinned = 1240;
 constexpr int kIdViewWhitespace = 1241;
 constexpr int kIdViewIndentGuides = 1242;
+constexpr int kIdViewFoldCurrent = 1243;
+constexpr int kIdViewUnfoldAll = 1244;
 constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
@@ -273,6 +275,13 @@ struct SyntaxToken {
     Tok kind;
 };
 
+struct FoldRegion {
+    LONG start = 0;
+    LONG end = 0;
+    int line = 0;
+    bool collapsed = false;
+};
+
 struct TabDocument {
     HWND editor = nullptr;
     std::wstring path;
@@ -300,6 +309,8 @@ struct TabDocument {
     int highlightedLine = -1;
     LONG bracketMatchStart = -1;
     LONG bracketMatchEnd = -1;
+    std::vector<FoldRegion> folds;
+    uint64_t foldTextHash = 0;
 };
 
 struct ClosedTab {
@@ -574,6 +585,9 @@ bool HandleMainWindowClose(bool forceExit = false);
 void OpenPrefixSuffixDialog();
 void OpenShortcutDialog();
 void RebuildAccelerators();
+uint64_t HashText(std::wstring_view text);
+TabDocument* ActiveDocument();
+std::wstring GetEditorRawText(HWND editor);
 std::vector<std::wstring> SplitLines(std::wstring_view text);
 std::wstring JoinLines(const std::vector<std::wstring>& lines, std::wstring_view separator = L"\r");
 bool ToolRange(HWND editor, bool wholeLines, CHARRANGE& range, std::wstring& text, bool& wholeDocument);
@@ -1010,10 +1024,92 @@ public:
         }
     }
 
+    void SetHidden(LONG start, LONG end, bool hidden) {
+        if (!range_ || FAILED(range_->SetRange(start, end))) return;
+        ITextFont* font = nullptr;
+        if (SUCCEEDED(range_->GetFont(&font)) && font) {
+            font->SetHidden(hidden ? tomTrue : tomFalse);
+            font->Release();
+        }
+    }
+
 private:
     ITextDocument* document_ = nullptr;
     ITextRange* range_ = nullptr;
 };
+
+void DetectFoldRegions(TabDocument& document) {
+    if (!document.editor) return;
+    const std::wstring text = GetEditorRawText(document.editor);
+    const uint64_t hash = HashText(text);
+    if (document.foldTextHash == hash && !document.folds.empty()) return;
+    document.folds.clear();
+    document.foldTextHash = hash;
+    std::vector<LONG> stack;
+    for (LONG position = 0; position < static_cast<LONG>(text.size()); ++position) {
+        const wchar_t character = text[static_cast<size_t>(position)];
+        if (character == L'{' && (position == 0 || text[static_cast<size_t>(position - 1)] != L'\\')) {
+            stack.push_back(position);
+        } else if (character == L'}' && !stack.empty()) {
+            const LONG opening = stack.back();
+            stack.pop_back();
+            const LRESULT line = SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, opening);
+            const LRESULT closingLine = SendMessageW(document.editor, EM_EXLINEFROMCHAR, 0, position);
+            if (line >= 0 && closingLine > line) {
+                const LONG end = std::min<LONG>(static_cast<LONG>(text.size()), position + 1);
+                document.folds.push_back({opening + 1, end, static_cast<int>(line), false});
+            }
+        }
+    }
+    std::sort(document.folds.begin(), document.folds.end(), [](const FoldRegion& left, const FoldRegion& right) {
+        if (left.line != right.line) return left.line < right.line;
+        return left.start < right.start;
+    });
+}
+
+void ApplyFoldVisibility(TabDocument& document) {
+    if (!document.editor) return;
+    TextDocumentRef tom(document.editor);
+    if (!tom) return;
+    long freeze = 0;
+    tom.document()->Undo(tomSuspend, nullptr);
+    tom.document()->Freeze(&freeze);
+    for (const FoldRegion& region : document.folds) {
+        tom.SetHidden(region.start, region.end, region.collapsed);
+    }
+    tom.document()->Unfreeze(&freeze);
+    tom.document()->Undo(tomResume, nullptr);
+    InvalidateRect(document.editor, nullptr, TRUE);
+    RefreshGutter();
+}
+
+void FoldCurrentBlock() {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    DetectFoldRegions(*document);
+    CHARRANGE selection{};
+    SendMessageW(document->editor, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    const int line = static_cast<int>(SendMessageW(document->editor, EM_EXLINEFROMCHAR, 0, selection.cpMin));
+    auto it = std::find_if(document->folds.begin(), document->folds.end(), [line](const FoldRegion& region) {
+        return region.line == line;
+    });
+    if (it == document->folds.end()) {
+        ShowNotice(L"当前行没有可折叠代码块");
+        return;
+    }
+    it->collapsed = !it->collapsed;
+    ApplyFoldVisibility(*document);
+    g_app.stateDirty = true;
+}
+
+void UnfoldAllBlocks() {
+    TabDocument* document = ActiveDocument();
+    if (!document) return;
+    DetectFoldRegions(*document);
+    for (FoldRegion& region : document->folds) region.collapsed = false;
+    ApplyFoldVisibility(*document);
+    g_app.stateDirty = true;
+}
 
 void SetSelectionColor(HWND editor, LONG start, LONG end, COLORREF color) {
     CHARRANGE range{start, end};
@@ -2514,6 +2610,8 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             editor = g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor;
         }
         if (editor) {
+            TabDocument& activeDocument = g_app.documents[static_cast<size_t>(g_app.activeIndex)];
+            DetectFoldRegions(activeDocument);
             POINT origin{0, 0};
             MapWindowPoints(editor, window, &origin, 1);  // editor client -> gutter coordinates
             TextDocumentRef tom(editor);
@@ -2538,8 +2636,33 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 if (y > client.bottom) break;
                 const long paragraph = paragraphOf(static_cast<LONG>(start));
                 if (paragraph != previousParagraph) {
-                    if (HasBookmark(g_app.documents[static_cast<size_t>(g_app.activeIndex)], static_cast<int>(paragraph))) {
+                    const auto fold = std::find_if(activeDocument.folds.begin(), activeDocument.folds.end(),
+                        [paragraph](const FoldRegion& region) { return region.line + 1 == paragraph; });
+                    if (fold != activeDocument.folds.end()) {
                         const int markerX = Scale(5);
+                        const int markerY = y + metrics.tmHeight / 2;
+                        HPEN foldPen = CreatePen(PS_SOLID, 1, CurrentPalette().gutterText);
+                        HBRUSH foldBrush = CreateSolidBrush(GutterBackground());
+                        HGDIOBJ oldPen = SelectObject(dc, foldPen);
+                        HGDIOBJ oldBrush = SelectObject(dc, foldBrush);
+                        POINT arrow[3]{};
+                        if (fold->collapsed) {
+                            arrow[0] = {markerX - Scale(2), markerY - Scale(4)};
+                            arrow[1] = {markerX - Scale(2), markerY + Scale(4)};
+                            arrow[2] = {markerX + Scale(3), markerY};
+                        } else {
+                            arrow[0] = {markerX - Scale(4), markerY - Scale(2)};
+                            arrow[1] = {markerX + Scale(4), markerY - Scale(2)};
+                            arrow[2] = {markerX, markerY + Scale(3)};
+                        }
+                        Polygon(dc, arrow, 3);
+                        SelectObject(dc, oldBrush);
+                        SelectObject(dc, oldPen);
+                        DeleteObject(foldBrush);
+                        DeleteObject(foldPen);
+                    }
+                    if (HasBookmark(activeDocument, static_cast<int>(paragraph))) {
+                        const int markerX = Scale(17);
                         const int markerY = y + metrics.tmHeight / 2;
                         HBRUSH markerBrush = CreateSolidBrush(CurrentPalette().accent);
                         HPEN markerPen = CreatePen(PS_SOLID, 1, CurrentPalette().accent);
@@ -2569,11 +2692,26 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (g_app.activeIndex < 0 || g_app.activeIndex >= static_cast<int>(g_app.documents.size())) return 0;
         HWND editor = g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor;
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const bool foldClick = point.x < Scale(14);
         MapWindowPoints(window, editor, &point, 1);
         const LRESULT character = SendMessageW(editor, EM_CHARFROMPOS, 0, reinterpret_cast<LPARAM>(&point));
         const LONG position = static_cast<LONG>(character);
         const int line = position >= 0
             ? static_cast<int>(SendMessageW(editor, EM_EXLINEFROMCHAR, 0, position)) + 1 : 1;
+        if (foldClick) {
+            TabDocument& document = g_app.documents[static_cast<size_t>(g_app.activeIndex)];
+            DetectFoldRegions(document);
+            auto it = std::find_if(document.folds.begin(), document.folds.end(), [line](const FoldRegion& region) {
+                return region.line + 1 == line;
+            });
+            if (it != document.folds.end()) {
+                it->collapsed = !it->collapsed;
+                ApplyFoldVisibility(document);
+                g_app.stateDirty = true;
+                SetFocus(editor);
+                return 0;
+            }
+        }
         ToggleBookmarkAtLine(g_app.activeIndex, line);
         SetFocus(editor);
         return 0;
@@ -3976,6 +4114,7 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     ApplyEditorTheme(document.editor);
     ApplyEditorLineSpacing(document.editor);
     ApplyWordWrap(document.editor);
+    DetectFoldRegions(document);
     if (LanguageFromPath(document.path) == kLanguagePlain) document.sniffedLanguage = SniffLanguage(text);
     // Colours are painted when the tab is shown (only the visible part).
     SendMessageW(document.editor, EM_EMPTYUNDOBUFFER, 0, 0);  // loading is not an undoable edit
@@ -4407,6 +4546,8 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, kIdViewWhitespace, L"显示空格和制表符");
     AppendMenuW(view, MF_STRING, kIdViewIndentGuides, L"显示缩进参考线");
+    AppendMenuW(view, MF_STRING, kIdViewFoldCurrent, L"折叠/展开当前代码块");
+    AppendMenuW(view, MF_STRING, kIdViewUnfoldAll, L"展开全部代码块");
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacingSingle, L"1.0 倍");
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacing115, L"1.15 倍");
     AppendMenuW(lineSpacing, MF_STRING, kIdLineSpacing150, L"1.5 倍");
@@ -17242,6 +17383,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             g_app.showIndentGuides = !g_app.showIndentGuides;
             g_app.stateDirty = true;
             for (const TabDocument& document : g_app.documents) InvalidateRect(document.editor, nullptr, FALSE);
+            break;
+        case kIdViewFoldCurrent:
+            FoldCurrentBlock();
+            break;
+        case kIdViewUnfoldAll:
+            UnfoldAllBlocks();
             break;
         case kIdToolbarTheme:
             ShowThemeMenu(ToolbarItemScreenRect(kIdToolbarTheme));
