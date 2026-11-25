@@ -166,7 +166,10 @@ enum TextToolId : int {
     kIdTogglePreview,
     kIdFormatCss, kIdMinifyCss, kIdFormatJavaScript, kIdMinifyJavaScript,
     kIdMarkdownToHtml, kIdHtmlToMarkdown,
-    kIdTextToolLast = kIdMinifyJavaScript
+    // Keep the range inclusive of every text/developer transformation command.
+    // The Markdown/HTML commands are handled by RunTextTool and must reach it
+    // through IsTextToolCommand/WM_COMMAND as well.
+    kIdTextToolLast = kIdHtmlToMarkdown
 };
 constexpr int kIdNewTabButton = 1301;
 constexpr int kIdToolbarNew = 1401;
@@ -18989,6 +18992,10 @@ int RunSelfTests() {
     std::wstring htmlResult;
     failures += expect(ShowdownConvert(L"<h1>中文标题</h1><p>你好，世界！</p>", false, htmlResult, markdownError) &&
         utf8Safe(htmlResult));
+    // Keep the developer conversion commands reachable from WM_COMMAND.
+    // A regression here makes the menu appear clickable while doing nothing.
+    failures += expect(IsTextToolCommand(kIdMarkdownToHtml) &&
+        IsTextToolCommand(kIdHtmlToMarkdown));
 
     for (int locale = 0; locale < 5; ++locale) {
         DataGeneratorOptions profile;
