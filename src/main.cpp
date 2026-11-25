@@ -143,6 +143,8 @@ constexpr int kIdViewWhitespace = 1241;
 constexpr int kIdViewIndentGuides = 1242;
 constexpr int kIdViewFoldCurrent = 1243;
 constexpr int kIdViewUnfoldAll = 1244;
+constexpr int kIdTabNext = 1245;
+constexpr int kIdTabPrevious = 1246;
 constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
@@ -201,9 +203,10 @@ constexpr int kIdSettingsMinimizeToTray = 1711;
 constexpr int kIdSettingsShowTray = 1712;
 constexpr int kIdSettingsShortcuts = 1713;
 constexpr int kIdShortcutEditFirst = 2120;
-constexpr int kIdShortcutApply = 2140;
-constexpr int kIdShortcutReset = 2141;
-constexpr int kIdShortcutCancel = 2142;
+// Keep these outside the dynamically allocated edit-control ID range.
+constexpr int kIdShortcutApply = 2500;
+constexpr int kIdShortcutReset = 2501;
+constexpr int kIdShortcutCancel = 2502;
 constexpr int kIdTrayShow = 1720;
 constexpr int kIdTrayExit = 1721;
 constexpr int kIdEncodingFirst = 1601;    // 1601..1605
@@ -496,7 +499,7 @@ AppState g_app;
 
 struct ShortcutBinding {
     int command = 0;
-    const wchar_t* label = nullptr;
+    std::wstring label;
     std::wstring text;
 };
 
@@ -505,27 +508,168 @@ HACCEL g_accelerators = nullptr;
 HWND g_shortcutDialog = nullptr;
 HWND g_shortcutDialogOwner = nullptr;
 std::vector<HWND> g_shortcutEditControls;
+struct ShortcutDialogControl {
+    HWND window = nullptr;
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+std::vector<ShortcutDialogControl> g_shortcutDialogControls;
+HWND g_shortcutDialogHint = nullptr;
+HWND g_shortcutDialogApply = nullptr;
+HWND g_shortcutDialogReset = nullptr;
+HWND g_shortcutDialogCancel = nullptr;
+int g_shortcutDialogContentHeight = 0;
+int g_shortcutDialogScrollOffset = 0;
 
 std::string HexEncode(std::string_view value);
 std::string WideToUtf8(std::wstring_view value);
 std::wstring Utf8ToWide(std::string_view value);
+std::wstring DataGeneratorLabel(int command);
+
+std::wstring ShortcutLabelForCommand(int command) {
+    switch (command) {
+    case kIdFileNew: return L"文件：新建";
+    case kIdFileOpen: return L"文件：打开";
+    case kIdFileSave: return L"文件：保存";
+    case kIdFileSaveAs: return L"文件：另存为";
+    case kIdFileSaveAll: return L"文件：保存全部";
+    case kIdFileClose: return L"文件：关闭标签";
+    case kIdFileCloseAll: return L"文件：关闭全部标签";
+    case kIdFileReopenClosed: return L"文件：重新打开关闭的标签";
+    case kIdFileRename: return L"文件：重命名标签";
+    case kIdFileExit: return L"文件：退出";
+    case kIdTabNext: return L"标签：下一个标签";
+    case kIdTabPrevious: return L"标签：上一个标签";
+    case kIdTabTogglePinned: return L"标签：固定/取消固定当前标签";
+    case kIdEditUndo: return L"编辑：撤销";
+    case kIdEditRedo: return L"编辑：重做";
+    case kIdEditCut: return L"编辑：剪切";
+    case kIdEditCopy: return L"编辑：复制";
+    case kIdEditPaste: return L"编辑：粘贴";
+    case kIdEditSelectAll: return L"编辑：全选";
+    case kIdPrefixSuffix: return L"编辑：前缀与后缀处理";
+    case kIdMultiCaretNext: return L"编辑：添加下一行光标";
+    case kIdRectangleSelection: return L"编辑：矩形选择";
+    case kIdClearMultiCaret: return L"编辑：清除多光标";
+    case kIdMacroToggle: return L"编辑：开始/停止宏录制";
+    case kIdMacroPlay: return L"编辑：播放最近宏";
+    case kIdMacroClear: return L"编辑：清除最近宏";
+    case kIdToolbarFind: return L"搜索：查找";
+    case kIdToolbarReplace: return L"搜索：替换";
+    case kIdFindNext: return L"搜索：查找下一个";
+    case kIdFindPrevious: return L"搜索：查找上一个";
+    case kIdToolbarGoto: return L"搜索：跳转到行";
+    case kIdSearchInFolder: return L"搜索：文件夹搜索";
+    case kIdReplaceInFolder: return L"搜索：文件夹替换";
+    case kIdSearchCurrentFile: return L"搜索：当前文件";
+    case kIdSearchOpenFiles: return L"搜索：所有打开文件";
+    case kIdSearchFileNames: return L"搜索：文件名";
+    case kIdSearchRegex: return L"搜索：正则表达式";
+    case kIdToggleSearchPanel: return L"搜索：显示搜索面板";
+    case kIdViewToggleBookmark: return L"视图：切换书签";
+    case kIdViewNextBookmark: return L"视图：下一个书签";
+    case kIdViewPreviousBookmark: return L"视图：上一个书签";
+    case kIdViewClearBookmarks: return L"视图：清除书签";
+    case kIdViewWhitespace: return L"视图：显示空格和制表符";
+    case kIdViewIndentGuides: return L"视图：显示缩进参考线";
+    case kIdViewFoldCurrent: return L"视图：折叠/展开当前代码块";
+    case kIdViewUnfoldAll: return L"视图：展开全部代码块";
+    case kIdToolbarLineNumbers: return L"视图：显示行号";
+    case kIdToolbarWrap: return L"视图：自动换行";
+    case kIdToolbarEncoding: return L"编码：编码和换行符菜单";
+    case kIdToolbarFormat: return L"工具：格式化 JSON";
+    case kIdToolbarRun: return L"运行：运行当前文件";
+    case kIdToggleToolbox: return L"工具：开发者工具箱";
+    case kIdCompareWithFile: return L"工具：比较当前文件与...";
+    case kIdCompareFiles: return L"工具：比较两个文件";
+    case kIdCompareStructure: return L"工具：结构化比较";
+    case kIdCompareFolders: return L"工具：比较文件夹";
+    case kIdOpenLogViewer: return L"工具：日志查看器";
+    case kIdToolbarSettings: return L"设置：偏好设置";
+    case kIdSettingsShortcuts: return L"设置：快捷键设置";
+    case kIdThemeDark: return L"设置：切换到深色主题";
+    case kIdThemeLight: return L"设置：切换到浅色主题";
+    case kIdThemeGreen: return L"设置：切换到护眼绿主题";
+    case kIdThemeBlue: return L"设置：切换到暗夜蓝主题";
+    case kIdLineSpacingSingle: return L"视图：行距 1.0 倍";
+    case kIdLineSpacing115: return L"视图：行距 1.15 倍";
+    case kIdLineSpacing150: return L"视图：行距 1.5 倍";
+    case kIdLineSpacing200: return L"视图：行距 2.0 倍";
+    case kIdLineSpacingCustom: return L"视图：自定义行距";
+    default: break;
+    }
+    if (command >= kIdEncodingFirst && command < kIdEncodingFirst + kEncodingCount) {
+        return L"编码：" + std::wstring(kEncodingNames[command - kIdEncodingFirst]);
+    }
+    if (command >= kIdLineEndingFirst && command < kIdLineEndingFirst + kLineEndingCount) {
+        return L"换行符：" + std::wstring(kLineEndingNames[command - kIdLineEndingFirst]);
+    }
+    if (command >= kIdLanguageFirst && command < kIdLanguageFirst + kLanguageCount) {
+        return L"语言：" + std::wstring(kLanguageNames[command - kIdLanguageFirst]);
+    }
+    if (command >= kIdTextToolFirst && command <= kIdTextToolLast) {
+        static const wchar_t* const labels[] = {
+            L"文本：合并为一行", L"文本：合并为一行（空格）", L"文本：合并为一行（自定义）",
+            L"文本：每 N 行合并", L"文本：按分隔符拆分", L"文本：指定字符后换行", L"文本：按长度换行",
+            L"文本：删除空行", L"文本：合并连续空行", L"文本：删除重复行", L"文本：升序排序",
+            L"文本：降序排序", L"文本：反转行顺序", L"文本：添加前缀", L"文本：添加后缀", L"文本：添加行号",
+            L"文本：去除行首空白", L"文本：去除行尾空白", L"文本：去除两端空白", L"文本：合并连续空格",
+            L"文本：删除所有空格", L"文本：制表符转空格", L"文本：全角转半角", L"文本：半角转全角",
+            L"文本：中文标点转英文", L"文本：英文标点转中文", L"文本：清除不可见字符",
+            L"文本：转为大写", L"文本：转为小写", L"文本：单词首字母大写", L"文本：汉字转拼音",
+            L"文本：汉字转拼音（无声调）", L"文本：汉字转拼音首字母", L"文本：简体转繁体",
+            L"文本：繁体转简体", L"开发者：Base64 编码", L"开发者：Base64 解码", L"开发者：URL 编码",
+            L"开发者：URL 解码", L"开发者：正则表达式替换", L"文本：提取邮箱", L"文本：提取链接",
+            L"文本：提取 IP", L"文本：提取数字", L"文本：提取关键词行", L"文本：提取指定列",
+            L"文本：替换原文输出", L"文本：输出到新标签", L"文本：插入到原文下方", L"文本：切换处理前预览",
+            L"开发者：CSS 美化", L"开发者：CSS 压缩", L"开发者：JavaScript 美化",
+            L"开发者：JavaScript 压缩", L"开发者：Markdown 转 HTML", L"开发者：HTML 转 Markdown"
+        };
+        const int index = command - kIdTextToolFirst;
+        if (index >= 0 && index < static_cast<int>(std::size(labels))) return labels[index];
+    }
+    if (command >= kIdDataFirst && command <= kIdDataLast) {
+        return L"数据：" + DataGeneratorLabel(command);
+    }
+    return L"命令 " + std::to_wstring(command);
+}
 
 void InitializeShortcutBindings() {
     if (!g_shortcuts.empty()) return;
-    g_shortcuts = {
-        {kIdFileNew, L"新建", L"Ctrl+N"},
-        {kIdFileOpen, L"打开", L"Ctrl+O"},
-        {kIdFileSave, L"保存", L"Ctrl+S"},
-        {kIdFileSaveAs, L"另存为", L"Ctrl+Shift+S"},
-        {kIdFileClose, L"关闭标签", L"Ctrl+W"},
-        {kIdToolbarFind, L"查找", L"Ctrl+F"},
-        {kIdToolbarReplace, L"替换", L"Ctrl+H"},
-        {kIdToolbarGoto, L"跳转到行", L"Ctrl+G"},
-        {kIdSearchInFolder, L"文件夹搜索", L"Ctrl+Shift+F"},
-        {kIdToggleToolbox, L"开发者工具箱", L"Ctrl+Shift+D"},
-        {kIdToolbarSettings, L"偏好设置", L"Ctrl+,"},
-        {kIdSettingsShortcuts, L"快捷键设置", L"Ctrl+K"},
+    const auto add = [](int command, std::wstring text = {}) {
+        g_shortcuts.push_back({command, ShortcutLabelForCommand(command), std::move(text)});
     };
+    add(kIdFileNew, L"Ctrl+N"); add(kIdFileOpen, L"Ctrl+O"); add(kIdFileSave, L"Ctrl+S");
+    add(kIdFileSaveAs, L"Ctrl+Shift+S"); add(kIdFileSaveAll, L"Ctrl+Alt+S"); add(kIdFileClose, L"Ctrl+W");
+    add(kIdFileCloseAll, L"Ctrl+Shift+W"); add(kIdFileReopenClosed, L"Ctrl+Shift+T"); add(kIdFileRename, L"F2");
+    add(kIdFileExit, L"Ctrl+Q");
+    add(kIdTabNext, L"Ctrl+Tab"); add(kIdTabPrevious, L"Ctrl+Shift+Tab"); add(kIdTabTogglePinned);
+    add(kIdEditUndo, L"Ctrl+Z"); add(kIdEditRedo, L"Ctrl+Y"); add(kIdEditCut, L"Ctrl+X");
+    add(kIdEditCopy, L"Ctrl+C"); add(kIdEditPaste, L"Ctrl+V"); add(kIdEditSelectAll, L"Ctrl+A");
+    add(kIdPrefixSuffix, L"Ctrl+Alt+P"); add(kIdMultiCaretNext, L"Ctrl+Alt+Down");
+    add(kIdRectangleSelection, L"Ctrl+Alt+R"); add(kIdClearMultiCaret, L"Ctrl+Alt+Backspace");
+    add(kIdMacroToggle, L"Ctrl+Alt+M"); add(kIdMacroPlay, L"Ctrl+Alt+Shift+M"); add(kIdMacroClear);
+    add(kIdToolbarFind, L"Ctrl+F"); add(kIdToolbarReplace, L"Ctrl+H"); add(kIdFindNext, L"F3");
+    add(kIdFindPrevious, L"Shift+F3"); add(kIdToolbarGoto, L"Ctrl+G"); add(kIdSearchInFolder, L"Ctrl+Shift+F");
+    add(kIdReplaceInFolder, L"Ctrl+Shift+H"); add(kIdSearchCurrentFile); add(kIdSearchOpenFiles);
+    add(kIdSearchFileNames); add(kIdSearchRegex); add(kIdToggleSearchPanel, L"Ctrl+Shift+J");
+    add(kIdViewToggleBookmark, L"Ctrl+F2"); add(kIdViewNextBookmark, L"F4"); add(kIdViewPreviousBookmark, L"Shift+F4");
+    add(kIdViewClearBookmarks); add(kIdViewWhitespace, L"Ctrl+Alt+Space"); add(kIdViewIndentGuides, L"Ctrl+Alt+I");
+    add(kIdViewFoldCurrent, L"F7"); add(kIdViewUnfoldAll, L"Shift+F7");
+    add(kIdToolbarLineNumbers, L"Ctrl+Alt+L"); add(kIdToolbarWrap, L"Ctrl+Alt+W"); add(kIdToolbarEncoding);
+    add(kIdLineSpacingSingle, L"Ctrl+Alt+1"); add(kIdLineSpacing115, L"Ctrl+Alt+2");
+    add(kIdLineSpacing150, L"Ctrl+Alt+3"); add(kIdLineSpacing200, L"Ctrl+Alt+4"); add(kIdLineSpacingCustom);
+    add(kIdToolbarFormat, L"Shift+Alt+F"); add(kIdToggleToolbox, L"Ctrl+Shift+D"); add(kIdToolbarRun, L"F5");
+    add(kIdCompareWithFile); add(kIdCompareFiles); add(kIdCompareStructure); add(kIdCompareFolders); add(kIdOpenLogViewer);
+    add(kIdToolbarSettings, L"Ctrl+,"); add(kIdSettingsShortcuts, L"Ctrl+K");
+    add(kIdThemeDark); add(kIdThemeLight); add(kIdThemeGreen); add(kIdThemeBlue);
+    for (int command = kIdEncodingFirst; command < kIdEncodingFirst + kEncodingCount; ++command) add(command);
+    for (int command = kIdLineEndingFirst; command < kIdLineEndingFirst + kLineEndingCount; ++command) add(command);
+    for (int command = kIdLanguageFirst; command < kIdLanguageFirst + kLanguageCount; ++command) add(command);
+    for (int command = kIdTextToolFirst; command <= kIdTextToolLast; ++command) add(command);
+    for (int command = kIdDataFirst; command <= kIdDataLast; ++command) add(command);
 }
 
 void SaveShortcutBindings(std::ostream& output) {
@@ -3686,6 +3830,14 @@ void SelectTab(int index) {
     UpdateWindowTitle();
 }
 
+void SelectAdjacentTab(int delta) {
+    const int count = static_cast<int>(g_app.documents.size());
+    if (count <= 1 || g_app.activeIndex < 0) return;
+    int next = (g_app.activeIndex + delta) % count;
+    if (next < 0) next += count;
+    SelectTab(next);
+}
+
 void MarkRecoveryDirty(int index) {
     if (index < 0 || index >= static_cast<int>(g_app.documents.size())) {
         return;
@@ -5313,8 +5465,12 @@ void HandleFindReplaceMessage(LPARAM lParam) {
 }
 
 bool ParseShortcutText(std::wstring value, BYTE& modifiers, WORD& key) {
-    modifiers = FVIRTKEY;
+    while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
+    while (!value.empty() && iswspace(value.back())) value.pop_back();
+    modifiers = 0;
     key = 0;
+    if (value.empty()) return true;
+    modifiers = FVIRTKEY;
     std::vector<std::wstring> parts;
     size_t start = 0;
     while (start <= value.size()) {
@@ -5350,51 +5506,142 @@ bool ParseShortcutText(std::wstring value, BYTE& modifiers, WORD& key) {
     else if (token == L"ENTER" || token == L"RETURN") key = VK_RETURN;
     else if (token == L"ESC" || token == L"ESCAPE") key = VK_ESCAPE;
     else if (token == L"SPACE") key = VK_SPACE;
+    else if (token == L"UP") key = VK_UP;
+    else if (token == L"DOWN") key = VK_DOWN;
+    else if (token == L"LEFT") key = VK_LEFT;
+    else if (token == L"RIGHT") key = VK_RIGHT;
+    else if (token == L"BACK" || token == L"BACKSPACE") key = VK_BACK;
+    else if (token == L"DEL" || token == L"DELETE") key = VK_DELETE;
+    else if (token == L"HOME") key = VK_HOME;
+    else if (token == L"END") key = VK_END;
+    else if (token == L"PAGEUP" || token == L"PGUP") key = VK_PRIOR;
+    else if (token == L"PAGEDOWN" || token == L"PGDN") key = VK_NEXT;
+    else if (token == L"INSERT" || token == L"INS") key = VK_INSERT;
     else return false;
-    return (modifiers & (FCONTROL | FSHIFT | FALT)) != 0;
+    if ((modifiers & (FCONTROL | FSHIFT | FALT)) != 0) return true;
+    return key >= VK_F1 && key <= VK_F24;
+}
+
+void LayoutShortcutDialog(HWND window) {
+    if (!window) return;
+    constexpr int kTop = 42;
+    constexpr int kBottomArea = 58;
+    RECT client{};
+    GetClientRect(window, &client);
+    const int clientHeight = MulDiv(static_cast<int>(client.bottom), 96, static_cast<int>(g_app.dpi));
+    const int viewportBottom = std::max(kTop + 1, clientHeight - kBottomArea);
+    const int viewportHeight = viewportBottom - kTop;
+    const int maxOffset = std::max(0, g_shortcutDialogContentHeight - viewportHeight);
+    g_shortcutDialogScrollOffset = std::clamp(g_shortcutDialogScrollOffset, 0, maxOffset);
+
+    SCROLLINFO scroll{};
+    scroll.cbSize = sizeof(scroll);
+    scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    scroll.nMin = 0;
+    scroll.nMax = std::max(0, g_shortcutDialogContentHeight - 1);
+    scroll.nPage = static_cast<UINT>(std::max(1, viewportHeight));
+    scroll.nPos = g_shortcutDialogScrollOffset;
+    SetScrollInfo(window, SB_VERT, &scroll, TRUE);
+
+    for (ShortcutDialogControl& control : g_shortcutDialogControls) {
+        const int y = kTop + control.y - g_shortcutDialogScrollOffset;
+        const bool visible = y + control.height > kTop && y < viewportBottom;
+        if (visible) {
+            SetWindowPos(control.window, nullptr, Scale(control.x), Scale(y),
+                Scale(control.width), Scale(control.height), SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+        } else {
+            ShowWindow(control.window, SW_HIDE);
+        }
+    }
+    if (g_shortcutDialogHint) {
+        SetWindowPos(g_shortcutDialogHint, nullptr, Scale(24), Scale(10), Scale(620), Scale(24),
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    }
+    const int buttonY = Scale(std::max(kTop + 4, clientHeight - 44));
+    if (g_shortcutDialogApply) SetWindowPos(g_shortcutDialogApply, nullptr, Scale(350), buttonY, Scale(92), Scale(30), SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    if (g_shortcutDialogReset) SetWindowPos(g_shortcutDialogReset, nullptr, Scale(450), buttonY, Scale(100), Scale(30), SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    if (g_shortcutDialogCancel) SetWindowPos(g_shortcutDialogCancel, nullptr, Scale(558), buttonY, Scale(92), Scale(30), SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
 }
 
 LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
         g_shortcutEditControls.clear();
-        int y = 16;
+        g_shortcutDialogControls.clear();
+        g_shortcutDialogScrollOffset = 0;
+        constexpr int kTop = 42;
+        constexpr int kRowHeight = 28;
         for (size_t index = 0; index < g_shortcuts.size(); ++index) {
             const ShortcutBinding& binding = g_shortcuts[index];
-            HWND label = CreateWindowExW(0, L"STATIC", binding.label,
-                WS_CHILD | WS_VISIBLE, Scale(24), Scale(y + 3), Scale(190), Scale(24),
+            const int rowY = static_cast<int>(index) * kRowHeight;
+            HWND label = CreateWindowExW(0, L"STATIC", binding.label.c_str(),
+                WS_CHILD | WS_VISIBLE, Scale(24), Scale(kTop + rowY + 3), Scale(270), Scale(22),
                 window, nullptr, g_app.instance, nullptr);
             HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", binding.text.c_str(),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                Scale(220), Scale(y), Scale(250), Scale(26), window,
+                Scale(310), Scale(kTop + rowY), Scale(300), Scale(24), window,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShortcutEditFirst + index)),
                 g_app.instance, nullptr);
             SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
             SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
             if (g_app.darkTheme) SetWindowTheme(edit, L"DarkMode_Explorer", nullptr);
             g_shortcutEditControls.push_back(edit);
-            y += 30;
+            g_shortcutDialogControls.push_back({label, 24, rowY + 3, 270, 22});
+            g_shortcutDialogControls.push_back({edit, 310, rowY, 300, 24});
         }
-        HWND hint = CreateWindowExW(0, L"STATIC",
-            L"格式：Ctrl+Shift+S、F5、Alt+1。快捷键不能与其他功能重复。",
-            WS_CHILD | WS_VISIBLE, Scale(24), Scale(y + 4), Scale(500), Scale(24),
+        g_shortcutDialogContentHeight = static_cast<int>(g_shortcuts.size()) * kRowHeight;
+        g_shortcutDialogHint = CreateWindowExW(0, L"STATIC",
+            L"支持 Ctrl/Shift/Alt + 字母、数字、F1-F24、方向键等；留空表示取消快捷键。",
+            WS_CHILD | WS_VISIBLE, Scale(24), Scale(10), Scale(620), Scale(24),
             window, nullptr, g_app.instance, nullptr);
-        SendMessageW(hint, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
-        HWND apply = CreateWindowExW(0, L"BUTTON", L"应用",
+        SendMessageW(g_shortcutDialogHint, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        g_shortcutDialogApply = CreateWindowExW(0, L"BUTTON", L"应用",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            Scale(270), Scale(y + 34), Scale(82), Scale(30), window,
-            reinterpret_cast<HMENU>(kIdShortcutApply), g_app.instance, nullptr);
-        HWND reset = CreateWindowExW(0, L"BUTTON", L"恢复默认",
+            Scale(350), Scale(550), Scale(92), Scale(30), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShortcutApply)), g_app.instance, nullptr);
+        g_shortcutDialogReset = CreateWindowExW(0, L"BUTTON", L"恢复默认",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            Scale(360), Scale(y + 34), Scale(92), Scale(30), window,
-            reinterpret_cast<HMENU>(kIdShortcutReset), g_app.instance, nullptr);
-        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消",
+            Scale(450), Scale(550), Scale(100), Scale(30), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShortcutReset)), g_app.instance, nullptr);
+        g_shortcutDialogCancel = CreateWindowExW(0, L"BUTTON", L"取消",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            Scale(460), Scale(y + 34), Scale(82), Scale(30), window,
-            reinterpret_cast<HMENU>(kIdShortcutCancel), g_app.instance, nullptr);
-        ThemePushButtons({apply, reset, cancel});
+            Scale(558), Scale(550), Scale(92), Scale(30), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShortcutCancel)), g_app.instance, nullptr);
+        for (HWND button : {g_shortcutDialogApply, g_shortcutDialogReset, g_shortcutDialogCancel})
+            SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        ThemePushButtons({g_shortcutDialogApply, g_shortcutDialogReset, g_shortcutDialogCancel});
+        LayoutShortcutDialog(window);
         return 0;
     }
+    case WM_SIZE:
+        LayoutShortcutDialog(window);
+        return 0;
+    case WM_VSCROLL: {
+        const int action = LOWORD(wParam);
+        RECT client{};
+        GetClientRect(window, &client);
+        constexpr int kTop = 42;
+        constexpr int kBottomArea = 58;
+        const int clientHeight = MulDiv(static_cast<int>(client.bottom), 96, static_cast<int>(g_app.dpi));
+        const int viewportHeight = std::max(1, clientHeight - kBottomArea - kTop);
+        switch (action) {
+        case SB_LINEUP: g_shortcutDialogScrollOffset -= 28; break;
+        case SB_LINEDOWN: g_shortcutDialogScrollOffset += 28; break;
+        case SB_PAGEUP: g_shortcutDialogScrollOffset -= viewportHeight; break;
+        case SB_PAGEDOWN: g_shortcutDialogScrollOffset += viewportHeight; break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK: g_shortcutDialogScrollOffset = HIWORD(wParam); break;
+        case SB_TOP: g_shortcutDialogScrollOffset = 0; break;
+        case SB_BOTTOM: g_shortcutDialogScrollOffset = g_shortcutDialogContentHeight; break;
+        default: break;
+        }
+        LayoutShortcutDialog(window);
+        return 0;
+    }
+    case WM_MOUSEWHEEL:
+        g_shortcutDialogScrollOffset -= GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA * 56;
+        LayoutShortcutDialog(window);
+        return 0;
     case WM_COMMAND: {
         const int command = LOWORD(wParam);
         if (command == kIdShortcutReset) {
@@ -5423,15 +5670,15 @@ LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LP
                     SetFocus(g_shortcutEditControls[index]);
                     return 0;
                 }
-                if (std::find(parsed.begin(), parsed.end(), std::make_pair(modifiers, key)) != parsed.end()) {
+                if (modifiers != 0 && std::find(parsed.begin(), parsed.end(), std::make_pair(modifiers, key)) != parsed.end()) {
                     MessageBoxW(window, L"快捷键不能重复，请修改后再应用。", kWindowTitle, MB_ICONWARNING);
                     SetFocus(g_shortcutEditControls[index]);
                     return 0;
                 }
-                parsed.emplace_back(modifiers, key);
+                if (modifiers != 0) parsed.emplace_back(modifiers, key);
                 values.push_back(std::move(value));
             }
-            for (size_t index = 0; index < values.size(); ++index) g_shortcuts[index].text = values[index];
+            for (size_t index = 0; index < values.size() && index < g_shortcuts.size(); ++index) g_shortcuts[index].text = values[index];
             RebuildAccelerators();
             g_app.stateDirty = true;
             PersistAll(false);
@@ -5445,6 +5692,13 @@ LRESULT CALLBACK ShortcutDialogProc(HWND window, UINT message, WPARAM wParam, LP
         return 0;
     case WM_DESTROY:
         g_shortcutEditControls.clear();
+        g_shortcutDialogControls.clear();
+        g_shortcutDialogHint = nullptr;
+        g_shortcutDialogApply = nullptr;
+        g_shortcutDialogReset = nullptr;
+        g_shortcutDialogCancel = nullptr;
+        g_shortcutDialogContentHeight = 0;
+        g_shortcutDialogScrollOffset = 0;
         g_shortcutDialog = nullptr;
         {
             HWND owner = g_shortcutDialogOwner ? g_shortcutDialogOwner : g_app.window;
@@ -5490,12 +5744,11 @@ void OpenShortcutDialog() {
     klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassW(&klass);
-    const int height = 16 + static_cast<int>(g_shortcuts.size()) * 30 + 24 + 64;
     g_shortcutDialogOwner = g_app.settingsWindow ? g_app.settingsWindow : g_app.window;
     g_shortcutDialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
         klass.lpszClassName, L"MCnotepad 快捷键设置",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, Scale(570), Scale(height),
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VSCROLL | WS_CLIPCHILDREN,
+        CW_USEDEFAULT, CW_USEDEFAULT, Scale(680), Scale(620),
         g_shortcutDialogOwner, nullptr, g_app.instance, nullptr);
     if (!g_shortcutDialog) {
         g_shortcutDialogOwner = nullptr;
@@ -5510,31 +5763,17 @@ void OpenShortcutDialog() {
 HACCEL CreateAccelerators() {
     InitializeShortcutBindings();
     std::vector<ACCEL> entries;
+    std::vector<std::pair<BYTE, WORD>> used;
     for (const ShortcutBinding& binding : g_shortcuts) {
         BYTE modifiers = 0;
         WORD key = 0;
-        if (ParseShortcutText(binding.text, modifiers, key)) entries.push_back({modifiers, key, static_cast<WORD>(binding.command)});
+        if (ParseShortcutText(binding.text, modifiers, key) && modifiers != 0 &&
+            std::find(used.begin(), used.end(), std::make_pair(modifiers, key)) == used.end()) {
+            entries.push_back({modifiers, key, static_cast<WORD>(binding.command)});
+            used.emplace_back(modifiers, key);
+        }
     }
-    const ACCEL fixed[] = {
-        { FCONTROL | FALT | FVIRTKEY, 'S', kIdFileSaveAll },
-        { FCONTROL | FSHIFT | FVIRTKEY, 'W', kIdFileCloseAll },
-        { FCONTROL | FSHIFT | FVIRTKEY, 'T', kIdFileReopenClosed },
-        { FCONTROL | FVIRTKEY, 'Z', kIdEditUndo },
-        { FCONTROL | FVIRTKEY, 'Y', kIdEditRedo },
-        { FCONTROL | FVIRTKEY, 'X', kIdEditCut },
-        { FCONTROL | FVIRTKEY, 'C', kIdEditCopy },
-        { FCONTROL | FVIRTKEY, 'V', kIdEditPaste },
-        { FCONTROL | FVIRTKEY, 'A', kIdEditSelectAll },
-        { FCONTROL | FALT | FVIRTKEY, VK_DOWN, kIdMultiCaretNext },
-        { FALT | FSHIFT | FVIRTKEY, 'F', kIdToolbarFormat },
-        { FCONTROL | FSHIFT | FVIRTKEY, 'H', kIdReplaceInFolder },
-        { FVIRTKEY, VK_F5, kIdToolbarRun },
-        { FVIRTKEY, VK_F2, kIdFileRename },
-        { FVIRTKEY, VK_F3, kIdFindNext },
-        { FSHIFT | FVIRTKEY, VK_F3, kIdFindPrevious }
-    };
-    entries.insert(entries.end(), std::begin(fixed), std::end(fixed));
-    return CreateAcceleratorTableW(entries.data(), static_cast<int>(entries.size()));
+    return entries.empty() ? nullptr : CreateAcceleratorTableW(entries.data(), static_cast<int>(entries.size()));
 }
 
 void RebuildAccelerators() {
@@ -17590,6 +17829,16 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdToolbarSaveAs: SaveDocument(g_app.activeIndex, true); break;
         case kIdFileSaveAll: SaveAllDocuments(); break;
         case kIdToolbarClose: CloseDocument(g_app.activeIndex); break;
+        case kIdTabNext: SelectAdjacentTab(1); break;
+        case kIdTabPrevious: SelectAdjacentTab(-1); break;
+        case kIdTabTogglePinned:
+            if (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size())) {
+                g_app.documents[static_cast<size_t>(g_app.activeIndex)].pinned =
+                    !g_app.documents[static_cast<size_t>(g_app.activeIndex)].pinned;
+                if (g_app.tabs) InvalidateRect(g_app.tabs, nullptr, FALSE);
+                g_app.stateDirty = true;
+            }
+            break;
         case kIdToolbarUndo: HandleEditCommand(kIdEditUndo); break;
         case kIdToolbarRedo: HandleEditCommand(kIdEditRedo); break;
         case kIdToolbarFind: OpenFindDialog(false); break;
@@ -17959,6 +18208,10 @@ int RunSelfTests() {
     WORD key = 0;
     failures += expect(ParseShortcutText(L"Ctrl+Shift+S", modifiers, key) &&
         (modifiers & FCONTROL) && (modifiers & FSHIFT) && key == 'S');
+    failures += expect(ParseShortcutText(L"F5", modifiers, key) && modifiers == FVIRTKEY && key == VK_F5);
+    failures += expect(ParseShortcutText(L"Ctrl+Down", modifiers, key) &&
+        (modifiers & FCONTROL) && key == VK_DOWN);
+    failures += expect(ParseShortcutText(L"", modifiers, key) && modifiers == 0 && key == 0);
     failures += expect(!ParseShortcutText(L"Ctrl+Unknown", modifiers, key));
     const auto lines = SplitLines(L"a\r\nb\nc");
     failures += expect(lines.size() == 3 && JoinLines(lines, L"\r") == L"a\rb\rc");
