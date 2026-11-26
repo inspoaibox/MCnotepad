@@ -103,7 +103,7 @@ void OpenGotoDialog() {
     if (!registered) {
         WNDCLASSW klass{};
         klass.hInstance = g_app.instance;
-        klass.lpfnWndProc = GotoProc;
+        klass.lpfnWndProc = Guarded<GotoProc>;
         klass.lpszClassName = L"MCnotepadGoto";
         klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         registered = RegisterClassW(&klass) != 0;

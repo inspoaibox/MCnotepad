@@ -502,7 +502,7 @@ void OpenShortcutDialog() {
     InitializeShortcutBindings();
     WNDCLASSW klass{};
     klass.hInstance = g_app.instance;
-    klass.lpfnWndProc = ShortcutDialogProc;
+    klass.lpfnWndProc = Guarded<ShortcutDialogProc>;
     klass.lpszClassName = L"MCnotepadShortcuts";
     klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
@@ -941,7 +941,7 @@ void OpenSettingsDialog() {
     }
     WNDCLASSW klass{};
     klass.hInstance = g_app.instance;
-    klass.lpfnWndProc = SettingsProc;
+    klass.lpfnWndProc = Guarded<SettingsProc>;
     klass.lpszClassName = L"MCnotepadSettings";
     klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);

@@ -885,7 +885,7 @@ bool OpenLogViewer(const std::wstring& path) {
     if (!registered) {
         WNDCLASSW klass{};
         klass.hInstance = g_app.instance;
-        klass.lpfnWndProc = LogViewerProc;
+        klass.lpfnWndProc = Guarded<LogViewerProc>;
         klass.lpszClassName = L"MCnotepadLog";
         klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         klass.hIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_MCNOTEPAD));

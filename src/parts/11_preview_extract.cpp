@@ -230,7 +230,7 @@ int ConfirmChange(const wchar_t* title, const std::wstring& before, const std::w
     if (!registered) {
         WNDCLASSW klass{};
         klass.hInstance = g_app.instance;
-        klass.lpfnWndProc = PreviewProc;
+        klass.lpfnWndProc = Guarded<PreviewProc>;
         klass.lpszClassName = L"MCnotepadPreview";
         klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         registered = RegisterClassW(&klass) != 0;

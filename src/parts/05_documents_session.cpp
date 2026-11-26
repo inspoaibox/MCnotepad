@@ -164,6 +164,28 @@ bool SaveSessionFile() {
     return WriteDataFile(g_app.sessionPath, output.str());
 }
 
+bool PersistAll(bool forceSnapshots);
+
+int g_unexpectedExceptions = 0;
+
+void ReportUnexpectedException(const char* what) {
+    ++g_unexpectedExceptions;
+    if (!g_app.window) return;  // self-test: no session to save, nobody to tell
+    static bool reporting = false;
+    if (reporting) return;  // the message box pumps messages; don't stack reports
+    reporting = true;
+    bool saved = false;
+    try {
+        saved = PersistAll(true);
+    } catch (...) {
+    }
+    std::wstring detail = what ? Utf8ToWide(what) : std::wstring(L"未知错误");
+    std::wstring message = L"刚才的操作出现了意外错误，已中止（程序没有退出）。\n\n错误信息：" + detail + L"\n\n" +
+        (saved ? L"所有标签的内容已写入恢复快照。" : L"恢复快照写入失败，请尽快保存重要内容。");
+    MessageBoxW(g_app.window, message.c_str(), kWindowTitle, MB_ICONERROR);
+    reporting = false;
+}
+
 bool PersistAll(bool forceSnapshots) {
     bool success = true;
     if (forceSnapshots) {
@@ -786,7 +808,7 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     }
 
     const WNDPROC oldEditorProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-        document.editor, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(EditorProc)));
+        document.editor, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(Guarded<EditorProc>)));
     if (oldEditorProc != nullptr) {
         g_editorProcs[document.editor] = oldEditorProc;
     }

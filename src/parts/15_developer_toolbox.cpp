@@ -953,7 +953,7 @@ void ToggleToolbox(bool show) {
         if (!registered) {
             WNDCLASSW klass{};
             klass.hInstance = g_app.instance;
-            klass.lpfnWndProc = ToolboxProc;
+            klass.lpfnWndProc = Guarded<ToolboxProc>;
             klass.lpszClassName = L"MCnotepadToolbox";
             klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
             registered = RegisterClassW(&klass) != 0;

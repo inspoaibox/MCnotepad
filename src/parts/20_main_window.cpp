@@ -811,6 +811,15 @@ int RunSelfTests() {
             DestroyWindow(edit);
         }
     }
+    // An exception escaping a window procedure is caught, not fatal.
+    {
+        struct Thrower {
+            static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM) { throw std::invalid_argument("test"); }
+        };
+        const int before = g_unexpectedExceptions;
+        const LRESULT result = Guarded<Thrower::Proc>(nullptr, WM_COMMAND, 0, 0);
+        failures += expect(result == 0 && g_unexpectedExceptions == before + 1);
+    }
     // Atomic save keeps attributes and hard links and leaves no temp files.
     {
         wchar_t tempRoot[MAX_PATH]{};
@@ -871,7 +880,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
 
     WNDCLASSW gutterClass{};
     gutterClass.hInstance = instance;
-    gutterClass.lpfnWndProc = GutterProc;
+    gutterClass.lpfnWndProc = Guarded<GutterProc>;
     gutterClass.lpszClassName = L"MCGutter";
     gutterClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     gutterClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
@@ -880,7 +889,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.hInstance = instance;
-    windowClass.lpfnWndProc = WindowProc;
+    windowClass.lpfnWndProc = Guarded<WindowProc>;
     windowClass.lpszClassName = kWindowClass;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_MCNOTEPAD));

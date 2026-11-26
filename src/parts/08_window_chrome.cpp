@@ -1373,10 +1373,10 @@ LRESULT CALLBACK StatusBarProc(HWND bar, UINT message, WPARAM wParam, LPARAM lPa
 
 void RegisterChromeClasses() {
     const struct { const wchar_t* name; WNDPROC proc; UINT style; } classes[] = {
-        {L"MCMenuBar", MenuBarProc, 0},
-        {L"MCToolbar", ToolbarProc, 0},
-        {L"MCTabStrip", TabStripProc, CS_DBLCLKS},
-        {L"MCStatusBar", StatusBarProc, 0},
+        {L"MCMenuBar", Guarded<MenuBarProc>, 0},
+        {L"MCToolbar", Guarded<ToolbarProc>, 0},
+        {L"MCTabStrip", Guarded<TabStripProc>, CS_DBLCLKS},
+        {L"MCStatusBar", Guarded<StatusBarProc>, 0},
     };
     for (const auto& entry : classes) {
         WNDCLASSW klass{};

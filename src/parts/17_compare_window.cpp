@@ -327,7 +327,7 @@ void OpenCompareWindow(CompareSide left, CompareSide right, bool structure = fal
     if (!registered) {
         WNDCLASSW klass{};
         klass.hInstance = g_app.instance;
-        klass.lpfnWndProc = CompareWindowProc;
+        klass.lpfnWndProc = Guarded<CompareWindowProc>;
         klass.lpszClassName = L"MCnotepadCompare";
         klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         klass.hIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_MCNOTEPAD));

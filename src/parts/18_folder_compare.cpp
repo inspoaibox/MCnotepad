@@ -349,7 +349,7 @@ void CompareFolderPaths(const std::wstring& left, const std::wstring& right) {
     if (!registered) {
         WNDCLASSW klass{};
         klass.hInstance = g_app.instance;
-        klass.lpfnWndProc = FolderCompareProc;
+        klass.lpfnWndProc = Guarded<FolderCompareProc>;
         klass.lpszClassName = L"MCnotepadFolderCompare";
         klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         klass.hIcon = LoadIconW(g_app.instance, MAKEINTRESOURCEW(IDI_MCNOTEPAD));

@@ -258,7 +258,7 @@ void ShowReplaceInFilesPreview() {
     if (!registered) {
         WNDCLASSW klass{};
         klass.hInstance = g_app.instance;
-        klass.lpfnWndProc = ReplacePreviewProc;
+        klass.lpfnWndProc = Guarded<ReplacePreviewProc>;
         klass.lpszClassName = L"MCnotepadReplacePreview";
         klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         registered = RegisterClassW(&klass) != 0;

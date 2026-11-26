@@ -134,7 +134,7 @@ bool PromptForText(const wchar_t* title, const std::vector<std::wstring>& labels
     if (!registered) {
         WNDCLASSW klass{};
         klass.hInstance = g_app.instance;
-        klass.lpfnWndProc = PromptProc;
+        klass.lpfnWndProc = Guarded<PromptProc>;
         klass.lpszClassName = L"MCnotepadPrompt";
         klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         registered = RegisterClassW(&klass) != 0;
@@ -836,7 +836,7 @@ void OpenPrefixSuffixDialog() {
     if (!ActiveDocument()) return;
     static bool registered = false;
     if (!registered) {
-        WNDCLASSW klass{}; klass.hInstance = g_app.instance; klass.lpfnWndProc = PrefixSuffixDialogProc; klass.lpszClassName = L"MCnotepadPrefixSuffix"; klass.hCursor = LoadCursorW(nullptr, IDC_ARROW); registered = RegisterClassW(&klass) != 0;
+        WNDCLASSW klass{}; klass.hInstance = g_app.instance; klass.lpfnWndProc = Guarded<PrefixSuffixDialogProc>; klass.lpszClassName = L"MCnotepadPrefixSuffix"; klass.hCursor = LoadCursorW(nullptr, IDC_ARROW); registered = RegisterClassW(&klass) != 0;
     }
     PrefixSuffixDialogState state;
     RECT owner{}; GetWindowRect(g_app.window, &owner);

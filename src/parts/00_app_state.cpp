@@ -832,3 +832,20 @@ void CreateUiFonts();
 void UpdateStatusBar();
 void SetMenuState();
 
+// A C++ exception escaping a window procedure makes Windows end the process
+// at once (0xC000041D), losing unsaved edits: the data generator did this
+// with an empty Faker date range. Every window procedure is registered
+// through Guarded<>, which saves recovery snapshots and reports the error.
+void ReportUnexpectedException(const char* what);
+
+template <WNDPROC Proc>
+LRESULT CALLBACK Guarded(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    try {
+        return Proc(window, message, wParam, lParam);
+    } catch (const std::exception& error) {
+        ReportUnexpectedException(error.what());
+    } catch (...) {
+        ReportUnexpectedException(nullptr);
+    }
+    return 0;
+}

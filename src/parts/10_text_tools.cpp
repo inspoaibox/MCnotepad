@@ -850,7 +850,7 @@ void OpenDataGeneratorDialog(int command) {
     if (!ActiveDocument()) return;
     static bool registered = false;
     if (!registered) {
-        WNDCLASSW klass{}; klass.hInstance = g_app.instance; klass.lpfnWndProc = DataGeneratorDialogProc;
+        WNDCLASSW klass{}; klass.hInstance = g_app.instance; klass.lpfnWndProc = Guarded<DataGeneratorDialogProc>;
         klass.lpszClassName = L"MCnotepadDataGenerator"; klass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         registered = RegisterClassW(&klass) != 0;
     }
