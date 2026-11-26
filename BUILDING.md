@@ -32,6 +32,21 @@ MCnotepad-<版本>-portable.zip   便携版
 SHA256SUMS.txt                  校验值
 ```
 
+发布目录固定遵循以下规则：
+
+```text
+dist\<版本>\    每个正式版本的永久归档，只读使用
+dist\latest\    当前最新正式版本的唯一入口，由 package.ps1 自动覆盖
+```
+
+不要从 `build\windows-x64\Release` 或 `dist` 根目录下的临时文件复制程序发布。没有安装 Inno Setup 6 时，可使用下面的命令生成并更新 `dist\latest` 中的便携版：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File package.ps1 -PortableOnly
+```
+
+完整发布仍使用不带 `-PortableOnly` 的命令，它会同时生成安装版和便携版。发布完成后，用户只需要从 `dist\latest` 取包；需要追溯历史版本时再进入对应的版本目录。
+
 有未提交的修改时脚本会停止；加上 `-AllowDirty` 可以生成测试用的安装包（版本信息中会标记 `-dirty`）。
 
 安装程序默认只为当前用户安装，不需要管理员权限（第一页可以选择为所有用户安装）；可选创建桌面快捷方式和右键菜单“用 MCnotepad 打开”。安装或升级时，正在运行的 MCnotepad（包括隐藏在托盘中的）会先保存所有标签再退出。卸载时保留 `%LOCALAPPDATA%\MCnotepad` 中的会话和恢复快照。

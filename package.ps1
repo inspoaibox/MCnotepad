@@ -2,6 +2,7 @@
   Builds an MCnotepad release and packages it. Run from the repository root:
 
       powershell -ExecutionPolicy Bypass -File package.ps1
+      powershell -ExecutionPolicy Bypass -File package.ps1 -PortableOnly
 
   Produces, in dist\<version>\ :
       MCnotepad-<version>-setup.exe      installer (the normal way to use MCnotepad)
@@ -13,7 +14,8 @@
   MCNOTEPAD_RELEASE=ON, separate from the development build in build\windows-x64.
 #>
 param(
-    [switch]$AllowDirty   # package even with uncommitted changes (build id gets "-dirty")
+    [switch]$AllowDirty,   # package even with uncommitted changes (build id gets "-dirty")
+    [switch]$PortableOnly  # skip Inno Setup and create the canonical portable release only
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -36,7 +38,7 @@ Step "MCnotepad $version ($buildId)"
 # ---- tools --------------------------------------------------------------------------
 $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe", "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") |
     Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $iscc) { Fail 'Inno Setup 6 is not installed (https://jrsoftware.org/isdl.php)' }
+if (-not $PortableOnly -and -not $iscc) { Fail 'Inno Setup 6 is not installed; use -PortableOnly for a portable release or install Inno Setup 6' }
 
 # ---- release build --------------------------------------------------------------------
 $buildDir = Join-Path $root 'build\package'
@@ -79,14 +81,27 @@ Compress-Archive -Path $portable -DestinationPath $zip -CompressionLevel Optimal
 Remove-Item -LiteralPath $portable -Recurse -Force
 
 # ---- installer ------------------------------------------------------------------------
-Step 'installer'
-& $iscc /Q "/DAppVersion=$version" "/DBuildId=$buildId" "/DStageDir=$stage" "/DOutputDir=$out" (Join-Path $root 'installer\MCnotepad.iss')
-if ($LASTEXITCODE) { Fail 'Inno Setup failed' }
+if (-not $PortableOnly) {
+    Step 'installer'
+    & $iscc /Q "/DAppVersion=$version" "/DBuildId=$buildId" "/DStageDir=$stage" "/DOutputDir=$out" (Join-Path $root 'installer\MCnotepad.iss')
+    if ($LASTEXITCODE) { Fail 'Inno Setup failed' }
+}
 Remove-Item -LiteralPath $stage -Recurse -Force
 
 # ---- checksums and summary ------------------------------------------------------------
 $files = Get-ChildItem $out -File | Where-Object { $_.Name -like "MCnotepad-$version-*" }
 $files | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } |
     Set-Content -Encoding ASCII (Join-Path $out 'SHA256SUMS.txt')
+$latest = Join-Path $root 'dist\latest'
+if (Test-Path $latest) { Remove-Item -LiteralPath $latest -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $latest | Out-Null
+foreach ($file in $files) { Copy-Item -LiteralPath $file.FullName -Destination $latest }
+Copy-Item -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Destination $latest
+Set-Content -LiteralPath (Join-Path $latest 'VERSION.txt') -Value @(
+    "MCnotepad $version"
+    "Build: $buildId"
+    "Source: dist\$version"
+) -Encoding ASCII
 Step "done: $out"
+Write-Host "latest: $latest"
 $files | ForEach-Object { Write-Host ('    {0,-36} {1,8:N1} MB' -f $_.Name, ($_.Length / 1MB)) }
