@@ -1021,7 +1021,7 @@ bool OpenFileInNewTab(const fs::path& path) {
         return false;
     }
     SelectTab(index);
-    PersistAll(false);
+    g_app.stateDirty = true;  // the autosave timer writes the session within two seconds
     return true;
 }
 
@@ -1029,7 +1029,7 @@ void NewDocument() {
     const int index = CreateDocument({}, {}, {}, true, false, 0, 0, 0);
     if (index >= 0) {
         SelectTab(index);
-        PersistAll(false);
+        g_app.stateDirty = true;  // nothing to lose yet; the autosave timer writes it
     }
 }
 

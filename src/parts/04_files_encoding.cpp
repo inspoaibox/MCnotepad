@@ -110,7 +110,9 @@ bool ReadBinaryFile(const fs::path& path, std::vector<char>& bytes) {
     return input.good() || input.eof();
 }
 
-bool WriteBinaryFile(const fs::path& path, std::string_view bytes) {
+// `flush` forces the data to the physical disk before returning. That costs
+// tens of milliseconds per file, so it is used for the user's own files only.
+bool WriteBinaryFile(const fs::path& path, std::string_view bytes, bool flush = true) {
     HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
@@ -128,7 +130,7 @@ bool WriteBinaryFile(const fs::path& path, std::string_view bytes) {
         }
         written += completed;
     }
-    if (success && !FlushFileBuffers(handle)) {
+    if (success && flush && !FlushFileBuffers(handle)) {
         success = false;
     }
     CloseHandle(handle);
@@ -172,7 +174,10 @@ bool WriteDataFile(const fs::path& path, std::string_view bytes) {
     swprintf_s(suffix, L".mcn-%08lx%04lx.tmp", GetTickCount(), GetCurrentProcessId() & 0xFFFF);
     const fs::path temporaryPath = path.wstring() + suffix;
     std::error_code error;
-    if (!WriteBinaryFile(temporaryPath, bytes)) {
+    // No forced flush: these files are rewritten every few seconds while
+    // typing, and the rename below already keeps a crash from leaving a
+    // half-written file in place.
+    if (!WriteBinaryFile(temporaryPath, bytes, false)) {
         fs::remove(temporaryPath, error);
         return false;
     }

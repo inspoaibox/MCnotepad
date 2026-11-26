@@ -482,7 +482,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 start = index + 1;
             }
         }
-        if (IsIconic(window)) ShowWindow(window, SW_RESTORE);
+        // Launching MCnotepad again (taskbar, Start menu, a double-clicked
+        // file) must bring the window back, also when the X button only hid
+        // it in the tray.
+        if (g_app.hiddenToTray || !IsWindowVisible(window)) RestoreMainWindowFromTray();
+        else if (IsIconic(window)) ShowWindow(window, SW_RESTORE);
         SetForegroundWindow(window);
         // Open asynchronously: the sender is blocked until we return, and opening
         // can show message boxes.

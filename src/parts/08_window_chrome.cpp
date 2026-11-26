@@ -232,6 +232,8 @@ RECT ToScreen(HWND window, RECT rect) {
     return rect;
 }
 
+constexpr UINT kMessageCreateTooltips = WM_APP + 60;
+
 HWND CreateTooltip(HWND owner) {
     HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
         WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -616,7 +618,13 @@ void InvalidateToolbar() {
 
 LRESULT CALLBACK ToolbarProc(HWND bar, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
-    case WM_CREATE: {
+    case WM_CREATE:
+        // Creating a tooltip window is slow the first time (it loads the
+        // common-controls theme); do it once the main window is on screen.
+        PostMessageW(bar, kMessageCreateTooltips, 0, 0);
+        return 0;
+    case kMessageCreateTooltips: {
+        if (g_toolTip) return 0;
         g_toolTip = CreateTooltip(bar);
         for (size_t index = 0; index < g_toolItems.size(); ++index) {
             std::wstring text = ToolTipText(g_toolItems[index].id);
@@ -627,6 +635,7 @@ LRESULT CALLBACK ToolbarProc(HWND bar, UINT message, WPARAM wParam, LPARAM lPara
             tool.lpszText = text.data();
             SendMessageW(g_toolTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
         }
+        LayoutToolbarItems(bar);  // gives each tool its rectangle
         return 0;
     }
     case WM_ERASEBKGND:
@@ -937,7 +946,11 @@ DWORD g_tabLastCloseTick = 0;
 
 LRESULT CALLBACK TabStripProc(HWND strip, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
-    case WM_CREATE: {
+    case WM_CREATE:
+        PostMessageW(strip, kMessageCreateTooltips, 0, 0);  // see ToolbarProc
+        return 0;
+    case kMessageCreateTooltips: {
+        if (g_tabTip) return 0;
         g_tabTip = CreateTooltip(strip);
         TOOLINFOW tool{sizeof(tool)};
         tool.uFlags = TTF_SUBCLASS;
