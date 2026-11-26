@@ -640,7 +640,9 @@ void ApplyEditorFont() {
         EditorEventMute mute(document.editor);
         SendMessageW(document.editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
         ApplyEditorTypography(document.editor);
-        SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
+        SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(kEditorTextMargin), 0));
+        ApplyEditorTopInset(document.editor);  // keeps the top spacing and the margin together
+        HighlightDocument(document);  // the font reset above cleared the syntax colours
         InvalidateRect(document.editor, nullptr, TRUE);
     }
     RefreshGutter();

@@ -783,6 +783,8 @@ void AppendEncodingItems(HMENU menu);
 void CheckDocumentMenuItems(HMENU menu);
 void ApplyWordWrapAll();
 void ApplyEditorLineSpacing(HWND editor);
+void ApplyEditorTopInset(HWND editor);
+constexpr int kEditorTextMargin = 6;  // gap between the line numbers and the text, 96-DPI pixels
 void ApplyEditorLineSpacingAll();
 void OpenCustomLineSpacingDialog();
 void OpenCustomTopSpacingDialog();

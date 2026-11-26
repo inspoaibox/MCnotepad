@@ -518,7 +518,10 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         SyntaxOnViewChanged(editor);
     } else if (message == WM_SIZE || message == WM_SHOWWINDOW) {
         UpdateHorizontalScrollbar(editor);
-        if (message == WM_SIZE) SyntaxOnViewChanged(editor);
+        if (message == WM_SIZE) {
+            ApplyEditorTopInset(editor);  // no-op once set; needed after the editor first gets a size
+            SyntaxOnViewChanged(editor);
+        }
     }
     if (message == WM_LBUTTONUP) {
         for (TabDocument& document : g_app.documents) {
@@ -652,6 +655,28 @@ void ApplyWordWrapAll() {
 // the complete document keeps the setting consistent across every paragraph,
 // while the event guard and modify flag preservation ensure this view option
 // never turns a clean document into an unsaved one.
+// "Top spacing" is the gap between the top of the editor and the first line
+// of text, nothing else. RichEdit keeps a custom top inset of its text area
+// through resizes and margin changes, so setting it once is enough.
+void ApplyEditorTopInset(HWND editor) {
+    if (!editor) return;
+    // A rectangle set while the editor has no size yet is turned into
+    // left 0 / top 0 and stays so; it is applied on the first WM_SIZE instead.
+    RECT client{};
+    GetClientRect(editor, &client);
+    if (client.right <= Scale(kEditorTextMargin) || client.bottom <= Scale(g_app.topSpacingPixels)) return;
+    RECT format{};
+    SendMessageW(editor, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&format));
+    // The left edge is set here too: once a custom text rectangle exists,
+    // RichEdit no longer applies EM_SETMARGINS to it.
+    const LONG top = Scale(g_app.topSpacingPixels);
+    const LONG left = Scale(kEditorTextMargin);
+    if (format.top == top && format.left == left) return;
+    format.top = top;
+    format.left = left;
+    SendMessageW(editor, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&format));
+}
+
 void ApplyEditorLineSpacing(HWND editor) {
     if (!editor) return;
     EditorEventMute mute(editor);
@@ -661,6 +686,8 @@ void ApplyEditorLineSpacing(HWND editor) {
 
     PARAFORMAT2 format{};
     format.cbSize = sizeof(format);
+    // PFM_SPACEBEFORE with 0 clears the per-paragraph gap older builds used
+    // for "top spacing"; that is now an inset above the text area instead.
     format.dwMask = PFM_LINESPACING | PFM_SPACEBEFORE;
     // Use one fixed paragraph line box for the whole document.  RichEdit's
     // multiple-line mode derives the box from the selected glyph run, so a
@@ -682,12 +709,12 @@ void ApplyEditorLineSpacing(HWND editor) {
     const int lineTwips = std::clamp(MulDiv(linePixels, 1440, static_cast<int>(g_app.dpi)), 120, 720);
     format.bLineSpacingRule = tomLineSpaceExactly;
     format.dyLineSpacing = lineTwips;
-    format.dySpaceBefore = static_cast<SHORT>(std::clamp(
-        MulDiv(g_app.topSpacingPixels, 1440, static_cast<int>(g_app.dpi)), 0, 1440));
+    format.dySpaceBefore = 0;
 
     SendMessageW(editor, EM_SETSEL, 0, -1);
     SendMessageW(editor, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format));
     RestoreSelection(editor, savedSelection);
+    ApplyEditorTopInset(editor);
     SendMessageW(editor, EM_SETMODIFY, wasModified ? TRUE : FALSE, 0);
 
     const LONG nowVisibleLine = static_cast<LONG>(SendMessageW(editor, EM_GETFIRSTVISIBLELINE, 0, 0));
@@ -739,7 +766,7 @@ void OpenCustomLineSpacingDialog() {
 void OpenCustomTopSpacingDialog() {
     std::wstring value = std::to_wstring(g_app.topSpacingPixels);
     std::vector<std::wstring> values{value};
-    if (!PromptForText(L"自定义顶部间距", {L"每段顶部间距（像素，0 - 40）："}, values, nullptr, nullptr)) {
+    if (!PromptForText(L"自定义顶部间距", {L"编辑区顶部与第一行文字之间的距离（像素，0 - 40）："}, values, nullptr, nullptr)) {
         return;
     }
     int pixels = -1;
@@ -817,7 +844,7 @@ int CreateDocument(std::wstring path, std::wstring title, std::wstring text,
     SendMessageW(document.editor, WM_SETFONT,
         reinterpret_cast<WPARAM>(g_app.editorFont != nullptr
             ? g_app.editorFont : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-    SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(6), 0));
+    SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(kEditorTextMargin), 0));
     // Keep the selected Latin font, but allow RichEdit to choose a proper
     // fallback face for CJK text instead of drawing replacement boxes.
     ApplyEditorTypography(document.editor);

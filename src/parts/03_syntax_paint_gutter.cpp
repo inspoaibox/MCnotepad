@@ -581,13 +581,19 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 if (start < 0) break;
                 POINTL position{};
                 SendMessageW(editor, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&position), start);
-                // RichEdit reports the character box before its internal
-                // top inset; the gutter has no such inset. Keep the number
-                // baseline aligned with the first glyph of the text line.
-                const int y = position.y + origin.y + Scale(5);
-                if (y > client.bottom) break;
+                if (position.y + origin.y > client.bottom) break;
                 const long paragraph = fastParagraphOf(static_cast<LONG>(start));
                 if (paragraph != previousParagraph) {
+                    // Numbers sit on the line's own text baseline, as RichEdit
+                    // lays it out (line spacing, top inset and font fallback all
+                    // move it), so they line up with the text at any setting.
+                    int baseline = position.y + origin.y + metrics.tmAscent;
+                    POINT onScreen{};
+                    if (tom && tom.BaselineScreenPoint(static_cast<LONG>(start), onScreen)) {
+                        ScreenToClient(window, &onScreen);
+                        baseline = onScreen.y;
+                    }
+                    const int y = baseline - metrics.tmAscent;  // top of the number's cell
                     const auto fold = std::find_if(activeDocument.folds.begin(), activeDocument.folds.end(),
                         [paragraph](const FoldRegion& region) { return region.line + 1 == paragraph; });
                     if (fold != activeDocument.folds.end()) {
@@ -630,8 +636,9 @@ LRESULT CALLBACK GutterProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     wchar_t number[16]{};
                     swprintf_s(number, L"%ld", paragraph);
                     SetTextColor(dc, paragraph == caretParagraph ? CurrentPalette().tabActiveText : GutterForeground());
-                    RECT lineRect{0, y, right, y + metrics.tmHeight};
-                    DrawTextW(dc, number, -1, &lineRect, DT_RIGHT | DT_SINGLELINE | DT_TOP | DT_NOCLIP);
+                    const UINT previousAlign = SetTextAlign(dc, TA_RIGHT | TA_BASELINE);
+                    ExtTextOutW(dc, right, baseline, 0, nullptr, number, static_cast<UINT>(wcslen(number)), nullptr);
+                    SetTextAlign(dc, previousAlign);
                 }
                 previousParagraph = paragraph;
             }

@@ -388,6 +388,17 @@ public:
         return {static_cast<LONG>(start), static_cast<LONG>(end)};
     }
 
+    // Screen position of the text baseline at `position` (the line's real
+    // baseline, whatever the line spacing or fonts). False if RichEdit can't say.
+    bool BaselineScreenPoint(LONG position, POINT& point) {
+        if (!range_ || FAILED(range_->SetRange(position, position))) return false;
+        long x = 0, y = 0;
+        constexpr long kAllowOffClient = 0x200;  // tomAllowOffClient: lines partly scrolled out
+        if (range_->GetPoint(tomStart | TA_BASELINE | TA_LEFT | kAllowOffClient, &x, &y) != S_OK) return false;
+        point = POINT{x, y};
+        return true;
+    }
+
     LONG ParagraphStart(LONG position) {
         long start = 0;
         if (range_ && SUCCEEDED(range_->SetRange(position, position)) &&
