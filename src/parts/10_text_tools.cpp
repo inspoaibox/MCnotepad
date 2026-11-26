@@ -986,15 +986,15 @@ void AppendTextToolMenus(HMENU menu) {
     AppendMenuW(extract, MF_STRING, kIdExtractUrls, L"链接");
     AppendMenuW(extract, MF_STRING, kIdExtractIps, L"IP 地址");
     AppendMenuW(extract, MF_STRING, kIdExtractNumbers, L"数字");
-    AppendMenuW(extract, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(extract, MF_STRING, kIdExtractKeywordLines, L"包含关键词的行...");
-    AppendMenuW(extract, MF_STRING, kIdExtractFields, L"指定列（字段）...");
-    AppendMenuW(extract, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(extract, MF_STRING, kIdExtractDates, L"日期和时间");
     AppendMenuW(extract, MF_STRING, kIdExtractPhones, L"手机号");
     AppendMenuW(extract, MF_STRING, kIdExtractUuid, L"UUID / GUID");
     AppendMenuW(extract, MF_STRING, kIdExtractHexColors, L"十六进制颜色");
     AppendMenuW(extract, MF_STRING, kIdExtractQuoted, L"引号内容");
+    // Items that ask for input first come last, together.
+    AppendMenuW(extract, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(extract, MF_STRING, kIdExtractKeywordLines, L"包含关键词的行...");
+    AppendMenuW(extract, MF_STRING, kIdExtractFields, L"指定列（字段）...");
     AppendMenuW(extract, MF_STRING, kIdExtractCustomRegex, L"自定义正则规则...");
 
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(lines), L"行处理");

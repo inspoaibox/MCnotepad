@@ -636,7 +636,7 @@ void ApplyEditorFont() {
     g_app.editorFont = CreateFontW(fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         FIXED_PITCH | FF_MODERN, g_app.fontFamily.c_str());
-    for (const TabDocument& document : g_app.documents) {
+    for (TabDocument& document : g_app.documents) {
         const SelectionState savedSelection = CaptureSelection(document.editor);
         const LONG firstVisibleLine = static_cast<LONG>(SendMessageW(
             document.editor, EM_GETFIRSTVISIBLELINE, 0, 0));
@@ -644,6 +644,13 @@ void ApplyEditorFont() {
         EditorEventMute mute(document.editor);
         SendMessageW(document.editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
         ApplyEditorTypography(document.editor);
+        // WM_SETFONT resets every character's colour (black text on dark
+        // themes) and the fixed line height still matches the old size
+        // (lines overlapping after Ctrl+wheel): put both back.
+        ApplyEditorTheme(document.editor);
+        document.bracketMatchStart = -1;  // its background was cleared too
+        document.bracketMatchEnd = -1;
+        ApplyEditorLineSpacing(document.editor);
         SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(kEditorTextMargin), 0));
         ApplyEditorTopInset(document.editor);  // keeps the top spacing and the margin together
         RestoreSelection(document.editor, savedSelection);

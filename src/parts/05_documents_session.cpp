@@ -462,7 +462,7 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
             ChangeEditorFontSize(-1);
             return 0;
         }
-        if (wParam == '0') {
+        if (wParam == '0' || wParam == VK_NUMPAD0) {
             ChangeEditorFontSize(13 - g_app.fontSize);
             return 0;
         }
