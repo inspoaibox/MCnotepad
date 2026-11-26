@@ -80,7 +80,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         } else if (wParam == kTimerHighlight) {
             KillTimer(window, kTimerHighlight);
             if (const TabDocument* document = ActiveDocument()) {
-                HighlightDocument(*document);
+                // Never reformat RichEdit while an IME owns a composition
+                // range.  TOM formatting during composition makes Windows'
+                // candidate window and caret flicker or jump. WM_IME_ENDCOMPOSITION
+                // schedules this refresh again after the committed text is in place.
+                if (!IsEditorImeComposing(document->editor)) HighlightDocument(*document);
             }
         }
         return 0;

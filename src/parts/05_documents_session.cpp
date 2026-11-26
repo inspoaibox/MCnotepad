@@ -400,6 +400,11 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
 
     if (message == WM_IME_STARTCOMPOSITION) {
         g_imeComposingEditors.insert(editor);
+        // RichEdit owns the IME composition range.  Defer our TOM-based
+        // syntax/brace formatting until the IME commits, otherwise changing
+        // character formats during composition makes the candidate window
+        // flash and can move the caret away from the composition string.
+        if (g_app.window) KillTimer(g_app.window, kTimerHighlight);
     }
 
     // This is a plain-text editor: every paste (menu, Ctrl+V, Shift+Insert)
@@ -573,6 +578,7 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
                 break;
             }
         }
+        if (g_app.window) SetTimer(g_app.window, kTimerHighlight, kHighlightDelayMs, nullptr);
     }
     if (message == WM_PAINT) {
         DrawEditorGuides(editor);
