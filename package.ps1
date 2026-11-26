@@ -56,6 +56,11 @@ if ($test.ExitCode) { Fail "self-test failed (exit $($test.ExitCode)); run `"$ex
 
 # ---- stage the program files ----------------------------------------------------------
 $out = Join-Path $root "dist\$version"
+if (Test-Path $out) {
+    Get-ChildItem $out -File | Where-Object {
+        $_.Name -like "MCnotepad-$version-*" -or $_.Name -eq 'SHA256SUMS.txt'
+    } | Remove-Item -Force
+}
 $stage = Join-Path $out '_stage'
 if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
