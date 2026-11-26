@@ -555,6 +555,13 @@ void ToggleLivePreview() {
 }
 
 void PreviewOnTextChanged(HWND editor) {
+    for (TabDocument& document : g_app.documents) {
+        if (document.editor != editor || !document.untitled || document.language != kLanguageAuto || !document.path.empty()) continue;
+        const int before = document.sniffedLanguage;
+        document.sniffedLanguage = SniffLanguage(GetEditorRawText(editor));
+        if (before != document.sniffedLanguage) InvalidateToolbar();
+        break;
+    }
     if (PreviewVisible() && ActiveEditor() == editor) SetTimer(g_app.window, kTimerPreview, kPreviewDelayMs, nullptr);
 }
 

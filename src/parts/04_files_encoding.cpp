@@ -510,6 +510,17 @@ int SniffLanguage(const std::wstring& text) {
     if (head.starts_with(L"<?php")) return kLanguagePhp;
     if (head.starts_with(L"diff --git") || (head.starts_with(L"--- ") && head.find(L"\n+++ ") != std::wstring::npos)) return kLanguageDiff;
     if ((head[0] == L'{' || head[0] == L'[') && head.find(L"\":") != std::wstring::npos) return kLanguageJson;
+    // Untitled documents have no extension to identify Markdown. Recognize
+    // the unambiguous forms users commonly start with so the live preview
+    // button becomes available immediately after typing or pasting Markdown.
+    const auto startsMarkdownLine = [&head](std::wstring_view marker) {
+        return head.starts_with(marker) || head.find(L"\n" + std::wstring(marker)) != std::wstring::npos;
+    };
+    if (startsMarkdownLine(L"# ") || startsMarkdownLine(L"## ") || startsMarkdownLine(L"### ") ||
+        head.starts_with(L"```") || head.find(L"](") != std::wstring::npos ||
+        head.find(L"\n- ") != std::wstring::npos || head.find(L"\n* ") != std::wstring::npos) {
+        return kLanguageMarkdown;
+    }
     return kLanguagePlain;
 }
 

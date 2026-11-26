@@ -746,6 +746,7 @@ int RunSelfTests() {
     // A regression here makes the menu appear clickable while doing nothing.
     failures += expect(IsTextToolCommand(kIdMarkdownToHtml) &&
         IsTextToolCommand(kIdHtmlToMarkdown));
+    failures += expect(SniffLanguage(L"# 中文标题\r\n\r\n正文") == kLanguageMarkdown);
 
     for (int locale = 0; locale < 5; ++locale) {
         DataGeneratorOptions profile;
