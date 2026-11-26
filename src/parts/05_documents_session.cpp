@@ -215,10 +215,16 @@ void RemoveRunningMarker() {
 
 void ChangeEditorFontSize(int delta) {
     const int next = delta == 0 ? 13 : std::clamp(g_app.fontSize + delta, 10, 32);
-    if (next == g_app.fontSize) return;
+    // Ctrl+0 is also a recovery action: even when the stored size is already
+    // 13, reapply the font and layout so a stale RichEdit zoom/viewport state
+    // cannot leave the editor looking partially scaled after taskbar restore.
+    const bool needsRefresh = next != g_app.fontSize || delta == 0;
+    if (!needsRefresh) return;
     g_app.fontSize = next;
     CreateUiFonts();
     ApplyEditorFont();
+    if (g_app.window) LayoutChildren(g_app.window);
+    RefreshGutter();
     g_app.stateDirty = true;
     ShowNotice(L"编辑器字号 " + std::to_wstring(g_app.fontSize) + L" px");
 }
@@ -514,6 +520,17 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
         g_imeComposingEditors.erase(editor);
     } else if (message == WM_MOUSEWHEEL || message == WM_KEYDOWN || message == WM_VSCROLL) {
         // EN_VSCROLL is not sent for wheel or keyboard scrolling.
+        for (TabDocument& document : g_app.documents) {
+            if (document.editor == editor) {
+                const int visibleLine = static_cast<int>(SendMessageW(
+                    editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+                if (document.firstVisibleLine != visibleLine) {
+                    document.firstVisibleLine = visibleLine;
+                    g_app.stateDirty = true;
+                }
+                break;
+            }
+        }
         RefreshGutter();
         SyntaxOnViewChanged(editor);
     } else if (message == WM_SIZE || message == WM_SHOWWINDOW) {

@@ -178,6 +178,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         }
         if (notification == EN_VSCROLL) {
+            for (TabDocument& document : g_app.documents) {
+                if (document.editor == source) {
+                    const int visibleLine = static_cast<int>(SendMessageW(
+                        source, EM_GETFIRSTVISIBLELINE, 0, 0));
+                    if (document.firstVisibleLine != visibleLine) {
+                        document.firstVisibleLine = visibleLine;
+                        g_app.stateDirty = true;
+                    }
+                    break;
+                }
+            }
             RefreshGutter();
             SyntaxOnViewChanged(source);
             UpdateStatusBar();
@@ -479,7 +490,25 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         return TRUE;
     }
     case WM_ACTIVATEAPP:
-        if (wParam) PostMessageW(window, kMessageCheckExternalChanges, 0, 0);
+        if (!wParam) {
+            // Save the real viewport before taskbar/tray deactivation.  The
+            // editor can reflow while hidden, so relying only on tab switches
+            // leaves the next restore parked on an old line (often line 11).
+            for (TabDocument& document : g_app.documents) CaptureEditorState(document);
+            g_app.stateDirty = true;
+        } else {
+            LayoutChildren(window);
+            if (TabDocument* document = ActiveDocument()) {
+                const LONG current = static_cast<LONG>(SendMessageW(
+                    document->editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+                if (current != document->firstVisibleLine) {
+                    SendMessageW(document->editor, EM_LINESCROLL, 0,
+                        document->firstVisibleLine - current);
+                }
+            }
+            RefreshGutter();
+            PostMessageW(window, kMessageCheckExternalChanges, 0, 0);
+        }
         return 0;
     case kMessageCheckExternalChanges:
         if (AppIsInModalState()) { g_deferredExternalCheck = true; return 0; }

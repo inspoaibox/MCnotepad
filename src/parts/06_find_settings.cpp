@@ -637,11 +637,22 @@ void ApplyEditorFont() {
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         FIXED_PITCH | FF_MODERN, g_app.fontFamily.c_str());
     for (const TabDocument& document : g_app.documents) {
+        const SelectionState savedSelection = CaptureSelection(document.editor);
+        const LONG firstVisibleLine = static_cast<LONG>(SendMessageW(
+            document.editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+        const LRESULT wasModified = SendMessageW(document.editor, EM_GETMODIFY, 0, 0);
         EditorEventMute mute(document.editor);
         SendMessageW(document.editor, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.editorFont), TRUE);
         ApplyEditorTypography(document.editor);
         SendMessageW(document.editor, EM_SETMARGINS, EC_LEFTMARGIN, MAKELPARAM(Scale(kEditorTextMargin), 0));
         ApplyEditorTopInset(document.editor);  // keeps the top spacing and the margin together
+        RestoreSelection(document.editor, savedSelection);
+        const LONG nowVisibleLine = static_cast<LONG>(SendMessageW(
+            document.editor, EM_GETFIRSTVISIBLELINE, 0, 0));
+        if (firstVisibleLine != nowVisibleLine) {
+            SendMessageW(document.editor, EM_LINESCROLL, 0, firstVisibleLine - nowVisibleLine);
+        }
+        SendMessageW(document.editor, EM_SETMODIFY, wasModified ? TRUE : FALSE, 0);
         HighlightDocument(document);  // the font reset above cleared the syntax colours
         InvalidateRect(document.editor, nullptr, TRUE);
     }
