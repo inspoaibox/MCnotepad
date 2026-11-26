@@ -53,6 +53,12 @@ add_executable(MCnotepad WIN32
     resources/app.rc
 )
 
+# src/main.cpp includes the ordered parts in src/parts/ as one translation
+# unit. They are listed here for IDEs and dependency tracking only.
+file(GLOB MCNOTEPAD_PARTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/parts/*.cpp)
+target_sources(MCnotepad PRIVATE ${MCNOTEPAD_PARTS})
+set_source_files_properties(${MCNOTEPAD_PARTS} PROPERTIES HEADER_FILE_ONLY TRUE)
+
 target_compile_definitions(MCnotepad PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(MCnotepad PRIVATE comctl32 comdlg32 shlwapi advapi32 dwmapi uxtheme crypt32 cpp-pinyin::cpp-pinyin OpenCC::OpenCC faker-cxx duktape)
 
