@@ -17971,6 +17971,7 @@ void StartLogFilter(LogViewer& log) {
         auto* result = new LogFilterResult{generation, {}, {}, true};
         const uint64_t lines = index->Lines(size);
         uint64_t start = 0;
+        uint64_t lastCheck = 0;  // the UI thread waits for this worker to stop, so look often
         for (uint64_t line = 0; line < lines; ++line) {
             const void* hit = start < size ? memchr(data + start, '\n', static_cast<size_t>(size - start)) : nullptr;
             const uint64_t next = hit ? static_cast<uint64_t>(static_cast<const char*>(hit) - data) + 1 : size;
@@ -17978,7 +17979,10 @@ void StartLogFilter(LogViewer& log) {
             if (end > start && data[end - 1] == '\r') --end;
             if (LogLineMatches(data + start, static_cast<size_t>(end - start), filter, result->endState)) result->view.push_back(static_cast<uint32_t>(line));
             start = next;
-            if ((line & 0x3FFF) == 0 && line) {
+            // Checked by lines and by bytes: a file of very long lines would
+            // otherwise run for seconds between two checks.
+            if (((line & 0x3FFF) == 0 && line) || start - lastCheck > (4u << 20)) {
+                lastCheck = start;
                 if (*cancel) { result->ok = false; break; }
                 PostMessageW(window, kMessageLogProgress, generation, static_cast<LPARAM>(start * 1000 / std::max<uint64_t>(size, 1)));
             }
@@ -19390,49 +19394,7 @@ int RunSelfTests() {
 } // namespace
 
 
-// TEMPORARY hang sampler: writes RVAs of the main thread's stack to a file.
-unsigned __stdcall HangSampler(void* mainThreadHandle) {
-    HANDLE mainThread = static_cast<HANDLE>(mainThreadHandle);
-    const DWORD64 base = reinterpret_cast<DWORD64>(GetModuleHandleW(nullptr));
-    FILE* out = nullptr;
-    _wfopen_s(&out, L"D:\\tmp\\hangtrace.txt", L"w");
-    if (!out) return 0;
-    for (int sample = 0; sample < 6000; ++sample) {
-        Sleep(15);
-        SuspendThread(mainThread);
-        CONTEXT context{};
-        context.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(mainThread, &context)) {
-            fprintf(out, "S%d:", sample);
-            for (int frame = 0; frame < 48 && context.Rip; ++frame) {
-                DWORD64 imageBase = 0;
-                PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
-                if (imageBase == base) fprintf(out, " %llx", context.Rip - base);
-                else fprintf(out, " .");
-                if (!function) {
-                    context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);
-                    context.Rsp += 8;
-                } else {
-                    void* handlerData = nullptr;
-                    DWORD64 establisher = 0;
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
-                }
-            }
-            fprintf(out, "\n");
-            fflush(out);
-        }
-        ResumeThread(mainThread);
-    }
-    fclose(out);
-    return 0;
-}
-
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCommand) {
-    if (GetEnvironmentVariableW(L"MCN_TRACE", nullptr, 0) > 0) {
-        HANDLE self = nullptr;
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
-        _beginthreadex(nullptr, 0, HangSampler, self, 0, nullptr);
-    }
     (void)commandLine;
     g_app.instance = instance;
     InitializeShortcutBindings();
