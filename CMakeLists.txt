@@ -53,6 +53,19 @@ add_executable(MCnotepad WIN32
     resources/app.rc
 )
 
+# Version stamp. Development builds (the default) say so in the title bar and
+# keep their data apart from the installed / portable app; package.ps1
+# configures a separate build with MCNOTEPAD_RELEASE=ON and the git commit.
+set(MCNOTEPAD_RELEASE OFF CACHE BOOL "Release build made by package.ps1")
+set(MCNOTEPAD_BUILD_ID "dev" CACHE STRING "Build identifier shown in About (git commit for releases)")
+if(MCNOTEPAD_RELEASE)
+    set(MCNOTEPAD_RELEASE_VALUE 1)
+else()
+    set(MCNOTEPAD_RELEASE_VALUE 0)
+endif()
+configure_file(src/version.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/version.h @ONLY)
+target_include_directories(MCnotepad PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
 # src/main.cpp includes the ordered parts in src/parts/ as one translation
 # unit. They are listed here for IDEs and dependency tracking only.
 file(GLOB MCNOTEPAD_PARTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/parts/*.cpp)
@@ -62,7 +75,7 @@ set_source_files_properties(${MCNOTEPAD_PARTS} PROPERTIES HEADER_FILE_ONLY TRUE)
 target_compile_definitions(MCnotepad PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(MCnotepad PRIVATE comctl32 comdlg32 shlwapi advapi32 dwmapi uxtheme crypt32 cpp-pinyin::cpp-pinyin OpenCC::OpenCC faker-cxx duktape)
 
-target_include_directories(MCnotepad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(MCnotepad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/resources)
 
 if(MSVC)
     target_compile_options(MCnotepad PRIVATE /W4 /permissive- /EHsc /utf-8)

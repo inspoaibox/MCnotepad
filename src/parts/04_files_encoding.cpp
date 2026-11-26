@@ -28,13 +28,40 @@ HWND FindInstanceWindow() {
     return nullptr;
 }
 
+std::wstring CurrentExecutablePath();
+
+// Where sessions and recovery snapshots live:
+// - portable copy (a portable.ini next to the exe): a "data" folder beside it;
+// - installed / release build: %LOCALAPPDATA%\MCnotepad;
+// - development build: %LOCALAPPDATA%\MCnotepad-dev, so testing a build never
+//   touches the tabs of the copy in daily use.
 fs::path GetDataDirectory() {
+    const fs::path exe = CurrentExecutablePath();
+    std::error_code error;
+    if (!exe.empty() && fs::exists(exe.parent_path() / L"portable.ini", error)) {
+        return exe.parent_path() / L"data";
+    }
     wchar_t buffer[MAX_PATH]{};
     const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, MAX_PATH);
     if (length > 0 && length < MAX_PATH) {
-        return fs::path(buffer) / L"MCnotepad";
+        return fs::path(buffer) / (MCNOTEPAD_RELEASE ? L"MCnotepad" : L"MCnotepad-dev");
     }
     return fs::current_path() / L"data";
+}
+
+// "0.1.0 (28298d0)" for releases, "0.1.0 开发版" for development builds.
+std::wstring VersionDescription() {
+    std::wstring text = Utf8ToWide(MCNOTEPAD_VERSION_TEXT);
+    if (MCNOTEPAD_RELEASE) text += L" (" + Utf8ToWide(MCNOTEPAD_BUILD_ID_TEXT) + L")";
+    else text += L" 开发版";
+    return text;
+}
+
+std::wstring EditionDescription() {
+    std::error_code error;
+    const fs::path exe = CurrentExecutablePath();
+    if (!exe.empty() && fs::exists(exe.parent_path() / L"portable.ini", error)) return L"便携版";
+    return MCNOTEPAD_RELEASE ? L"安装版" : L"开发版（仅用于测试，数据与正式版分开）";
 }
 
 constexpr wchar_t kStartupRegistryPath[] =
@@ -65,7 +92,14 @@ bool IsStartupRegistrationEnabled() {
     const LONG result = RegQueryValueExW(key, kStartupRegistryValue, nullptr, &valueType,
         reinterpret_cast<LPBYTE>(value), &valueSize);
     RegCloseKey(key);
-    return result == ERROR_SUCCESS && (valueType == REG_SZ || valueType == REG_EXPAND_SZ) && value[0] != L'\0';
+    if (result != ERROR_SUCCESS || (valueType != REG_SZ && valueType != REG_EXPAND_SZ) || value[0] == L'\0') return false;
+    // The entry is shared by every copy (installed, portable, development):
+    // it counts as on only when it starts this copy, so turning the option on
+    // in another copy moves it there.
+    std::wstring command = value;
+    command.erase(std::remove(command.begin(), command.end(), L'"'), command.end());
+    while (!command.empty() && iswspace(command.back())) command.pop_back();
+    return CompareStringOrdinal(command.c_str(), -1, CurrentExecutablePath().c_str(), -1, TRUE) == CSTR_EQUAL;
 }
 
 bool SetStartupRegistration(bool enabled) {
@@ -82,7 +116,7 @@ bool SetStartupRegistration(bool enabled) {
         result = RegSetValueExW(key, kStartupRegistryValue, 0, REG_SZ,
             reinterpret_cast<const BYTE*>(command.c_str()),
             static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-    } else {
+    } else if (IsStartupRegistrationEnabled()) {  // leave another copy's entry alone
         result = RegDeleteValueW(key, kStartupRegistryValue);
         if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
     }
@@ -532,7 +566,8 @@ uint64_t FileTimestamp(const fs::path& path) {
 
 void UpdateWindowTitle() {
     if (!g_app.window) return;
-    std::wstring title = L"MCnotepad";
+    // Development builds say so, so they can't be mistaken for the installed app.
+    std::wstring title = MCNOTEPAD_RELEASE ? L"MCnotepad" : L"MCnotepad [开发版]";
     if (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size())) {
         title += L" - " + g_app.documents[static_cast<size_t>(g_app.activeIndex)].title;
     }

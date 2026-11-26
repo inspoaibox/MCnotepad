@@ -377,11 +377,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case kIdFileCloseAll: CloseAllDocuments(); break;
         case kIdFileReopenClosed: ReopenClosedDocument(); break;
         case kIdFileExit: HandleMainWindowClose(true); break;
-        case kIdHelpAbout:
-            MessageBoxW(window,
-                L"MCnotepad 0.1.0\n轻量、快速、可恢复的 Windows 文本编辑器。",
-                kWindowTitle, MB_ICONINFORMATION);
+        case kIdHelpAbout: {
+            const std::wstring about = L"MCnotepad " + VersionDescription() +
+                L"\n轻量、快速、可恢复的 Windows 文本编辑器。\n\n版本类型：" + EditionDescription() +
+                L"\n程序位置：" + CurrentExecutablePath() +
+                L"\n数据位置：" + g_app.dataDirectory.wstring();
+            MessageBoxW(window, about.c_str(), kWindowTitle, MB_ICONINFORMATION);
             break;
+        }
         case kIdEditUndo:
         case kIdEditRedo:
         case kIdEditCut:
@@ -579,6 +582,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             KillTimer(window, kTimerAutosave);
             PersistAll(true);
             RemoveRunningMarker();
+            // An installer or uninstaller (Restart Manager) is replacing the
+            // program files: really exit, even when "close" means "hide to
+            // tray". Unsaved tabs come back from their snapshots.
+            if (lParam & ENDSESSION_CLOSEAPP) DestroyWindow(window);
         }
         return 0;
     case WM_DESTROY:

@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "../resources/resource.h"
+#include "version.h"
 
 #include <cpp-pinyin/Pinyin.h>
 #include <cpp-pinyin/G2pglobal.h>

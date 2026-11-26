@@ -1,2 +1,39 @@
+#include <winver.h>
 #include "resource.h"
+#include "version.h"
+
 IDI_MCNOTEPAD ICON "MCnotepad.ico"
+
+#if MCNOTEPAD_RELEASE
+#define MCNOTEPAD_FILE_FLAGS 0
+#else
+#define MCNOTEPAD_FILE_FLAGS VS_FF_PRERELEASE
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION MCNOTEPAD_VERSION_MAJOR, MCNOTEPAD_VERSION_MINOR, MCNOTEPAD_VERSION_PATCH, 0
+ PRODUCTVERSION MCNOTEPAD_VERSION_MAJOR, MCNOTEPAD_VERSION_MINOR, MCNOTEPAD_VERSION_PATCH, 0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS MCNOTEPAD_FILE_FLAGS
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName", "MCnotepad"
+            VALUE "FileDescription", "MCnotepad text editor"
+            VALUE "FileVersion", MCNOTEPAD_VERSION_TEXT " (" MCNOTEPAD_BUILD_ID_TEXT ")"
+            VALUE "InternalName", "MCnotepad"
+            VALUE "OriginalFilename", "MCnotepad.exe"
+            VALUE "ProductName", "MCnotepad"
+            VALUE "ProductVersion", MCNOTEPAD_VERSION_TEXT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
