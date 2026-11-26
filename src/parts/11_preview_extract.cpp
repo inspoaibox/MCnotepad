@@ -331,27 +331,52 @@ std::wstring g_regexFind = L"";
 std::wstring g_regexReplace = L"";
 bool g_regexMatchCase = false;
 bool g_keywordMatchCase = false;
+std::wstring g_extractCustomRegex = LR"((?:[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}))";
+bool g_extractCaseSensitive = false;
+bool g_extractUnique = true;
+int g_extractOutputMode = 2;  // insert below by default; new tab is optional
 
-// Collects matches from the selection (or the whole document) into a new tab,
-// leaving the source untouched.
-void ExtractToNewTab(int command) {
+// Extracts matches from the selection (or the whole document). The destination
+// is chosen in the same dialog instead of being hard-coded to a new tab.
+void ExtractData(int command) {
     TabDocument* document = ActiveDocument();
     if (!document) return;
     std::vector<std::pair<std::wstring, bool>> checks;
+    std::vector<PromptChoice> choices{{L"结果输出到：", {L"替换当前内容", L"生成到新标签", L"插入当前文档下方（保留原文）"}, g_extractOutputMode}};
     std::vector<std::wstring> values;
+    const auto finishPrompt = [&](const wchar_t* title, const std::vector<std::wstring>& labels) {
+        if (!PromptForText(title, labels, values, &checks, &choices)) return false;
+        g_extractOutputMode = std::clamp(choices[0].selected, 0, 2);
+        return true;
+    };
     if (command == kIdExtractKeywordLines) {
         values = {g_keywords};
-        checks = {{L"区分大小写", g_keywordMatchCase}};
-        if (!PromptForText(L"提取包含关键词的行", {L"关键词（多个关键词用空格分隔，满足任意一个即可）："}, values, &checks)) return;
+        checks = {{L"区分大小写", g_keywordMatchCase}, {L"去除重复结果", g_extractUnique}};
+        if (!finishPrompt(L"提取包含关键词的行", {L"关键词（多个关键词用空格分隔，满足任意一个即可）："})) return;
         g_keywords = values[0];
         g_keywordMatchCase = checks[0].second;
+        g_extractUnique = checks[1].second;
         if (TrimCopy(values[0]).empty()) return;
     } else if (command == kIdExtractFields) {
         values = {g_fieldDelimiter, g_fieldColumns};
-        if (!PromptForText(L"提取指定列", {L"分隔符（\\t 表示制表符）：", L"要提取的列号（如 1 或 1,3）："}, values)) return;
+        checks = {{L"去除重复结果", g_extractUnique}};
+        if (!finishPrompt(L"提取指定列", {L"分隔符（\\t 表示制表符）：", L"要提取的列号（如 1 或 1,3）："})) return;
         g_fieldDelimiter = values[0];
         g_fieldColumns = values[1];
+        g_extractUnique = checks[0].second;
         if (values[0].empty()) return;
+    } else if (command == kIdExtractCustomRegex) {
+        values = {g_extractCustomRegex};
+        checks = {{L"区分大小写", g_extractCaseSensitive}, {L"去除重复结果", g_extractUnique}};
+        if (!finishPrompt(L"自定义正则提取", {L"正则表达式（提取第一个捕获组；没有捕获组则提取完整匹配）："})) return;
+        g_extractCustomRegex = values[0];
+        g_extractCaseSensitive = checks[0].second;
+        g_extractUnique = checks[1].second;
+        if (TrimCopy(g_extractCustomRegex).empty()) return;
+    } else {
+        checks = {{L"去除重复结果", g_extractUnique}};
+        if (!finishPrompt(L"提取数据", {})) return;
+        g_extractUnique = checks[0].second;
     }
 
     CHARRANGE range{};
@@ -363,40 +388,69 @@ void ExtractToNewTab(int command) {
 
     // `group` picks the capture that holds the value when the pattern also
     // has to consume a guard character before it.
-    const auto collect = [&](const wchar_t* pattern, bool unique, int group = 0) {
+    std::wstring regexError;
+    const auto collect = [&](const std::wstring& pattern, bool unique, int group = 0, bool caseSensitive = false) {
         std::unordered_map<std::wstring, bool> seen;
         try {
-            const std::wregex expression(pattern, std::regex_constants::ECMAScript | std::regex_constants::icase);
+            auto flags = std::regex_constants::ECMAScript;
+            if (!caseSensitive) flags |= std::regex_constants::icase;
+            const std::wregex expression(pattern, flags);
             for (std::wsregex_iterator it(text.begin(), text.end(), expression), end; it != end; ++it) {
-                std::wstring value = it->str(group);
+                const size_t selectedGroup = group < static_cast<int>(it->size()) ? static_cast<size_t>(group) : 0;
+                std::wstring value = it->str(selectedGroup);
                 // Trailing sentence punctuation is rarely part of a link.
                 while (!value.empty() && std::wstring(L".,;:!?)]}'\"").find(value.back()) != std::wstring::npos) value.pop_back();
                 if (value.empty() || (unique && !seen.emplace(value, true).second)) continue;
                 results.push_back(value);
             }
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+            regexError = Utf8ToWide(error.what());
         }
     };
 
     switch (command) {
     case kIdExtractEmails:
         what = L"邮箱地址";
-        collect(LR"([A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,})", true);
+        collect(LR"([A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,})", g_extractUnique);
         break;
     case kIdExtractUrls:
         what = L"链接";
-        collect(LR"((?:https?|ftp)://[^\s<>"'，。；：！？、）】》]+|www\.[A-Za-z0-9\-]+\.[^\s<>"'，。；：！？、）】》]+)", true);
+        collect(LR"((?:https?|ftp)://[^\s<>"'，。；：！？、）】》]+|www\.[A-Za-z0-9\-]+\.[^\s<>"'，。；：！？、）】》]+)", g_extractUnique);
         break;
     case kIdExtractIps:
         what = L"IP 地址";
-        collect(LR"((?:^|[^\d.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})(?![\d.]))", true, 1);
+        collect(LR"((?:^|[^\d.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})(?![\d.]))", g_extractUnique, 1);
         break;
     case kIdExtractNumbers:
         what = L"数字";
         // Whole dotted tokens first, so IPs and version numbers aren't split into "numbers".
         // A minus sign only right after a non-digit, so "2024-01-05" gives 2024, 01, 05.
-        collect(LR"((?:^|[^\d.])(-?\d+(?:\.\d+)*))", false, 1);
+        collect(LR"((?:^|[^\d.])(-?\d+(?:\.\d+)*))", g_extractUnique, 1);
         std::erase_if(results, [](const std::wstring& value) { return std::count(value.begin(), value.end(), L'.') > 1; });
+        break;
+    case kIdExtractDates:
+        what = L"日期/时间";
+        collect(LR"((?:\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?)?|\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b))", g_extractUnique);
+        break;
+    case kIdExtractPhones:
+        what = L"手机号";
+        collect(LR"((?:\+?86[ -]?)?1[3-9]\d{9})", g_extractUnique);
+        break;
+    case kIdExtractUuid:
+        what = L"UUID/GUID";
+        collect(LR"(\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b)", g_extractUnique);
+        break;
+    case kIdExtractHexColors:
+        what = L"十六进制颜色";
+        collect(LR"(#[0-9a-fA-F]{3,8}\b)", g_extractUnique);
+        break;
+    case kIdExtractQuoted:
+        what = L"引号内容";
+        collect(LR"("[^"\r\n]*"|'[^'\r\n]*'|“[^”\r\n]*”)", g_extractUnique);
+        break;
+    case kIdExtractCustomRegex:
+        what = L"自定义正则匹配";
+        collect(g_extractCustomRegex, g_extractUnique, 0, g_extractCaseSensitive);
         break;
     case kIdExtractKeywordLines: {
         what = L"行";
@@ -407,7 +461,7 @@ void ExtractToNewTab(int command) {
             const std::wstring haystack = g_keywordMatchCase ? line : MapCase(line, LCMAP_LOWERCASE);
             for (const std::wstring& keyword : keywords) {
                 if (haystack.find(keyword) != std::wstring::npos) {
-                    results.push_back(line);
+                    if (!g_extractUnique || std::find(results.begin(), results.end(), line) == results.end()) results.push_back(line);
                     break;
                 }
             }
@@ -439,7 +493,8 @@ void ExtractToNewTab(int command) {
             fields.push_back(line.substr(start));
             std::vector<std::wstring> picked;
             for (const size_t column : columns) picked.push_back(column <= fields.size() ? fields[column - 1] : L"");
-            results.push_back(JoinLines(picked, delimiter));
+            const std::wstring pickedLine = JoinLines(picked, delimiter);
+            if (!g_extractUnique || std::find(results.begin(), results.end(), pickedLine) == results.end()) results.push_back(pickedLine);
         }
         break;
     }
@@ -447,17 +502,19 @@ void ExtractToNewTab(int command) {
         return;
     }
 
+    if (!regexError.empty()) {
+        MessageBoxW(g_app.window, (L"正则表达式无效：" + regexError).c_str(), kWindowTitle, MB_ICONWARNING);
+        return;
+    }
     if (results.empty()) {
         ShowNotice(L"没有找到" + what + (wholeDocument ? L"（全文）" : L"（选中内容）"));
         return;
     }
-    const std::wstring title = L"提取结果 - " + (command == kIdExtractKeywordLines ? std::wstring(L"关键词")
-        : command == kIdExtractFields ? std::wstring(L"指定列") : what);
-    const int index = CreateDocument({}, title, JoinLines(results, L"\r\n"), true, true, 0, 0, 0);
-    if (index < 0) return;
-    SelectTab(index);
-    PersistAll(false);
-    ShowNotice(L"已提取 " + std::to_wstring(results.size()) + L" 个" + (what == L"行" ? L"行" : what) + L"到新标签");
+    const std::wstring title = command == kIdExtractKeywordLines ? L"关键词行"
+        : command == kIdExtractFields ? L"指定列" : what;
+    ApplyToolResult(*document, range, JoinLines(results, L"\r\n"), g_extractOutputMode,
+        L"提取 - " + title,
+        L"已提取 " + std::to_wstring(results.size()) + L" 个" + (what == L"行" ? L"行" : what));
 }
 
 const wchar_t* OutputModeName(int mode) {
@@ -478,8 +535,8 @@ void RunTextTool(int command) {
         ShowNotice(g_app.previewTextTools ? L"批量处理前会先预览更改" : L"批量处理将直接应用（仍可撤销）");
         return;
     }
-    if (command >= kIdExtractEmails && command <= kIdExtractFields) {
-        ExtractToNewTab(command);
+    if (IsExtractionCommand(command)) {
+        ExtractData(command);
         return;
     }
     TabDocument* document = ActiveDocument();

@@ -235,8 +235,15 @@ std::wstring g_lineSuffix = L";";
 int g_pinyinFormat = 0;  // 0 tones, 1 plain, 2 initials
 int g_pinyinLayout = 0;  // 0 pinyin line under each line (original kept), 1 pinyin only
 
+bool IsExtractionCommand(int command) {
+    return command == kIdExtractEmails || command == kIdExtractUrls || command == kIdExtractIps ||
+        command == kIdExtractNumbers || command == kIdExtractKeywordLines || command == kIdExtractFields ||
+        command == kIdExtractDates || command == kIdExtractPhones || command == kIdExtractUuid ||
+        command == kIdExtractHexColors || command == kIdExtractQuoted || command == kIdExtractCustomRegex;
+}
+
 bool IsTextToolCommand(int command) {
-    return command >= kIdTextToolFirst && command <= kIdTextToolLast;
+    return (command >= kIdTextToolFirst && command <= kIdTextToolLast) || IsExtractionCommand(command);
 }
 
 bool IsDataGeneratorCommand(int command) {
@@ -982,12 +989,19 @@ void AppendTextToolMenus(HMENU menu) {
     AppendMenuW(extract, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(extract, MF_STRING, kIdExtractKeywordLines, L"包含关键词的行...");
     AppendMenuW(extract, MF_STRING, kIdExtractFields, L"指定列（字段）...");
+    AppendMenuW(extract, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(extract, MF_STRING, kIdExtractDates, L"日期和时间");
+    AppendMenuW(extract, MF_STRING, kIdExtractPhones, L"手机号");
+    AppendMenuW(extract, MF_STRING, kIdExtractUuid, L"UUID / GUID");
+    AppendMenuW(extract, MF_STRING, kIdExtractHexColors, L"十六进制颜色");
+    AppendMenuW(extract, MF_STRING, kIdExtractQuoted, L"引号内容");
+    AppendMenuW(extract, MF_STRING, kIdExtractCustomRegex, L"自定义正则规则...");
 
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(lines), L"行处理");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(blanks), L"空格、符号与大小写");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(chinese), L"中文处理");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(developer), L"开发者工具");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(extract), L"提取到新标签");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(extract), L"提取数据");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     HMENU output = CreatePopupMenu();
     AppendMenuW(output, MF_STRING, kIdOutputNewTab, L"输出到新标签（原文不变）");

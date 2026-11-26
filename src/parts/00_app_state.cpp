@@ -171,6 +171,14 @@ enum TextToolId : int {
     // through IsTextToolCommand/WM_COMMAND as well.
     kIdTextToolLast = kIdHtmlToMarkdown
 };
+// Additional extraction commands are kept outside the original contiguous
+// text-tool range so existing shortcut IDs remain compatible.
+constexpr int kIdExtractDates = 2201;
+constexpr int kIdExtractPhones = 2202;
+constexpr int kIdExtractUuid = 2203;
+constexpr int kIdExtractHexColors = 2204;
+constexpr int kIdExtractQuoted = 2205;
+constexpr int kIdExtractCustomRegex = 2206;
 constexpr int kIdNewTabButton = 1301;
 constexpr int kIdToolbarNew = 1401;
 constexpr int kIdToolbarOpen = 1402;
@@ -579,6 +587,15 @@ std::wstring DataGeneratorLabel(int command);
 
 std::wstring ShortcutLabelForCommand(int command) {
     switch (command) {
+    case kIdExtractDates: return L"文本：提取日期/时间";
+    case kIdExtractPhones: return L"文本：提取手机号";
+    case kIdExtractUuid: return L"文本：提取 UUID/GUID";
+    case kIdExtractHexColors: return L"文本：提取十六进制颜色";
+    case kIdExtractQuoted: return L"文本：提取引号内容";
+    case kIdExtractCustomRegex: return L"文本：提取自定义正则匹配";
+    default: break;
+    }
+    switch (command) {
     case kIdFileNew: return L"文件：新建";
     case kIdFileOpen: return L"文件：打开";
     case kIdFileSave: return L"文件：保存";
@@ -730,6 +747,8 @@ void InitializeShortcutBindings() {
     for (int command = kIdLineEndingFirst; command < kIdLineEndingFirst + kLineEndingCount; ++command) add(command);
     for (int command = kIdLanguageFirst; command < kIdLanguageFirst + kLanguageCount; ++command) add(command);
     for (int command = kIdTextToolFirst; command <= kIdTextToolLast; ++command) add(command);
+    add(kIdExtractDates); add(kIdExtractPhones); add(kIdExtractUuid);
+    add(kIdExtractHexColors); add(kIdExtractQuoted); add(kIdExtractCustomRegex);
     for (int command = kIdDataFirst; command <= kIdDataLast; ++command) add(command);
 }
 
