@@ -732,6 +732,13 @@ int RunSelfTests() {
     std::wstring markdownError;
     failures += expect(ShowdownConvert(L"# 中文标题\r\n\r\n你好，世界！", true, markdownResult, markdownError) &&
         utf8Safe(markdownResult));
+    // Nested inline HTML (Showdown once relied on RegExp.$1, which Duktape
+    // does not set), converted twice to cover the cached converter.
+    for (int round = 0; round < 2; ++round) {
+        std::wstring nested;
+        failures += expect(ShowdownConvert(L"<span style=\"color:red\">**hi**</span> <font color=\"red\"><b>粗体</b></font> <span>`x`</span>", true, nested, markdownError) &&
+            nested.find(L"<b>粗体</b></font>") != std::wstring::npos && nested.find(L"maximum nesting") == std::wstring::npos);
+    }
     std::wstring htmlResult;
     failures += expect(ShowdownConvert(L"<h1>中文标题</h1><p>你好，世界！</p>", false, htmlResult, markdownError) &&
         utf8Safe(htmlResult));

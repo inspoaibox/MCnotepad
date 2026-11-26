@@ -3608,10 +3608,12 @@ showdown.subParser('unhashHTMLSpans', function (text, options, globals) {
   for (var i = 0; i < globals.gHtmlSpans.length; ++i) {
     var repText = globals.gHtmlSpans[i],
         // limiter to prevent infinite loop (assume 10 as limit for recurse)
-        limit = 0;
+        limit = 0,
+        spanMatch;
 
-    while (/¨C(\d+)C/.test(repText)) {
-      var num = RegExp.$1;
+    // exec() instead of RegExp.$1, which embedded runtimes (Duktape) do not set.
+    while ((spanMatch = /¨C(\d+)C/.exec(repText)) !== null) {
+      var num = spanMatch[1];
       repText = repText.replace('¨C' + num + 'C', globals.gHtmlSpans[num]);
       if (limit === 10) {
         console.error('maximum nesting of 10 spans reached!!!');

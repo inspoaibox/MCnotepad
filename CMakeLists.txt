@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(MCnotepad VERSION 0.2.0 LANGUAGES C CXX RC)
+project(MCnotepad VERSION 0.2.1 LANGUAGES C CXX RC)
 
 include(CTest)
 

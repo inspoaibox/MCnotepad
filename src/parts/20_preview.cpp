@@ -138,25 +138,32 @@ addEventListener('load',function(){if(restore>=0)go(restore);});
 var t;addEventListener('scroll',function(){clearTimeout(t);t=setTimeout(function(){if(wv&&Date.now()-syncing>300){var m=maxY();wv.postMessage('scroll:'+(m>0?scrollY/m:0));}},120);});
 if(wv)wv.addEventListener('message',function(e){var d=e.data;
  if(typeof d==='string'&&d.indexOf('scrollto:')===0){go(parseFloat(d.slice(9)));}
- else if(d&&d.type==='markdown'){var m=document.getElementById('mcn-markdown');if(m){var y=scrollY;m.innerHTML=d.html;scrollTo(0,y);}}
+ else if(d&&d.type==='markdown'&&window.mcnRender){var y=scrollY;mcnRender(d.text);scrollTo(0,y);}
 });})();</script>)JS";
 }
 
-std::string MarkdownBody(const TabDocument& document, std::wstring& error) {
-    std::wstring html;
-    const std::wstring text = GetEditorRawText(document.editor);
-    if (!ShowdownConvert(text, true, html, error)) return {};
-    return WideToUtf8(html);
+// The document's text as a JavaScript string literal that is safe inside <script>.
+std::string MarkdownSourceLiteral(const TabDocument& document) {
+    std::string literal = WideToUtf8(JsonString(GetEditorRawText(document.editor)));
+    for (size_t pos = 0; (pos = literal.find("</", pos)) != std::string::npos; pos += 3) literal.replace(pos, 2, "<\\/");
+    return literal;
 }
 
+// Markdown is converted inside the page by Showdown running in WebView2's
+// JavaScript engine: far faster than the embedded interpreter (a 1000-line
+// file took over a second there), and the editor's thread never waits for it.
 std::string BuildMarkdownPage(const TabDocument& document, bool hasFolder) {
-    std::wstring error;
-    const std::string body = MarkdownBody(document, error);
     std::string page = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">";
     if (hasFolder) page += "<base href=\"https://mcnotepad.files/\">";
-    page += "<style>" + MarkdownStyle() + "</style></head><body><article id=\"mcn-markdown\">";
-    page += error.empty() ? body : "<p>Markdown 转换失败：" + WideToUtf8(error) + "</p>";
-    page += "</article>" + PreviewScript(g_preview.scrollRatio) + "</body></html>";
+    page += "<style>" + MarkdownStyle() + "</style>";
+    page += "<script src=\"https://mcnotepad.preview/showdown.js\"></script></head><body><article id=\"mcn-markdown\"></article>";
+    page += R"JS(<script>(function(){
+var conv=window.showdown?new showdown.Converter({tables:true,strikethrough:true,tasklists:true,ghCodeBlocks:true,simplifiedAutoLink:true}):null;
+window.mcnRender=function(t){var m=document.getElementById('mcn-markdown');
+ if(!conv){m.textContent='Markdown 预览组件 showdown.js 加载失败。';return;}
+ try{m.innerHTML=conv.makeHtml(t);}catch(e){m.textContent='Markdown 转换失败：'+e;}};
+mcnRender()JS" + MarkdownSourceLiteral(document) + ");})();</script>";
+    page += PreviewScript(g_preview.scrollRatio) + "</body></html>";
     return page;
 }
 
@@ -208,6 +215,17 @@ void PreviewLayoutWebView() {
 
 void RenderPreview(bool forceReload);
 
+// The WebView paints this colour before a page is drawn, so loading and
+// reloading never flash white in the dark theme.
+void PreviewApplyBackground() {
+    ICoreWebView2Controller2* controller2 = nullptr;
+    if (!g_preview.controller || FAILED(g_preview.controller->QueryInterface(__uuidof(ICoreWebView2Controller2),
+            reinterpret_cast<void**>(&controller2))) || !controller2) return;
+    const COLORREF color = CurrentPalette().editorBackground;
+    controller2->put_DefaultBackgroundColor(COREWEBVIEW2_COLOR{255, GetRValue(color), GetGValue(color), GetBValue(color)});
+    controller2->Release();
+}
+
 void OpenExternally(const std::wstring& uri) {
     if (uri.rfind(L"http://", 0) == 0 || uri.rfind(L"https://", 0) == 0 || uri.rfind(L"mailto:", 0) == 0) {
         ShellExecuteW(g_app.window, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -235,10 +253,27 @@ void OnWebViewReady() {
             if (uri) CoTaskMemFree(uri);
             request->Release();
             if (address.rfind(kPreviewPageHost, 0) != 0 || !g_preview.environment) return S_OK;
-            IStream* stream = SHCreateMemStream(reinterpret_cast<const BYTE*>(g_preview.page.data()), static_cast<UINT>(g_preview.page.size()));
+            std::wstring name = address.substr(wcslen(kPreviewPageHost));
+            name = name.substr(0, name.find_first_of(L"?#"));
+            static std::string showdownScript;
+            const std::string* body = &g_preview.page;
+            const wchar_t* headers = L"Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store";
+            int status = 200;
+            if (name == L"showdown.js") {
+                if (showdownScript.empty()) {
+                    LoadTextAsset(fs::path(CurrentExecutablePath()).parent_path() / L"resources" / L"showdown.js", showdownScript);
+                }
+                body = &showdownScript;
+                headers = L"Content-Type: text/javascript; charset=utf-8\r\nCache-Control: max-age=86400";
+                if (showdownScript.empty()) status = 404;
+            } else if (name != L"index.html") {
+                static const std::string empty;
+                body = &empty;
+                status = 404;
+            }
+            IStream* stream = SHCreateMemStream(reinterpret_cast<const BYTE*>(body->data()), static_cast<UINT>(body->size()));
             ICoreWebView2WebResourceResponse* response = nullptr;
-            g_preview.environment->CreateWebResourceResponse(stream, 200, L"OK",
-                L"Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store", &response);
+            g_preview.environment->CreateWebResourceResponse(stream, status, status == 200 ? L"OK" : L"Not Found", headers, &response);
             if (response) {
                 args->put_Response(response);
                 response->Release();
@@ -328,6 +363,7 @@ void CreatePreviewWebView() {
                             }
                             controller->AddRef();
                             g_preview.controller = controller;
+                            PreviewApplyBackground();
                             controller->get_CoreWebView2(&g_preview.webview);
                             OnWebViewReady();
                             return S_OK;
@@ -356,13 +392,9 @@ void RenderPreview(bool forceReload) {
     const bool sameDocument = g_preview.shownEditor == document->editor && g_preview.shownKind == kind;
     if (!sameDocument) g_preview.scrollRatio = -1;
     if (!forceReload && sameDocument && kind == PreviewKind::Markdown && g_preview.pageReady) {
-        std::wstring error;
-        const std::string body = MarkdownBody(*document, error);
-        if (error.empty()) {
-            const std::wstring json = L"{\"type\":\"markdown\",\"html\":" + JsonString(Utf8ToWide(body)) + L"}";
-            g_preview.webview->PostWebMessageAsJson(json.c_str());
-            return;
-        }
+        const std::wstring json = L"{\"type\":\"markdown\",\"text\":" + JsonString(GetEditorRawText(document->editor)) + L"}";
+        g_preview.webview->PostWebMessageAsJson(json.c_str());
+        return;
     }
     // Relative paths resolve against the file's folder.
     const std::wstring folder = document->untitled || document->path.empty() ? std::wstring() : fs::path(document->path).parent_path().wstring();
@@ -544,6 +576,7 @@ void PreviewOnEditorScrolled(HWND editor) {
 }
 
 void PreviewThemeChanged() {
+    PreviewApplyBackground();
     if (PreviewVisible()) {
         InvalidateRect(g_preview.pane, nullptr, TRUE);
         RenderPreview(true);

@@ -552,6 +552,49 @@ bool LoadTextAsset(const fs::path& path, std::string& output) {
     return true;
 }
 
+// Markdown -> HTML for the live preview runs on every edit and tab switch, so
+// it keeps one JavaScript heap with Showdown loaded and a converter ready
+// (compiling showdown.js takes far longer than converting a page). The heap
+// is rebuilt after any failure.
+duk_context* g_markdownHeap = nullptr;
+
+void DropMarkdownHeap() {
+    if (g_markdownHeap) duk_destroy_heap(g_markdownHeap);
+    g_markdownHeap = nullptr;
+}
+
+bool ShowdownMarkdownToHtmlCached(const std::string& script, const std::string& utf8, std::wstring& output, std::wstring& error) {
+    auto fail = [&](duk_context* ctx, const char* message) {
+        error = Utf8ToWide(message ? message : "JavaScript 执行失败");
+        if (ctx) duk_destroy_heap(ctx);
+        g_markdownHeap = nullptr;
+        return false;
+    };
+    if (!g_markdownHeap) {
+        duk_context* ctx = duk_create_heap_default();
+        if (!ctx) { error = L"无法创建 JavaScript 运行环境。"; return false; }
+        duk_push_lstring(ctx, script.data(), script.size());
+        if (duk_peval(ctx) != 0) return fail(ctx, duk_safe_to_string(ctx, -1));
+        duk_pop(ctx);
+        static const char kSetup[] =
+            "var MCNConverter = new showdown.Converter({tables: true, strikethrough: true, tasklists: true,"
+            " ghCodeBlocks: true, simplifiedAutoLink: true});"
+            "function MCNMakeHtml(text) { return MCNConverter.makeHtml(text); }";
+        if (duk_peval_string(ctx, kSetup) != 0) return fail(ctx, duk_safe_to_string(ctx, -1));
+        duk_pop(ctx);
+        g_markdownHeap = ctx;
+    }
+    duk_context* ctx = g_markdownHeap;
+    duk_get_global_string(ctx, "MCNMakeHtml");
+    duk_push_lstring(ctx, utf8.data(), utf8.size());
+    if (duk_pcall(ctx, 1) != 0) return fail(ctx, duk_safe_to_string(ctx, -1));
+    if (!duk_is_string(ctx, -1)) return fail(ctx, "Showdown 返回了非文本结果");
+    output = Utf8ToWide(duk_get_string(ctx, -1));
+    duk_pop(ctx);
+    duk_gc(ctx, 0);
+    return true;
+}
+
 bool ShowdownConvert(std::wstring_view input, bool markdownToHtml, std::wstring& output, std::wstring& error) {
     if (input.size() > 8u * 1024u * 1024u) {
         error = L"为避免转换过程占用过多内存，单次处理限制为 8 MB。";
@@ -569,6 +612,7 @@ bool ShowdownConvert(std::wstring_view input, bool markdownToHtml, std::wstring&
         error = L"缺少 Showdown 运行资源，请确认 resources/showdown.js 和 resources/showdown-dom.js 存在。";
         return false;
     }
+    if (markdownToHtml) return ShowdownMarkdownToHtmlCached(showdownScript, WideToUtf8(input), output, error);
     duk_context* ctx = duk_create_heap_default();
     if (!ctx) { error = L"无法创建 JavaScript 运行环境。"; return false; }
     auto fail = [&](const char* message) {
