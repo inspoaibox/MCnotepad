@@ -58,6 +58,7 @@ $stage = Join-Path $out '_stage'
 if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item $exe $stage
+Copy-Item (Join-Path $buildDir 'Release\WebView2Loader.dll') $stage   # Markdown / HTML preview
 foreach ($folder in 'resources', 'dict') { Copy-Item -Recurse (Join-Path $buildDir "Release\$folder") $stage }
 Copy-Item (Join-Path $root 'README.md') $stage
 

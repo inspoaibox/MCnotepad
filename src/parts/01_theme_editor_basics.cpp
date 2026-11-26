@@ -232,6 +232,7 @@ void ApplyThemeToEditors(bool rehighlight = true) {
 void SetThemeKind(ThemeKind theme) {
     g_app.theme = theme;
     ApplyThemeToEditors();
+    PreviewThemeChanged();
 }
 
 std::wstring ToolbarLabel(int id) {
@@ -247,6 +248,7 @@ std::wstring ToolbarLabel(int id) {
     case kIdToolbarReplace: return L"替换";
     case kIdToolbarGoto: return L"跳转";
     case kIdToolbarFormat: return L"格式化";
+    case kIdViewLivePreview: return L"预览";
     case kIdToolbarRun: return L"运行";
     case kIdToolbarEncoding: return L"编码";
     case kIdToolbarLineNumbers: return L"行号";

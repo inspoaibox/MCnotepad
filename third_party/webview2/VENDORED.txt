@@ -1,0 +1,6 @@
+Microsoft Edge WebView2 SDK 1.0.4370.26 (NuGet package Microsoft.Web.WebView2)
+https://www.nuget.org/packages/Microsoft.Web.WebView2/1.0.4370.26
+
+Only the header (include/WebView2.h) and the x64 loader (x64/WebView2Loader.dll) are kept.
+The loader is copied next to MCnotepad.exe and loaded at runtime; the WebView2 runtime itself
+(Edge) is part of Windows 11 and most Windows 10 installs.

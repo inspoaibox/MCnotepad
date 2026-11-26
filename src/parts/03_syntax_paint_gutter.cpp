@@ -158,6 +158,7 @@ void SyntaxOnViewChanged(HWND editor) {
     for (TabDocument& document : g_app.documents) {
         if (document.editor == editor) {
             SyntaxColorVisible(document, false);
+            PreviewOnEditorScrolled(editor);
             return;
         }
     }

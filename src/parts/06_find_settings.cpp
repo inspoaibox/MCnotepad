@@ -781,6 +781,7 @@ void CreateSettingsControl(HWND parent, const wchar_t* className, const wchar_t*
     if (id == kIdSettingsWindowCloseBehavior) g_app.settingsWindowCloseBehaviorCombo = control;
     if (id == kIdSettingsMinimizeToTray) g_app.settingsMinimizeToTrayCheck = control;
     if (id == kIdSettingsShowTray) g_app.settingsShowTrayCheck = control;
+    if (id == kIdSettingsPreviewAuto) g_app.settingsPreviewAutoCheck = control;
 }
 
 // Font sizes offered in Settings.
@@ -857,8 +858,11 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             kIdSettingsWrap, 215, 278, 170, 26);
         SendMessageW(g_app.settingsLineNumbersCheck, BM_SETCHECK, g_app.showLineNumbers ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageW(g_app.settingsWrapCheck, BM_SETCHECK, g_app.wordWrap ? BST_CHECKED : BST_UNCHECKED, 0);
+        CreateSettingsControl(window, L"BUTTON", L"打开 MD/HTML 文件时自动显示预览", BS_AUTOCHECKBOX | WS_TABSTOP,
+            kIdSettingsPreviewAuto, 26, 310, 300, 26);
+        SendMessageW(g_app.settingsPreviewAutoCheck, BM_SETCHECK, g_app.previewAutoOpen ? BST_CHECKED : BST_UNCHECKED, 0);
         CreateSettingsControl(window, L"BUTTON", L"快捷键设置（Ctrl+K）", BS_PUSHBUTTON | WS_TABSTOP,
-            kIdSettingsShortcuts, 26, 310, 190, 30);
+            kIdSettingsShortcuts, 26, 344, 190, 30);
         CreateSettingsControl(window, L"BUTTON", L"应用", BS_DEFPUSHBUTTON | WS_TABSTOP,
             kIdSettingsApply, 360, 340, 82, 30);
         CreateSettingsControl(window, L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP,
@@ -882,6 +886,7 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             if (themeIndex >= 0 && themeIndex < 4) SetThemeKind(static_cast<ThemeKind>(themeIndex));
             g_app.showLineNumbers = SendMessageW(g_app.settingsLineNumbersCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
             g_app.wordWrap = SendMessageW(g_app.settingsWrapCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            g_app.previewAutoOpen = SendMessageW(g_app.settingsPreviewAutoCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
             const bool startupEnabled = SendMessageW(g_app.settingsStartupCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
             const int closeBehaviorIndex = static_cast<int>(SendMessageW(
                 g_app.settingsCloseBehaviorCombo, CB_GETCURSEL, 0, 0));
@@ -1027,6 +1032,7 @@ void SetActiveLanguage(int language) {
     HighlightDocument(*document);
     g_app.stateDirty = true;
     UpdateStatusBar();
+    UpdatePreviewForActiveTab();
 }
 
 void AppendEncodingItems(HMENU menu) {

@@ -74,6 +74,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 PersistAll(false);
             }
             UpdateStatusBar();
+        } else if (wParam == kTimerPreview) {
+            KillTimer(window, kTimerPreview);
+            RenderPreview(false);
         } else if (wParam == kTimerHighlight) {
             KillTimer(window, kTimerHighlight);
             if (const TabDocument* document = ActiveDocument()) {
@@ -154,6 +157,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                         ShiftBookmarksForEdit(g_app.documents[index], CountRealLines(currentText), caretLine);
                     }
                     StoreEditorText(source, hash, std::move(currentText));
+                    PreviewOnTextChanged(source);
                     const bool wasModified = g_app.documents[index].modified;
                     g_app.documents[index].modified = true;
                     MarkRecoveryDirty(static_cast<int>(index));
@@ -298,6 +302,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             ApplyWordWrapAll();
             LayoutChildren(window);
             break;
+        case kIdViewLivePreview: ToggleLivePreview(); break;
         case kIdViewZoomIn: ChangeEditorFontSize(1); break;
         case kIdViewZoomOut: ChangeEditorFontSize(-1); break;
         case kIdViewZoomReset: ChangeEditorFontSize(0); break;

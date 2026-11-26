@@ -21,7 +21,13 @@ void LayoutChildren(HWND window) {
     }
     const int toolboxWidth = g_app.toolboxVisible && g_app.toolboxPanel ? std::min(Scale(g_app.toolboxWidth), std::max(0, width - Scale(320))) : 0;
     if (g_app.toolboxPanel) MoveWindow(g_app.toolboxPanel, width - toolboxWidth, contentY, toolboxWidth, contentHeight, TRUE);
-    const int editorWidth = width - toolboxWidth;
+    int editorWidth = width - toolboxWidth;
+    // Live preview: to the right of the editor, left of the toolbox.
+    if (HWND pane = PreviewPaneWindow()) {
+        const int previewWidth = g_app.previewVisible ? std::max(Scale(160), editorWidth * (100 - g_app.previewEditorPercent) / 100) : 0;
+        if (g_app.previewVisible) editorWidth = std::max(Scale(160), editorWidth - previewWidth);
+        MoveWindow(pane, editorWidth, contentY, g_app.previewVisible ? width - toolboxWidth - editorWidth : 0, contentHeight, TRUE);
+    }
     HWND activeEditor = (g_app.activeIndex >= 0 && g_app.activeIndex < static_cast<int>(g_app.documents.size()))
         ? g_app.documents[static_cast<size_t>(g_app.activeIndex)].editor : nullptr;
     g_app.gutterWidth = GutterWidthFor(activeEditor);
@@ -66,6 +72,7 @@ void SelectTab(int index) {
     if (g_app.showLineNumbers && GutterWidthFor(document.editor) != g_app.gutterWidth) LayoutChildren(g_app.window);
     g_app.stateDirty = true;
     UpdateWindowTitle();
+    UpdatePreviewForActiveTab();
 }
 
 void SelectAdjacentTab(int delta) {
@@ -108,6 +115,7 @@ bool SaveSessionFile() {
     output << "LINE_SPACING\t" << g_app.lineSpacingPercent << "\n";
     output << "TOP_SPACING\t" << g_app.topSpacingPixels << "\n";
     output << "DEFAULT_FONT_SIZE\t" << g_app.defaultFontSize << "\n";
+    output << "PREVIEW\t" << (g_app.previewAutoOpen ? 1 : 0) << '\t' << g_app.previewEditorPercent << "\n";
     output << "OPTIONS\t" << (g_app.showLineNumbers ? 1 : 0) << '\t'
            << (g_app.wordWrap ? 1 : 0) << '\t'
            << (g_app.sidebarVisible ? 1 : 0) << '\t'
@@ -159,7 +167,7 @@ bool SaveSessionFile() {
             if (bookmark != 0) output << ',';
             output << document.bookmarks[bookmark];
         }
-        output << '\t' << (document.pinned ? 1 : 0) << '\n';
+        output << '\t' << (document.pinned ? 1 : 0) << '\t' << (document.previewOpen ? 1 : 0) << '\n';
     }
 
     return WriteDataFile(g_app.sessionPath, output.str());
@@ -1025,6 +1033,9 @@ bool OpenFileInNewTab(const fs::path& path) {
     if (index < 0) {
         return false;
     }
+    if (g_app.previewAutoOpen && IsPreviewable(g_app.documents[static_cast<size_t>(index)])) {
+        g_app.documents[static_cast<size_t>(index)].previewOpen = true;
+    }
     SelectTab(index);
     g_app.stateDirty = true;  // the autosave timer writes the session within two seconds
     return true;
@@ -1255,6 +1266,7 @@ void SetMenuState() {
         }
         if (selected != 0) CheckMenuItem(g_app.lineSpacingMenu, selected, MF_BYCOMMAND | MF_CHECKED);
     }
+    CheckMenuItem(menu, kIdViewLivePreview, MF_BYCOMMAND | (g_app.previewVisible ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, kIdTopSpacingCustom, MF_BYCOMMAND |
         (g_app.topSpacingPixels > 0 ? MF_CHECKED : MF_UNCHECKED));
     CheckDocumentMenuItems(menu);
@@ -1346,6 +1358,8 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(view, MF_STRING, kIdViewZoomOut, L"缩小字号\tCtrl+-");
     AppendMenuW(view, MF_STRING, kIdViewZoomReset, L"恢复默认字号\tCtrl+0");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, MF_STRING, kIdViewLivePreview, L"Markdown/HTML 预览\tCtrl+Shift+V");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, kIdViewToggleBookmark, L"切换书签\tCtrl+F2");
     AppendMenuW(view, MF_STRING, kIdViewNextBookmark, L"下一个书签\tF4");
     AppendMenuW(view, MF_STRING, kIdViewPreviousBookmark, L"上一个书签\tShift+F4");
@@ -1414,6 +1428,7 @@ struct SessionEntry {
     bool modified = false;
     bool untitled = false;
     bool pinned = false;
+    bool previewOpen = false;
     std::vector<int> bookmarks;
     DocumentFormat format;
 };
@@ -1495,6 +1510,12 @@ void LoadPersistedSession() {
             g_app.toolboxMask = static_cast<unsigned>(mask) & 0x3FF;
             if (!g_app.toolboxMask) g_app.toolboxMask = 0x3FF;
             g_app.toolboxTool = std::clamp(tool, 0, 9);
+        } else if (parts[0] == "PREVIEW" && parts.size() >= 3) {
+            int autoOpen = 0, percent = 50;
+            ParseInt(parts[1], autoOpen);
+            ParseInt(parts[2], percent);
+            g_app.previewAutoOpen = autoOpen != 0;
+            g_app.previewEditorPercent = std::clamp(percent, 20, 80);
         } else if (parts[0] == "DEFAULT_FONT_SIZE" && parts.size() >= 2) {
             ParseInt(parts[1], persistedDefaultFontSize);
         } else if (parts[0] == "PREFERENCES" && parts.size() >= 3) {
@@ -1568,6 +1589,11 @@ void LoadPersistedSession() {
                 int pinned = 0;
                 ParseInt(parts[16], pinned);
                 entry.pinned = pinned != 0;
+            }
+            if (parts.size() >= 18) {
+                int preview = 0;
+                ParseInt(parts[17], preview);
+                entry.previewOpen = preview != 0;
             }
             entry.path = Utf8ToWide(HexDecode(parts[2]));
             entry.title = Utf8ToWide(HexDecode(parts[3]));
@@ -1660,6 +1686,7 @@ void LoadPersistedSession() {
             TabDocument& created = g_app.documents[static_cast<size_t>(index)];
             created.horizontalScroll = entry.horizontalScroll;
             created.pinned = entry.pinned;
+            created.previewOpen = entry.previewOpen;
             created.bookmarks = std::move(entry.bookmarks);
             NormalizeBookmarks(created);
             // A tab that had to get a fresh snapshot (missing or shared by an

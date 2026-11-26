@@ -4,7 +4,7 @@
 // src/parts/. The parts are included here in order and are not compiled
 // on their own: later parts use declarations from earlier ones, and the
 // anonymous namespace opened in 00_app_state.cpp is closed in
-// 20_main_window.cpp. Keep new code in the part it belongs to, and keep
+// 21_main_window.cpp. Keep new code in the part it belongs to, and keep
 // the order below.
 
 #include "parts/00_app_state.cpp"  // Includes, command IDs, constants, document and application state
@@ -27,4 +27,5 @@
 #include "parts/17_compare_window.cpp"  // Compare window and structured view
 #include "parts/18_folder_compare.cpp"  // Folder compare
 #include "parts/19_log_viewer.cpp"  // Large log viewer
-#include "parts/20_main_window.cpp"  // Tool-window keys, main window procedure, self-test, entry point
+#include "parts/20_preview.cpp"  // Markdown / HTML live preview (WebView2)
+#include "parts/21_main_window.cpp"  // Tool-window keys, main window procedure, self-test, entry point

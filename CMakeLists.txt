@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(MCnotepad VERSION 0.1.2 LANGUAGES C CXX RC)
+project(MCnotepad VERSION 0.2.0 LANGUAGES C CXX RC)
 
 include(CTest)
 
@@ -75,7 +75,8 @@ set_source_files_properties(${MCNOTEPAD_PARTS} PROPERTIES HEADER_FILE_ONLY TRUE)
 target_compile_definitions(MCnotepad PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(MCnotepad PRIVATE comctl32 comdlg32 shlwapi advapi32 dwmapi uxtheme crypt32 cpp-pinyin::cpp-pinyin OpenCC::OpenCC faker-cxx duktape)
 
-target_include_directories(MCnotepad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/resources)
+target_include_directories(MCnotepad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/resources
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/webview2/include)
 
 if(MSVC)
     target_compile_options(MCnotepad PRIVATE /W4 /permissive- /EHsc /utf-8)
@@ -88,6 +89,13 @@ add_custom_command(TARGET MCnotepad POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_SOURCE_DIR}/resources
             $<TARGET_FILE_DIR:MCnotepad>/resources
+)
+
+# Markdown / HTML preview: the WebView2 loader is loaded at runtime from the exe folder.
+add_custom_command(TARGET MCnotepad POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/webview2/x64/WebView2Loader.dll
+            $<TARGET_FILE_DIR:MCnotepad>/WebView2Loader.dll
 )
 
 # Pinyin dictionaries are read at runtime from <exe dir>/dict/mandarin.

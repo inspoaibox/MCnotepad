@@ -46,6 +46,7 @@
 
 #include "../resources/resource.h"
 #include "version.h"
+#include "WebView2.h"
 
 #include <cpp-pinyin/Pinyin.h>
 #include <cpp-pinyin/G2pglobal.h>
@@ -150,6 +151,7 @@ constexpr int kIdTabPrevious = 1246;
 constexpr int kIdViewZoomIn = 1247;
 constexpr int kIdViewZoomOut = 1248;
 constexpr int kIdViewZoomReset = 1249;
+constexpr int kIdViewLivePreview = 1250;
 constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
@@ -218,6 +220,7 @@ constexpr int kIdSettingsWindowCloseBehavior = 1710;
 constexpr int kIdSettingsMinimizeToTray = 1711;
 constexpr int kIdSettingsShowTray = 1712;
 constexpr int kIdSettingsShortcuts = 1713;
+constexpr int kIdSettingsPreviewAuto = 1714;
 constexpr int kIdShortcutEditFirst = 2120;
 // Keep these outside the dynamically allocated edit-control ID range.
 constexpr int kIdShortcutApply = 2500;
@@ -328,6 +331,7 @@ struct TabDocument {
     bool untitled = true;
     bool modified = false;
     bool pinned = false;
+    bool previewOpen = false;  // Markdown / HTML preview pane
     bool recoveryDirty = true;
     int64_t caret = 0;
     int64_t anchor = 0;
@@ -447,6 +451,9 @@ struct AppState {
     ThemeKind theme = ThemeKind::Dark;
     int fontSize = 13;            // current size (Ctrl+wheel / Ctrl+= / Ctrl+- change it)
     int defaultFontSize = 13;     // set in Settings; new windows and Ctrl+0 use it
+    bool previewVisible = false;  // Markdown / HTML preview pane shown for the active tab
+    int previewEditorPercent = 50;  // editor share of the width while the preview is shown
+    bool previewAutoOpen = false;  // open the preview when a Markdown / HTML file is opened
     int lineSpacingPercent = 100;
     int topSpacingPixels = 0;
     std::wstring fontFamily = L"JetBrains Mono";  // one of the bundled programming fonts
@@ -514,6 +521,7 @@ struct AppState {
     HWND settingsWindowCloseBehaviorCombo = nullptr;
     HWND settingsMinimizeToTrayCheck = nullptr;
     HWND settingsShowTrayCheck = nullptr;
+    HWND settingsPreviewAutoCheck = nullptr;
     fs::path dataDirectory;
     fs::path recoveryDirectory;
     fs::path sessionPath;
@@ -650,6 +658,7 @@ std::wstring ShortcutLabelForCommand(int command) {
     case kIdViewZoomIn: return L"视图：放大字号";
     case kIdViewZoomOut: return L"视图：缩小字号";
     case kIdViewZoomReset: return L"视图：恢复默认字号";
+    case kIdViewLivePreview: return L"视图：Markdown/HTML 预览";
     case kIdViewNextBookmark: return L"视图：下一个书签";
     case kIdViewPreviousBookmark: return L"视图：上一个书签";
     case kIdViewClearBookmarks: return L"视图：清除书签";
@@ -744,6 +753,7 @@ void InitializeShortcutBindings() {
     add(kIdViewClearBookmarks); add(kIdViewWhitespace, L"Ctrl+Alt+Space"); add(kIdViewIndentGuides, L"Ctrl+Alt+I");
     add(kIdViewFoldCurrent, L"F7"); add(kIdViewUnfoldAll, L"Shift+F7");
     add(kIdViewZoomIn, L"Ctrl+Plus"); add(kIdViewZoomOut, L"Ctrl+Minus"); add(kIdViewZoomReset, L"Ctrl+0");
+    add(kIdViewLivePreview, L"Ctrl+Shift+V");
     add(kIdToolbarLineNumbers, L"Ctrl+Alt+L"); add(kIdToolbarWrap, L"Ctrl+Alt+W"); add(kIdToolbarEncoding);
     add(kIdLineSpacingSingle, L"Ctrl+Alt+1"); add(kIdLineSpacing115, L"Ctrl+Alt+2");
     add(kIdLineSpacing150, L"Ctrl+Alt+3"); add(kIdLineSpacing200, L"Ctrl+Alt+4"); add(kIdLineSpacingCustom);
@@ -879,3 +889,12 @@ LRESULT CALLBACK Guarded(HWND window, UINT message, WPARAM wParam, LPARAM lParam
     }
     return 0;
 }
+
+// Live preview (20_preview.cpp).
+void UpdatePreviewForActiveTab();
+void ToggleLivePreview();
+void PreviewOnTextChanged(HWND editor);
+void PreviewOnEditorScrolled(HWND editor);
+void PreviewThemeChanged();
+HWND PreviewPaneWindow();
+bool IsPreviewable(const struct TabDocument& document);

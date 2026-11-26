@@ -181,7 +181,31 @@ void DrawWrapIcon(HDC dc, const RECT& cell, COLORREF color) {
 }
 
 // Tinted toolbar icon: the PNGs are white-on-transparent masks.
+// Preview: a window split into code lines (left) and a page (right).
+void DrawPreviewIcon(HDC dc, const RECT& cell, COLORREF color) {
+    Graphics graphics(dc);
+    graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+    const float size = static_cast<float>(Scale(16));
+    const float x0 = static_cast<float>(cell.left) + (static_cast<float>(cell.right - cell.left) - size) / 2;
+    const float y0 = static_cast<float>(cell.top) + (static_cast<float>(cell.bottom - cell.top) - size) / 2;
+    const auto P = [&](float x, float y) { return PointF(x0 + x * size / 16, y0 + y * size / 16); };
+    Pen pen(Color(255, GetRValue(color), GetGValue(color), GetBValue(color)), std::max(1.0f, size / 12));
+    graphics.DrawRectangle(&pen, x0 + size / 16, y0 + 2 * size / 16, 14 * size / 16, 12 * size / 16);
+    graphics.DrawLine(&pen, P(8, 2), P(8, 14));
+    graphics.DrawLine(&pen, P(3, 6), P(6, 6));
+    graphics.DrawLine(&pen, P(3, 9), P(6, 9));
+    graphics.DrawLine(&pen, P(3, 12), P(5, 12));
+    SolidBrush fill(Color(255, GetRValue(color), GetGValue(color), GetBValue(color)));
+    graphics.FillRectangle(&fill, x0 + 10 * size / 16, y0 + 5 * size / 16, 3.2f * size / 16, 2.6f * size / 16);
+    graphics.DrawLine(&pen, P(10, 10), P(13.5f, 10));
+    graphics.DrawLine(&pen, P(10, 12.5f), P(13.5f, 12.5f));
+}
+
 void DrawToolIcon(HDC dc, int id, const RECT& cell, COLORREF color) {
+    if (id == kIdViewLivePreview) {
+        DrawPreviewIcon(dc, cell, color);
+        return;
+    }
     if (id == kIdToolbarWrap) {
         DrawWrapIcon(dc, cell, color);
         return;
@@ -505,7 +529,7 @@ std::vector<ToolbarItem> g_toolItems = {
     {kIdToolbarUndo, true}, {kIdToolbarRedo, false},
     {kIdToolbarFind, true}, {kIdToolbarReplace, false}, {kIdToolbarGoto, false},
     {kIdToolbarFormat, true}, {kIdToolbarRun, false},
-    {kIdToolbarEncoding, true}, {kIdToolbarLineNumbers, false}, {kIdToolbarWrap, false},
+    {kIdToolbarEncoding, true}, {kIdToolbarLineNumbers, false}, {kIdToolbarWrap, false}, {kIdViewLivePreview, false},
     {kIdToolbarTheme, true, true},
 };
 int g_toolHot = -1;
@@ -528,6 +552,7 @@ std::wstring ToolTipText(int id) {
     case kIdToolbarEncoding: return L"编码和换行符";
     case kIdToolbarLineNumbers: return L"显示行号";
     case kIdToolbarWrap: return L"自动换行";
+    case kIdViewLivePreview: return L"Markdown/HTML 预览 (Ctrl+Shift+V)";
     case kIdToolbarTheme: return L"切换主题";
     default: return {};
     }
@@ -538,12 +563,14 @@ bool ToolEnabled(int id) {
     if (!document) return id == kIdToolbarNew || id == kIdToolbarOpen || id == kIdToolbarTheme;
     if (id == kIdToolbarUndo) return SendMessageW(document->editor, EM_CANUNDO, 0, 0) != 0;
     if (id == kIdToolbarRedo) return SendMessageW(document->editor, EM_CANREDO, 0, 0) != 0;
+    if (id == kIdViewLivePreview) return IsPreviewable(*document);
     return true;
 }
 
 bool ToolChecked(int id) {
     if (id == kIdToolbarLineNumbers) return g_app.showLineNumbers;
     if (id == kIdToolbarWrap) return g_app.wordWrap;
+    if (id == kIdViewLivePreview) return g_app.previewVisible;
     return false;
 }
 

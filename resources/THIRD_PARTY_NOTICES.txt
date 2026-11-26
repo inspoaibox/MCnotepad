@@ -11,6 +11,11 @@ License: MIT
 The bundled showdown.js is used for Markdown <-> HTML conversion.
 showdown-dom.js is a small DOM adapter used by Showdown's HTML-to-Markdown path.
 
+Microsoft Edge WebView2 SDK 1.0.4370.26 (WebView2Loader.dll and headers)
+Copyright (C) Microsoft Corporation
+License: BSD 3-Clause (third_party/webview2/LICENSE.txt)
+Used for the Markdown / HTML preview; the WebView2 runtime itself is part of Windows.
+
 Bundled programming fonts (resources/fonts/<family>/, each with its license file)
 - JetBrains Mono 2.304 - JetBrains - SIL Open Font License 1.1
 - Fira Code 6.2 - Nikita Prokopov - SIL Open Font License 1.1
