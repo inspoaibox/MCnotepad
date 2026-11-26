@@ -298,6 +298,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             ApplyWordWrapAll();
             LayoutChildren(window);
             break;
+        case kIdViewZoomIn: ChangeEditorFontSize(1); break;
+        case kIdViewZoomOut: ChangeEditorFontSize(-1); break;
+        case kIdViewZoomReset: ChangeEditorFontSize(0); break;
         case kIdViewToggleBookmark:
             ToggleBookmarkAtCaret();
             break;

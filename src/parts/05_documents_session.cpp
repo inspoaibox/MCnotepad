@@ -107,6 +107,7 @@ bool SaveSessionFile() {
     output << "THEME\t" << static_cast<int>(g_app.theme) << "\n";
     output << "LINE_SPACING\t" << g_app.lineSpacingPercent << "\n";
     output << "TOP_SPACING\t" << g_app.topSpacingPixels << "\n";
+    output << "DEFAULT_FONT_SIZE\t" << g_app.defaultFontSize << "\n";
     output << "OPTIONS\t" << (g_app.showLineNumbers ? 1 : 0) << '\t'
            << (g_app.wordWrap ? 1 : 0) << '\t'
            << (g_app.sidebarVisible ? 1 : 0) << '\t'
@@ -213,8 +214,9 @@ void RemoveRunningMarker() {
     fs::remove(g_app.runningMarkerPath, error);
 }
 
+// delta 0 resets to the default size from Settings.
 void ChangeEditorFontSize(int delta) {
-    const int next = delta == 0 ? 13 : std::clamp(g_app.fontSize + delta, 10, 32);
+    const int next = delta == 0 ? g_app.defaultFontSize : std::clamp(g_app.fontSize + delta, 8, 48);
     // Ctrl+0 is also a recovery action: even when the stored size is already
     // 13, reapply the font and layout so a stale RichEdit zoom/viewport state
     // cannot leave the editor looking partially scaled after taskbar restore.
@@ -226,7 +228,8 @@ void ChangeEditorFontSize(int delta) {
     if (g_app.window) LayoutChildren(g_app.window);
     RefreshGutter();
     g_app.stateDirty = true;
-    ShowNotice(L"编辑器字号 " + std::to_wstring(g_app.fontSize) + L" px");
+    ShowNotice(L"编辑器字号 " + std::to_wstring(g_app.fontSize) +
+        (g_app.fontSize == g_app.defaultFontSize ? L"（默认）" : L"（默认 " + std::to_wstring(g_app.defaultFontSize) + L"，Ctrl+0 恢复）"));
 }
 
 bool TryAutoCloseCharacter(HWND editor, wchar_t character) {
@@ -454,16 +457,18 @@ LRESULT CALLBACK EditorProc(HWND editor, UINT message, WPARAM wParam, LPARAM lPa
             SendMessageW(g_app.window, WM_COMMAND, kIdViewToggleBookmark, 0);
             return 0;
         }
-        if (wParam == VK_OEM_PLUS || wParam == VK_ADD) {
+        // Ctrl+= / Ctrl+- / Ctrl+0 are app shortcuts (they work wherever the
+        // focus is); the numeric keypad keys are handled here as well.
+        if (wParam == VK_ADD) {
             ChangeEditorFontSize(1);
             return 0;
         }
-        if (wParam == VK_OEM_MINUS || wParam == VK_SUBTRACT) {
+        if (wParam == VK_SUBTRACT) {
             ChangeEditorFontSize(-1);
             return 0;
         }
-        if (wParam == '0' || wParam == VK_NUMPAD0) {
-            ChangeEditorFontSize(13 - g_app.fontSize);
+        if (wParam == VK_NUMPAD0) {
+            ChangeEditorFontSize(0);
             return 0;
         }
         switch (static_cast<UINT>(wParam)) {
@@ -1337,6 +1342,10 @@ HMENU CreateApplicationMenu() {
     AppendMenuW(view, MF_STRING, kIdToolbarLineNumbers, L"行号");
     AppendMenuW(view, MF_STRING, kIdToolbarWrap, L"自动换行");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, MF_STRING, kIdViewZoomIn, L"放大字号\tCtrl+=");
+    AppendMenuW(view, MF_STRING, kIdViewZoomOut, L"缩小字号\tCtrl+-");
+    AppendMenuW(view, MF_STRING, kIdViewZoomReset, L"恢复默认字号\tCtrl+0");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, kIdViewToggleBookmark, L"切换书签\tCtrl+F2");
     AppendMenuW(view, MF_STRING, kIdViewNextBookmark, L"下一个书签\tF4");
     AppendMenuW(view, MF_STRING, kIdViewPreviousBookmark, L"上一个书签\tShift+F4");
@@ -1429,6 +1438,7 @@ void LoadPersistedSession() {
     int persistedWordWrap = g_app.wordWrap ? 1 : 0;
     int persistedSidebarVisible = g_app.sidebarVisible ? 1 : 0;
     int persistedFontSize = g_app.fontSize;
+    int persistedDefaultFontSize = -1;  // sessions before 0.1.2: the saved size was the default
     int persistedLanguage = g_app.languageIndex;
     int persistedEncoding = g_app.encodingIndex;
     int persistedLineEnding = g_app.lineEndingIndex;
@@ -1485,6 +1495,8 @@ void LoadPersistedSession() {
             g_app.toolboxMask = static_cast<unsigned>(mask) & 0x3FF;
             if (!g_app.toolboxMask) g_app.toolboxMask = 0x3FF;
             g_app.toolboxTool = std::clamp(tool, 0, 9);
+        } else if (parts[0] == "DEFAULT_FONT_SIZE" && parts.size() >= 2) {
+            ParseInt(parts[1], persistedDefaultFontSize);
         } else if (parts[0] == "PREFERENCES" && parts.size() >= 3) {
             ParseInt(parts[1], persistedStartup);
             ParseInt(parts[2], persistedCloseBehavior);
@@ -1579,7 +1591,9 @@ void LoadPersistedSession() {
     g_app.showWhitespace = persistedShowWhitespace != 0;
     g_app.showIndentGuides = persistedShowIndentGuides != 0;
     g_app.sidebarVisible = false;
-    g_app.fontSize = std::clamp(persistedFontSize, 10, 32);
+    // Every start uses the default size; zooming lasts for the session.
+    g_app.defaultFontSize = std::clamp(persistedDefaultFontSize > 0 ? persistedDefaultFontSize : persistedFontSize, 8, 48);
+    g_app.fontSize = g_app.defaultFontSize;
     if (!persistedFontFamily.empty()) g_app.fontFamily = persistedFontFamily;
     g_app.languageIndex = std::clamp(persistedLanguage, 0, kLanguageCount - 1);
     g_app.encodingIndex = std::clamp(persistedEncoding, 0, kEncodingCount - 1);

@@ -783,31 +783,63 @@ void CreateSettingsControl(HWND parent, const wchar_t* className, const wchar_t*
     if (id == kIdSettingsShowTray) g_app.settingsShowTrayCheck = control;
 }
 
+// Font sizes offered in Settings.
+constexpr int kSettingsFontSizes[] = {9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32};
+
+// Fonts for the editor: every installed monospaced font, plus the common
+// Chinese UI fonts (proportional, but often preferred for Chinese text).
+std::vector<std::wstring> EditorFontChoices() {
+    std::vector<std::wstring> fonts;
+    HDC dc = GetDC(nullptr);
+    LOGFONTW query{};
+    query.lfCharSet = DEFAULT_CHARSET;
+    EnumFontFamiliesExW(dc, &query, [](const LOGFONTW* font, const TEXTMETRICW*, DWORD type, LPARAM list) -> int {
+        auto& out = *reinterpret_cast<std::vector<std::wstring>*>(list);
+        const std::wstring name = font->lfFaceName;
+        if (name.empty() || name[0] == L'@') return 1;  // vertical variants
+        if (type & RASTER_FONTTYPE) return 1;           // old bitmap fonts (Fixedsys, Terminal)
+        if (name.ends_with(L"-ExtB") || name.ends_with(L"-ExtG")) return 1;  // rare-character supplements
+        static const wchar_t* chinese[] = {L"Microsoft YaHei", L"Microsoft YaHei UI", L"DengXian", L"SimSun", L"NSimSun",
+            L"SimHei", L"KaiTi", L"FangSong", L"等线", L"微软雅黑", L"宋体", L"新宋体", L"黑体", L"楷体", L"仿宋"};
+        const bool fixed = (font->lfPitchAndFamily & 0x3) == FIXED_PITCH;
+        const bool common = std::any_of(std::begin(chinese), std::end(chinese), [&](const wchar_t* c) { return name == c; });
+        if ((fixed || common) && std::find(out.begin(), out.end(), name) == out.end()) out.push_back(name);
+        return 1;
+    }, reinterpret_cast<LPARAM>(&fonts), 0);
+    ReleaseDC(nullptr, dc);
+    if (std::find(fonts.begin(), fonts.end(), g_app.fontFamily) == fonts.end()) fonts.push_back(g_app.fontFamily);
+    std::sort(fonts.begin(), fonts.end(), [](const std::wstring& a, const std::wstring& b) {
+        return CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE, a.c_str(), -1, b.c_str(), -1, nullptr, nullptr, 0) == CSTR_LESS_THAN;
+    });
+    return fonts;
+}
+
 LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
         auto addLabel = [&](const wchar_t* text, int x, int y, int w, int h) {
             CreateSettingsControl(window, L"STATIC", text, 0, 0, x, y, w, h);
         };
-        addLabel(L"编辑器字体", 26, 20, 120, 24);
-        CreateSettingsControl(window, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP,
-            kIdSettingsFont, 160, 16, 260, 180);
-        for (const wchar_t* value : {L"Consolas", L"Cascadia Mono", L"Microsoft YaHei Mono", L"Courier New"})
-            SendMessageW(g_app.settingsFontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
+        addLabel(L"默认字体", 26, 20, 120, 24);
+        CreateSettingsControl(window, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+            kIdSettingsFont, 160, 16, 260, 320);
+        for (const std::wstring& font : EditorFontChoices())
+            SendMessageW(g_app.settingsFontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(font.c_str()));
         {
             const LRESULT fontIndex = SendMessageW(g_app.settingsFontCombo, CB_FINDSTRINGEXACT,
                 static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(g_app.fontFamily.c_str()));
             SendMessageW(g_app.settingsFontCombo, CB_SETCURSEL, fontIndex == CB_ERR ? 0 : fontIndex, 0);
         }
-        addLabel(L"字号", 26, 58, 120, 24);
-        CreateSettingsControl(window, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP,
-            kIdSettingsSize, 160, 54, 120, 180);
-        for (const wchar_t* value : {L"12", L"13", L"14", L"15", L"16", L"18", L"20", L"22"})
-            SendMessageW(g_app.settingsSizeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
-        const int sizes[] = {12, 13, 14, 15, 16, 18, 20, 22};
-        int sizeIndex = 1;
-        for (int i = 0; i < 8; ++i) if (sizes[i] == g_app.fontSize) sizeIndex = i;
+        addLabel(L"默认字号", 26, 58, 120, 24);
+        CreateSettingsControl(window, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+            kIdSettingsSize, 160, 54, 120, 320);
+        int sizeIndex = 0;
+        for (size_t i = 0; i < std::size(kSettingsFontSizes); ++i) {
+            SendMessageW(g_app.settingsSizeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(std::to_wstring(kSettingsFontSizes[i]).c_str()));
+            if (kSettingsFontSizes[i] <= g_app.defaultFontSize) sizeIndex = static_cast<int>(i);
+        }
         SendMessageW(g_app.settingsSizeCombo, CB_SETCURSEL, sizeIndex, 0);
+        addLabel(L"（Ctrl+滚轮临时缩放，Ctrl+0 恢复）", 290, 58, 230, 24);
         addLabel(L"默认主题", 26, 96, 120, 24);
         CreateSettingsControl(window, L"COMBOBOX", nullptr, CBS_DROPDOWNLIST | WS_TABSTOP,
             kIdSettingsTheme, 160, 92, 260, 180);
@@ -860,12 +892,13 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
             return 0;
         }
         if (LOWORD(wParam) == kIdSettingsApply || LOWORD(wParam) == IDOK) {
-            const int fontIndex = static_cast<int>(SendMessageW(g_app.settingsFontCombo, CB_GETCURSEL, 0, 0));
-            const wchar_t* fonts[] = {L"Consolas", L"Cascadia Mono", L"Microsoft YaHei Mono", L"Courier New"};
-            if (fontIndex >= 0 && fontIndex < 4) g_app.fontFamily = fonts[fontIndex];
+            const std::wstring chosenFont = GetWindowTextValue(g_app.settingsFontCombo);
+            if (!chosenFont.empty()) g_app.fontFamily = chosenFont;
             const int sizeIndex = static_cast<int>(SendMessageW(g_app.settingsSizeCombo, CB_GETCURSEL, 0, 0));
-            const int sizes[] = {12, 13, 14, 15, 16, 18, 20, 22};
-            if (sizeIndex >= 0 && sizeIndex < 8) g_app.fontSize = sizes[sizeIndex];
+            if (sizeIndex >= 0 && sizeIndex < static_cast<int>(std::size(kSettingsFontSizes))) {
+                g_app.defaultFontSize = kSettingsFontSizes[sizeIndex];
+                g_app.fontSize = g_app.defaultFontSize;  // applying the setting also ends any zoom
+            }
             const int themeIndex = static_cast<int>(SendMessageW(g_app.settingsThemeCombo, CB_GETCURSEL, 0, 0));
             if (themeIndex >= 0 && themeIndex < 4) SetThemeKind(static_cast<ThemeKind>(themeIndex));
             g_app.showLineNumbers = SendMessageW(g_app.settingsLineNumbersCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;

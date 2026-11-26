@@ -147,6 +147,9 @@ constexpr int kIdViewFoldCurrent = 1243;
 constexpr int kIdViewUnfoldAll = 1244;
 constexpr int kIdTabNext = 1245;
 constexpr int kIdTabPrevious = 1246;
+constexpr int kIdViewZoomIn = 1247;
+constexpr int kIdViewZoomOut = 1248;
+constexpr int kIdViewZoomReset = 1249;
 constexpr int kIdSearchHistoryFirst = 3101;  // ..3120
 // Text tools (Tools menu and editor right-click menu).
 enum TextToolId : int {
@@ -442,7 +445,8 @@ struct AppState {
     WNDPROC oldStatusProc = nullptr;
     bool darkTheme = true;
     ThemeKind theme = ThemeKind::Dark;
-    int fontSize = 13;
+    int fontSize = 13;            // current size (Ctrl+wheel / Ctrl+= / Ctrl+- change it)
+    int defaultFontSize = 13;     // set in Settings; new windows and Ctrl+0 use it
     int lineSpacingPercent = 100;
     int topSpacingPixels = 0;
     std::wstring fontFamily = L"Consolas";
@@ -643,6 +647,9 @@ std::wstring ShortcutLabelForCommand(int command) {
     case kIdCopySearchResults: return L"搜索：复制搜索结果";
     case kIdBookmarkSearchResult: return L"搜索：标记搜索结果";
     case kIdViewToggleBookmark: return L"视图：切换书签";
+    case kIdViewZoomIn: return L"视图：放大字号";
+    case kIdViewZoomOut: return L"视图：缩小字号";
+    case kIdViewZoomReset: return L"视图：恢复默认字号";
     case kIdViewNextBookmark: return L"视图：下一个书签";
     case kIdViewPreviousBookmark: return L"视图：上一个书签";
     case kIdViewClearBookmarks: return L"视图：清除书签";
@@ -736,6 +743,7 @@ void InitializeShortcutBindings() {
     add(kIdViewToggleBookmark, L"Ctrl+F2"); add(kIdViewNextBookmark, L"F4"); add(kIdViewPreviousBookmark, L"Shift+F4");
     add(kIdViewClearBookmarks); add(kIdViewWhitespace, L"Ctrl+Alt+Space"); add(kIdViewIndentGuides, L"Ctrl+Alt+I");
     add(kIdViewFoldCurrent, L"F7"); add(kIdViewUnfoldAll, L"Shift+F7");
+    add(kIdViewZoomIn, L"Ctrl+Plus"); add(kIdViewZoomOut, L"Ctrl+Minus"); add(kIdViewZoomReset, L"Ctrl+0");
     add(kIdToolbarLineNumbers, L"Ctrl+Alt+L"); add(kIdToolbarWrap, L"Ctrl+Alt+W"); add(kIdToolbarEncoding);
     add(kIdLineSpacingSingle, L"Ctrl+Alt+1"); add(kIdLineSpacing115, L"Ctrl+Alt+2");
     add(kIdLineSpacing150, L"Ctrl+Alt+3"); add(kIdLineSpacing200, L"Ctrl+Alt+4"); add(kIdLineSpacingCustom);
