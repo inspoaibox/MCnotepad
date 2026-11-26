@@ -449,7 +449,7 @@ struct AppState {
     int defaultFontSize = 13;     // set in Settings; new windows and Ctrl+0 use it
     int lineSpacingPercent = 100;
     int topSpacingPixels = 0;
-    std::wstring fontFamily = L"Consolas";
+    std::wstring fontFamily = L"JetBrains Mono";  // one of the bundled programming fonts
     bool showLineNumbers = true;
     bool wordWrap = false;
     bool showWhitespace = false;

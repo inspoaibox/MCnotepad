@@ -854,6 +854,21 @@ int RunSelfTests() {
             DestroyWindow(edit);
         }
     }
+    // The bundled programming fonts load (they are copied next to the exe).
+    {
+        LoadBundledFonts();
+        failures += expect(g_bundledFonts.size() >= 10 && IsBundledFont(L"JetBrains Mono") && IsBundledFont(L"Fira Code"));
+        HDC dc = GetDC(nullptr);
+        HFONT font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Maple Mono");
+        HGDIOBJ previous = SelectObject(dc, font);
+        wchar_t face[LF_FACESIZE]{};
+        GetTextFaceW(dc, LF_FACESIZE, face);
+        failures += expect(std::wstring(face) == L"Maple Mono");  // really used, not a substitute
+        SelectObject(dc, previous);
+        DeleteObject(font);
+        ReleaseDC(nullptr, dc);
+    }
     // An exception escaping a window procedure is caught, not fatal.
     {
         struct Thrower {
@@ -914,6 +929,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_app.findReplaceMessage = RegisterWindowMessageW(FINDMSGSTRING);
     InitializeStorage();
+    LoadBundledFonts();  // before any editor font is created
 
     INITCOMMONCONTROLSEX commonControls{};
     commonControls.dwSize = sizeof(commonControls);

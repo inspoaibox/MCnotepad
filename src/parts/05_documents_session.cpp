@@ -1595,6 +1595,10 @@ void LoadPersistedSession() {
     g_app.defaultFontSize = std::clamp(persistedDefaultFontSize > 0 ? persistedDefaultFontSize : persistedFontSize, 8, 48);
     g_app.fontSize = g_app.defaultFontSize;
     if (!persistedFontFamily.empty()) g_app.fontFamily = persistedFontFamily;
+    // Fonts offered before 0.1.2 were system fonts; move them to the bundled default.
+    for (const wchar_t* old : {L"Consolas", L"Cascadia Mono", L"Microsoft YaHei Mono", L"Courier New"}) {
+        if (g_app.fontFamily == old && IsBundledFont(L"JetBrains Mono")) g_app.fontFamily = L"JetBrains Mono";
+    }
     g_app.languageIndex = std::clamp(persistedLanguage, 0, kLanguageCount - 1);
     g_app.encodingIndex = std::clamp(persistedEncoding, 0, kEncodingCount - 1);
     g_app.lineEndingIndex = std::clamp(persistedLineEnding, 0, kLineEndingCount - 1);

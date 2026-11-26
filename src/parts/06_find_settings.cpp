@@ -786,32 +786,9 @@ void CreateSettingsControl(HWND parent, const wchar_t* className, const wchar_t*
 // Font sizes offered in Settings.
 constexpr int kSettingsFontSizes[] = {9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32};
 
-// Fonts for the editor: every installed monospaced font, plus the common
-// Chinese UI fonts (proportional, but often preferred for Chinese text).
+// Fonts for the editor: the bundled open-source programming fonts.
 std::vector<std::wstring> EditorFontChoices() {
-    std::vector<std::wstring> fonts;
-    HDC dc = GetDC(nullptr);
-    LOGFONTW query{};
-    query.lfCharSet = DEFAULT_CHARSET;
-    EnumFontFamiliesExW(dc, &query, [](const LOGFONTW* font, const TEXTMETRICW*, DWORD type, LPARAM list) -> int {
-        auto& out = *reinterpret_cast<std::vector<std::wstring>*>(list);
-        const std::wstring name = font->lfFaceName;
-        if (name.empty() || name[0] == L'@') return 1;  // vertical variants
-        if (type & RASTER_FONTTYPE) return 1;           // old bitmap fonts (Fixedsys, Terminal)
-        if (name.ends_with(L"-ExtB") || name.ends_with(L"-ExtG")) return 1;  // rare-character supplements
-        static const wchar_t* chinese[] = {L"Microsoft YaHei", L"Microsoft YaHei UI", L"DengXian", L"SimSun", L"NSimSun",
-            L"SimHei", L"KaiTi", L"FangSong", L"等线", L"微软雅黑", L"宋体", L"新宋体", L"黑体", L"楷体", L"仿宋"};
-        const bool fixed = (font->lfPitchAndFamily & 0x3) == FIXED_PITCH;
-        const bool common = std::any_of(std::begin(chinese), std::end(chinese), [&](const wchar_t* c) { return name == c; });
-        if ((fixed || common) && std::find(out.begin(), out.end(), name) == out.end()) out.push_back(name);
-        return 1;
-    }, reinterpret_cast<LPARAM>(&fonts), 0);
-    ReleaseDC(nullptr, dc);
-    if (std::find(fonts.begin(), fonts.end(), g_app.fontFamily) == fonts.end()) fonts.push_back(g_app.fontFamily);
-    std::sort(fonts.begin(), fonts.end(), [](const std::wstring& a, const std::wstring& b) {
-        return CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE, a.c_str(), -1, b.c_str(), -1, nullptr, nullptr, 0) == CSTR_LESS_THAN;
-    });
-    return fonts;
+    return g_bundledFonts;
 }
 
 LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -826,8 +803,10 @@ LRESULT CALLBACK SettingsProc(HWND window, UINT message, WPARAM wParam, LPARAM l
         for (const std::wstring& font : EditorFontChoices())
             SendMessageW(g_app.settingsFontCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(font.c_str()));
         {
-            const LRESULT fontIndex = SendMessageW(g_app.settingsFontCombo, CB_FINDSTRINGEXACT,
+            LRESULT fontIndex = SendMessageW(g_app.settingsFontCombo, CB_FINDSTRINGEXACT,
                 static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(g_app.fontFamily.c_str()));
+            if (fontIndex == CB_ERR) fontIndex = SendMessageW(g_app.settingsFontCombo, CB_FINDSTRINGEXACT,
+                static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(L"JetBrains Mono"));
             SendMessageW(g_app.settingsFontCombo, CB_SETCURSEL, fontIndex == CB_ERR ? 0 : fontIndex, 0);
         }
         addLabel(L"默认字号", 26, 58, 120, 24);

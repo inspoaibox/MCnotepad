@@ -49,6 +49,36 @@ fs::path GetDataDirectory() {
     return fs::current_path() / L"data";
 }
 
+// Programming fonts shipped in resources\fonts\<Family>\*.ttf (all open
+// source; licenses next to them). They are loaded for this process only, so
+// nothing is installed into Windows. Returns the families that loaded, in
+// the order shown in Settings.
+std::vector<std::wstring> g_bundledFonts;
+
+void LoadBundledFonts() {
+    g_bundledFonts.clear();
+    const fs::path exe = CurrentExecutablePath();
+    if (exe.empty()) return;
+    std::error_code error;
+    const fs::path root = exe.parent_path() / L"resources" / L"fonts";
+    for (const auto& folder : fs::directory_iterator(root, error)) {
+        if (!folder.is_directory(error)) continue;
+        int loaded = 0;
+        for (const auto& file : fs::directory_iterator(folder.path(), error)) {
+            std::wstring extension = file.path().extension().wstring();
+            for (wchar_t& c : extension) c = towlower(c);
+            if (extension != L".ttf" && extension != L".otf") continue;
+            loaded += AddFontResourceExW(file.path().c_str(), FR_PRIVATE, nullptr) > 0 ? 1 : 0;
+        }
+        if (loaded > 0) g_bundledFonts.push_back(folder.path().filename().wstring());  // folder name = family name
+    }
+    std::sort(g_bundledFonts.begin(), g_bundledFonts.end());
+}
+
+bool IsBundledFont(const std::wstring& family) {
+    return std::find(g_bundledFonts.begin(), g_bundledFonts.end(), family) != g_bundledFonts.end();
+}
+
 // "0.1.0 (28298d0)" for releases, "0.1.0 开发版" for development builds.
 std::wstring VersionDescription() {
     std::wstring text = Utf8ToWide(MCNOTEPAD_VERSION_TEXT);
