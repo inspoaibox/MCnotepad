@@ -18,6 +18,7 @@
 #include <uxtheme.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <regex>

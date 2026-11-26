@@ -766,6 +766,26 @@ int RunSelfTests() {
                 value.find(L"[数据生成失败]") == std::wstring::npos && utf8Safe(value));
         }
     }
+    // Batch identifier generation must advance one shared RNG/state.  A
+    // regression here used to return ten identical UUIDs (and the same issue
+    // affected several other identifier-like generators).
+    {
+        const int identifierCommands[] = {
+            kDataUuid, kDataGuid, kDataUlid, kDataNanoId, kDataSnowflake,
+            kDataOrderNumber, kDataSku, kDataBarcode, kDataSerialNumber,
+            kDataRandomString, kDataPassword, kDataCaptcha, kDataApiKey,
+            kDataToken, kDataJwt, kDataHex, kDataBase64, kDataHash
+        };
+        for (const int command : identifierCommands) {
+            DataGeneratorOptions options;
+            options.count = 20;
+            options.length = 16;
+            options.seed = 0x51A7E2026u + static_cast<uint64_t>(command);
+            const std::vector<std::wstring> values = SplitLines(GenerateDataText(command, options));
+            std::unordered_set<std::wstring> distinct(values.begin(), values.end());
+            failures += expect(values.size() == 20 && distinct.size() == values.size());
+        }
+    }
     // UTF-16 without a BOM is recognised instead of being cut at the first NUL.
     {
         const std::string le("H\0i\0 \0\x2D\x4E", 8);  // "Hi " + U+4E2D, UTF-16 LE

@@ -405,6 +405,114 @@ std::wstring DataRandomString(std::mt19937_64& rng, int length, const std::wstri
     return result;
 }
 
+// Identifier generators must use the batch RNG passed to GenerateDataValue.
+// The faker library owns a separate thread-local generator, which makes it
+// impossible to honor the dialog seed and can make a batch look repeated when
+// the library is called through different generation paths.  Keeping these
+// generators local also lets the uniqueness policy below cover every output.
+std::wstring DataRandomHex(std::mt19937_64& rng, size_t length) {
+    return DataRandomString(rng, static_cast<int>(length), L"0123456789abcdef");
+}
+
+std::wstring DataUuid(std::mt19937_64& rng) {
+    std::array<unsigned char, 16> bytes{};
+    for (size_t i = 0; i < bytes.size(); i += sizeof(uint64_t)) {
+        const uint64_t value = rng();
+        for (size_t j = 0; j < sizeof(uint64_t) && i + j < bytes.size(); ++j) {
+            bytes[i + j] = static_cast<unsigned char>((value >> (j * 8)) & 0xFFu);
+        }
+    }
+    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0F) | 0x40); // RFC 4122 version 4
+    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3F) | 0x80); // RFC 4122 variant
+    static constexpr wchar_t hex[] = L"0123456789abcdef";
+    std::wstring result;
+    result.reserve(36);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) result += L'-';
+        result += hex[(bytes[i] >> 4) & 0x0F];
+        result += hex[bytes[i] & 0x0F];
+    }
+    return result;
+}
+
+std::wstring DataUlid(std::mt19937_64& rng) {
+    std::array<unsigned char, 16> bytes{};
+    const uint64_t timestamp = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    for (int i = 0; i < 6; ++i) bytes[5 - i] = static_cast<unsigned char>((timestamp >> (i * 8)) & 0xFFu);
+    for (size_t i = 6; i < bytes.size(); i += sizeof(uint64_t)) {
+        const uint64_t value = rng();
+        for (size_t j = 0; j < sizeof(uint64_t) && i + j < bytes.size(); ++j) {
+            bytes[i + j] = static_cast<unsigned char>((value >> (j * 8)) & 0xFFu);
+        }
+    }
+    static constexpr wchar_t alphabet[] = L"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    std::wstring result;
+    result.reserve(26);
+    // A ULID is 128 bits encoded in 26 base32 characters; the first two bits
+    // are zero because 26*5 = 130.
+    for (int output = 0; output < 26; ++output) {
+        const int startBit = output * 5 - 2;
+        unsigned int value = 0;
+        for (int bit = 0; bit < 5; ++bit) {
+            const int sourceBit = startBit + bit;
+            const bool set = sourceBit >= 0 && sourceBit < 128 &&
+                ((bytes[static_cast<size_t>(sourceBit / 8)] >> (7 - (sourceBit % 8))) & 1u) != 0;
+            value = (value << 1) | (set ? 1u : 0u);
+        }
+        result += alphabet[value & 31u];
+    }
+    return result;
+}
+
+std::wstring DataBarcode(std::mt19937_64& rng, bool ean13) {
+    const int payloadLength = ean13 ? 12 : 7;
+    std::wstring payload;
+    payload.reserve(static_cast<size_t>(payloadLength + 1));
+    for (int i = 0; i < payloadLength; ++i) {
+        payload += static_cast<wchar_t>(L'0' + std::uniform_int_distribution<int>(0, 9)(rng));
+    }
+    int sum = 0;
+    for (int i = 0; i < payloadLength; ++i) {
+        const int digit = payload[static_cast<size_t>(i)] - L'0';
+        const bool weighted = ean13 ? (i % 2 == 1) : (i % 2 == 0);
+        sum += weighted ? digit * 3 : digit;
+    }
+    payload += static_cast<wchar_t>(L'0' + ((10 - (sum % 10)) % 10));
+    return payload;
+}
+
+std::wstring DataSnowflake() {
+    static std::mutex mutex;
+    static uint64_t lastTimestamp = 0;
+    static uint16_t sequence = 0;
+    std::lock_guard<std::mutex> lock(mutex);
+    uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    if (now < lastTimestamp) now = lastTimestamp;
+    if (now == lastTimestamp) {
+        if (sequence == 0x0FFF) { ++now; sequence = 0; }
+        else ++sequence;
+    } else {
+        sequence = 0;
+    }
+    lastTimestamp = now;
+    return std::to_wstring((now << 12) | sequence);
+}
+
+bool DataCommandShouldBeUnique(int command) {
+    switch (command) {
+    case kDataUuid: case kDataGuid: case kDataUlid: case kDataNanoId:
+    case kDataSnowflake: case kDataOrderNumber: case kDataSku:
+    case kDataBarcode: case kDataSerialNumber: case kDataRandomString:
+    case kDataPassword: case kDataCaptcha: case kDataApiKey: case kDataToken:
+    case kDataJwt: case kDataHex: case kDataBase64: case kDataHash:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::wstring DataPad(int64_t value, int width) {
     std::wstring result = std::to_wstring(value);
     if (width > static_cast<int>(result.size())) result.insert(0, static_cast<size_t>(width - result.size()), L'0');
@@ -484,18 +592,18 @@ std::wstring GenerateDataValue(int command, const DataGeneratorOptions& options,
     case kDataRandomLetter: { const wchar_t letters[] = L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"; return std::wstring(1, letters[randomInt(0, 51)]); }
     case kDataRandomString: return DataRandomString(rng, options.length, options.charset);
     case kDataBoolean: return randomInt(0, 1) ? L"true" : L"false";
-    case kDataPassword: return Utf8ToWide(faker::internet::password(std::max(4, options.length)));
+    case kDataPassword: return DataRandomString(rng, std::max(4, options.length), L"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^");
     case kDataCaptcha: { std::wstring chars = L"0123456789"; return DataRandomString(rng, std::max(1, options.length), chars); }
     case kDataColor: { const int kind = index % 3; return Utf8ToWide(kind == 0 ? faker::color::hex() : kind == 1 ? faker::color::rgb() : faker::color::hsl()); }
     case kDataChineseCharacter: { static const wchar_t chars[] = L"的一是不了人我在有他这为之大来以个中上们到说时国和地要就出会可也你对生能而子那得于着下自之年过发后作里用道行所然家种事成方多经么去法学如都同现当没动面起看定天分还进好小部其些主样理心她本前开但因只从想实日军者意无力它与长把机十民第手"; return std::wstring(1, chars[randomInt(0, static_cast<int64_t>(std::size(chars) - 2))]); }
     case kDataEnglishWord: return Utf8ToWide(faker::word::sample(std::nullopt, faker::Locale::en_US));
-    case kDataUuid: case kDataGuid: return Utf8ToWide(faker::string::uuidV4());
-    case kDataUlid: return Utf8ToWide(faker::string::ulid());
-    case kDataNanoId: return Utf8ToWide(faker::string::nanoId(std::max(4, options.length)));
-    case kDataSnowflake: { const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()); return std::to_wstring((now << 12) | (static_cast<uint64_t>(index) & 0xFFF)); }
+    case kDataUuid: case kDataGuid: return DataUuid(rng);
+    case kDataUlid: return DataUlid(rng);
+    case kDataNanoId: return DataRandomString(rng, std::max(4, options.length), L"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-");
+    case kDataSnowflake: return DataSnowflake();
     case kDataOrderNumber: return L"ORD-" + DataNow(L"%Y%m%d") + DataPad(randomInt(0, 999999), 6);
-    case kDataSku: return Utf8ToWide(faker::commerce::sku(std::max(4, options.length)));
-    case kDataBarcode: return Utf8ToWide((index % 2) ? faker::commerce::EAN13() : faker::commerce::EAN8());
+    case kDataSku: return DataRandomString(rng, std::max(4, options.length), L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789");
+    case kDataBarcode: return DataBarcode(rng, (index % 2) != 0);
     case kDataSerialNumber: return L"SN-" + DataRandomString(rng, std::max(6, options.length), L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789");
     case kDataCurrentDate: return DataNow(L"%Y-%m-%d");
     case kDataCurrentTime: return DataNow(L"%H:%M:%S");
@@ -575,11 +683,11 @@ std::wstring GenerateDataValue(int command, const DataGeneratorOptions& options,
     case kDataUserAgent: return L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/" + std::to_wstring(randomInt(110, 130)) + L".0 Safari/537.36";
     case kDataApiKey: return L"test_" + DataRandomString(rng, std::max(16, options.length), L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
     case kDataToken: return DataRandomString(rng, std::max(24, options.length), L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_~");
-    case kDataJwt: return Utf8ToWide(faker::internet::jwtToken());
+    case kDataJwt: return L"eyJhbGciOiJIUzI1NiJ9." + DataRandomString(rng, 24, L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") + L"." + DataRandomString(rng, 43, L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-");
     case kDataHex: return DataRandomString(rng, std::max(2, options.length), L"0123456789abcdef");
     case kDataBinary: return DataRandomString(rng, std::max(2, options.length), L"01");
     case kDataBase64: return Base64Encode(DataRandomString(rng, std::max(4, options.length), options.charset));
-    case kDataHash: return Utf8ToWide(faker::crypto::sha256());
+    case kDataHash: return DataRandomHex(rng, 64);
     case kDataHttpHeaders: return Utf8ToWide(faker::internet::httpRequestHeader()) + L": " + Utf8ToWide(faker::internet::httpMediaType());
     case kDataLorem: return Utf8ToWide(faker::lorem::sentence());
     case kDataChineseLorem: return L"这是用于测试和演示的中文占位文本，内容会根据生成数量自动重复。";
@@ -590,34 +698,34 @@ std::wstring GenerateDataValue(int command, const DataGeneratorOptions& options,
     case kDataRepeatChar: return std::wstring(std::max(1, options.length), options.repeatText.empty() ? L'喵' : options.repeatText.front());
     case kDataBlankLines: return {};
     case kDataDivider: return L"────────────────────────────────────────";
-    case kDataMarkdownTable: return L"| 字段 | 示例值 |\r\n| --- | --- |\r\n| id | " + Utf8ToWide(faker::string::uuidV4()) + L" |";
+    case kDataMarkdownTable: return L"| 字段 | 示例值 |\r\n| --- | --- |\r\n| id | " + DataUuid(rng) + L" |";
     case kDataMarkdownToc: return L"- [概述](#概述)\r\n- [安装](#安装)\r\n- [使用方法](#使用方法)";
     case kDataMarkdownTasks: return L"- [ ] 待办事项\r\n- [ ] 测试数据\r\n- [x] 已完成事项";
-    case kDataJson: return L"{\"id\":\"" + Utf8ToWide(faker::string::uuidV4()) + L"\",\"name\":\"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\",\"email\":\"" + Utf8ToWide(faker::internet::exampleEmail()) + L"\"}";
-    case kDataJsonl: return L"{\"id\":\"" + Utf8ToWide(faker::string::uuidV4()) + L"\",\"value\":" + std::to_wstring(randomInt(1, 9999)) + L"}";
-    case kDataXml: return L"<item><id>" + Utf8ToWide(faker::string::uuidV4()) + L"</id><name>" + DataJsonEscape(Utf8ToWide(faker::commerce::productName())) + L"</name></item>";
-    case kDataCsv: return L"id,name,email\r\n" + Utf8ToWide(faker::string::uuidV4()) + L"," + Utf8ToWide(faker::person::fullName(locale)) + L"," + Utf8ToWide(faker::internet::exampleEmail());
-    case kDataTsv: return L"id\tname\temail\r\n" + Utf8ToWide(faker::string::uuidV4()) + L"\t" + Utf8ToWide(faker::person::fullName(locale)) + L"\t" + Utf8ToWide(faker::internet::exampleEmail());
-    case kDataYaml: return L"id: " + Utf8ToWide(faker::string::uuidV4()) + L"\r\nname: \"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\"\r\nactive: true";
-    case kDataToml: return L"id = \"" + Utf8ToWide(faker::string::uuidV4()) + L"\"\r\nname = \"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\"";
-    case kDataSql: return L"INSERT INTO users (id, name, email) VALUES ('" + Utf8ToWide(faker::string::uuidV4()) + L"', '" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"', '" + Utf8ToWide(faker::internet::exampleEmail()) + L"');";
-    case kDataHtmlTable: return L"<table>\r\n  <tr><th>ID</th><th>Name</th></tr>\r\n  <tr><td>" + Utf8ToWide(faker::string::uuidV4()) + L"</td><td>" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"</td></tr>\r\n</table>";
+    case kDataJson: return L"{\"id\":\"" + DataUuid(rng) + L"\",\"name\":\"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\",\"email\":\"" + Utf8ToWide(faker::internet::exampleEmail()) + L"\"}";
+    case kDataJsonl: return L"{\"id\":\"" + DataUuid(rng) + L"\",\"value\":" + std::to_wstring(randomInt(1, 9999)) + L"}";
+    case kDataXml: return L"<item><id>" + DataUuid(rng) + L"</id><name>" + DataJsonEscape(Utf8ToWide(faker::commerce::productName())) + L"</name></item>";
+    case kDataCsv: return L"id,name,email\r\n" + DataUuid(rng) + L"," + Utf8ToWide(faker::person::fullName(locale)) + L"," + Utf8ToWide(faker::internet::exampleEmail());
+    case kDataTsv: return L"id\tname\temail\r\n" + DataUuid(rng) + L"\t" + Utf8ToWide(faker::person::fullName(locale)) + L"\t" + Utf8ToWide(faker::internet::exampleEmail());
+    case kDataYaml: return L"id: " + DataUuid(rng) + L"\r\nname: \"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\"\r\nactive: true";
+    case kDataToml: return L"id = \"" + DataUuid(rng) + L"\"\r\nname = \"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\"";
+    case kDataSql: return L"INSERT INTO users (id, name, email) VALUES ('" + DataUuid(rng) + L"', '" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"', '" + Utf8ToWide(faker::internet::exampleEmail()) + L"');";
+    case kDataHtmlTable: return L"<table>\r\n  <tr><th>ID</th><th>Name</th></tr>\r\n  <tr><td>" + DataUuid(rng) + L"</td><td>" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"</td></tr>\r\n</table>";
     case kDataTemplate: {
         std::wstring result = options.repeatText.empty() ? L"{{id}} {{name}} {{email}}" : options.repeatText;
-        DataReplaceAll(result, L"{{id}}", Utf8ToWide(faker::string::uuidV4()));
-        DataReplaceAll(result, L"{{uuid}}", Utf8ToWide(faker::string::uuidV4()));
+        DataReplaceAll(result, L"{{id}}", DataUuid(rng));
+        DataReplaceAll(result, L"{{uuid}}", DataUuid(rng));
         DataReplaceAll(result, L"{{name}}", Utf8ToWide(faker::person::fullName(locale)));
         DataReplaceAll(result, L"{{email}}", Utf8ToWide(faker::internet::exampleEmail()));
         DataReplaceAll(result, L"{{date}}", DataNow(L"%Y-%m-%d"));
         DataReplaceAll(result, L"{{index}}", std::to_wstring(index + 1));
         return result;
     }
-    case kDataMultiField: return Utf8ToWide(faker::string::uuidV4()) + L" | " + Utf8ToWide(faker::person::fullName(locale)) + L" | " + Utf8ToWide(faker::internet::exampleEmail());
-    case kDataUsers: return L"{\"id\":\"" + Utf8ToWide(faker::string::uuidV4()) + L"\",\"name\":\"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\",\"email\":\"" + Utf8ToWide(faker::internet::exampleEmail()) + L"\"}";
-    case kDataProducts: return L"{\"sku\":\"" + Utf8ToWide(faker::commerce::sku()) + L"\",\"name\":\"" + DataJsonEscape(Utf8ToWide(faker::commerce::productFullName())) + L"\"}";
+    case kDataMultiField: return DataUuid(rng) + L" | " + Utf8ToWide(faker::person::fullName(locale)) + L" | " + Utf8ToWide(faker::internet::exampleEmail());
+    case kDataUsers: return L"{\"id\":\"" + DataUuid(rng) + L"\",\"name\":\"" + DataJsonEscape(Utf8ToWide(faker::person::fullName(locale))) + L"\",\"email\":\"" + Utf8ToWide(faker::internet::exampleEmail()) + L"\"}";
+    case kDataProducts: return L"{\"sku\":\"SKU-" + DataRandomString(rng, std::max(6, options.length), L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789") + L"\",\"name\":\"" + DataJsonEscape(Utf8ToWide(faker::commerce::productFullName())) + L"\"}";
     case kDataOrders: return L"{\"orderNo\":\"ORD-" + DataNow(L"%Y%m%d") + DataPad(randomInt(0, 999999), 6) + L"\",\"status\":\"paid\"}";
-    case kDataLogs: return DataNow(L"%Y-%m-%d %H:%M:%S") + L" [INFO] request_id=" + Utf8ToWide(faker::string::uuidV4()) + L" status=200 latency=" + std::to_wstring(randomInt(1, 999)) + L"ms";
-    case kDataApiResponse: return L"{\"code\":200,\"message\":\"ok\",\"data\":{\"id\":\"" + Utf8ToWide(faker::string::uuidV4()) + L"\",\"timestamp\":" + std::to_wstring(std::time(nullptr)) + L"}}";
+    case kDataLogs: return DataNow(L"%Y-%m-%d %H:%M:%S") + L" [INFO] request_id=" + DataUuid(rng) + L" status=200 latency=" + std::to_wstring(randomInt(1, 999)) + L"ms";
+    case kDataApiResponse: return L"{\"code\":200,\"message\":\"ok\",\"data\":{\"id\":\"" + DataUuid(rng) + L"\",\"timestamp\":" + std::to_wstring(std::time(nullptr)) + L"}}";
     default: return {};
     }
 }
@@ -625,6 +733,11 @@ std::wstring GenerateDataValue(int command, const DataGeneratorOptions& options,
 std::wstring GenerateDataText(int command, const DataGeneratorOptions& options) {
     std::mt19937_64 rng(options.seed ? options.seed : std::random_device{}());
     const int count = std::clamp(options.count, 1, 100000);
+    // Identifier-like values are expected to be distinct even when the user
+    // leaves the optional "禁止重复" checkbox off.  For small-domain values
+    // (booleans, genders, percentages, etc.) repetition remains valid unless
+    // the user explicitly asks for deduplication.
+    const bool requireUnique = options.unique || DataCommandShouldBeUnique(command);
     std::vector<std::wstring> values;
     values.reserve(static_cast<size_t>(count));
     std::unordered_set<std::wstring> seen;
@@ -639,7 +752,7 @@ std::wstring GenerateDataText(int command, const DataGeneratorOptions& options) 
             } catch (...) {
                 value = L"[数据生成失败]";
             }
-        } while (options.unique && !seen.insert(value).second && ++attempts < 100);
+        } while (requireUnique && !seen.insert(value).second && ++attempts < 100);
         values.push_back(std::move(value));
     }
     if (command == kDataBlankLines) values.assign(static_cast<size_t>(count), L"");
