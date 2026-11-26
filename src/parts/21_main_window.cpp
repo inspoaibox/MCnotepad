@@ -480,6 +480,24 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_CLOSE:
         HandleMainWindowClose();
         return 0;
+    case WM_DROPFILES: {
+        const HDROP drop = reinterpret_cast<HDROP>(wParam);
+        if (drop == nullptr) return 0;
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFFu, nullptr, 0);
+        for (UINT index = 0; index < count; ++index) {
+            const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+            if (length == 0) continue;
+            std::vector<wchar_t> path(static_cast<size_t>(length) + 1, L'\0');
+            if (DragQueryFileW(drop, index, path.data(), length + 1) != length) continue;
+            g_app.pendingOpenFiles.emplace_back(path.data(), length);
+        }
+        DragFinish(drop);
+        if (g_app.hiddenToTray || !IsWindowVisible(window)) RestoreMainWindowFromTray();
+        else if (IsIconic(window)) ShowWindow(window, SW_RESTORE);
+        SetForegroundWindow(window);
+        PostMessageW(window, kMessageOpenPendingFiles, 0, 0);
+        return 0;
+    }
     case WM_COPYDATA: {
         const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
         if (data == nullptr || data->dwData != kCopyDataOpenFiles) return FALSE;
@@ -995,7 +1013,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
     }
 
     HWND window = CreateWindowExW(
-        0,
+        WS_EX_ACCEPTFILES,
         kWindowClass,
         kWindowTitle,
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
