@@ -77,6 +77,12 @@ Root: HKA; Subkey: "Software\Classes\.mkd"; ValueType: string; ValueName: ""; Va
 Root: HKA; Subkey: "Software\Classes\MCnotepad.Markdown"; ValueType: string; ValueName: ""; ValueData: "Markdown document"; Tasks: fileassociation; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\MCnotepad.Markdown\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\MCnotepad.exe,0"; Tasks: fileassociation
 Root: HKA; Subkey: "Software\Classes\MCnotepad.Markdown\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\MCnotepad.exe"" ""%1"""; Tasks: fileassociation
+; Repair the legacy Applications\MCnotepad.exe entry used by Windows UserChoice
+; records from older portable builds. Without this, Windows can keep invoking
+; a deleted portable path even after the new ProgID is installed.
+Root: HKA; Subkey: "Software\Classes\Applications\MCnotepad.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "MCnotepad"; Tasks: fileassociation; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\MCnotepad.exe\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\MCnotepad.exe,0"; Tasks: fileassociation
+Root: HKA; Subkey: "Software\Classes\Applications\MCnotepad.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\MCnotepad.exe"" ""%1"""; Tasks: fileassociation
 ; Register the application with Windows Default apps. This keeps the entry
 ; named MCnotepad and points it at the same Markdown ProgID.
 Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "MCnotepad"; ValueData: "Software\MCnotepad\Capabilities"; Tasks: fileassociation; Flags: uninsdeletevalue
